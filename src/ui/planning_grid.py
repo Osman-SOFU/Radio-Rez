@@ -82,7 +82,7 @@ class PlanningGrid(QWidget):
         self.table.setColumnWidth(0, 140)
         self.table.setColumnWidth(1, 80)
         for c in range(2, total_cols):
-            self.table.setColumnWidth(c, 90)
+            self.table.setColumnWidth(c, 60)
 
         # Satırları doldur
         dt_row_brush = QBrush(QColor("#e0e0e0"))

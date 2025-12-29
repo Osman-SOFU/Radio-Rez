@@ -77,7 +77,8 @@ class MainWindow(QMainWindow):
         mid = QHBoxLayout()
         main.addLayout(mid)
 
-        left_box = QGroupBox("Arama Sonuçları (Reklamveren)")
+        left_box = QGroupBox("Arama Sonuçları (Reklam veren)")
+        left_box.setMaximumWidth(280)  # 240-320 arası idealdir
         left_layout = QVBoxLayout(left_box)
         self.list_advertisers = QListWidget()
         left_layout.addWidget(self.list_advertisers)
@@ -85,7 +86,7 @@ class MainWindow(QMainWindow):
 
         # Tabs
         self.tabs = QTabWidget()
-        mid.addWidget(self.tabs, 4)
+        mid.addWidget(self.tabs, 6)
 
         self.tab_widgets: dict[str, QWidget] = {}
         for name in TAB_NAMES:
@@ -179,16 +180,20 @@ class MainWindow(QMainWindow):
         self.in_date = QDateEdit()
         self.in_date.setCalendarPopup(True)
         self.in_date.setDate(QDate.currentDate())
+        self.in_date.setFixedWidth(120)
         row2.addWidget(self.in_date)
 
         row2.addWidget(QLabel("Spot Saat:"))
         self.in_time = QTimeEdit()
         self.in_time.setTime(QTime.currentTime())
+        self.in_time.setFixedWidth(80)
         row2.addWidget(self.in_time)
 
         self.lbl_dt_odt = QLabel("DT/ODT: -")
         self.lbl_dt_odt.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        row2.addWidget(self.lbl_dt_odt, 1)
+        self.lbl_dt_odt.setMinimumWidth(80)
+        row2.addWidget(self.lbl_dt_odt)
+        row2.addStretch(1)
 
         self.in_time.timeChanged.connect(self.on_time_changed)
         self.on_time_changed(self.in_time.time())
