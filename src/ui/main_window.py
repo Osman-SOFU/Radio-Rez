@@ -62,7 +62,7 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         main.addLayout(top)
 
-        top.addWidget(QLabel("Reklamveren Ara:"))
+        top.addWidget(QLabel("Reklam veren Ara:"))
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Örn: MURATBEY")
         top.addWidget(self.search_edit, 2)
@@ -146,7 +146,7 @@ class MainWindow(QMainWindow):
 
         row0b.addWidget(QLabel("Plan Başlığı:"))
         self.in_plan_title = QLineEdit()
-        row0b.addWidget(self.in_plan_title, 3)
+        row0b.addWidget(self.in_plan_title, 2)
 
         row0b.addWidget(QLabel("Kod:"))
         self.in_spot_code = QLineEdit()
@@ -156,6 +156,14 @@ class MainWindow(QMainWindow):
         self.in_spot_duration = QSpinBox()
         self.in_spot_duration.setRange(0, 9999)
         row0b.addWidget(self.in_spot_duration, 1)
+
+        row_code_def = QHBoxLayout()
+        layout.addLayout(row_code_def)
+
+        row_code_def.addWidget(QLabel("Kod Tanımı:"))
+        self.in_code_definition = QLineEdit()
+        row_code_def.addWidget(self.in_code_definition, 6)
+
 
         row0c = QHBoxLayout()
         layout.addLayout(row0c)
@@ -170,7 +178,7 @@ class MainWindow(QMainWindow):
         row1 = QHBoxLayout()
         layout.addLayout(row1)
         
-        row1.addWidget(QLabel("Reklamveren:"))
+        row1.addWidget(QLabel("Reklam veren:"))
         self.in_advertiser = QLineEdit()
         row1.addWidget(self.in_advertiser, 2)
 
@@ -275,6 +283,8 @@ class MainWindow(QMainWindow):
 
         plan_cells = self._sanitize_plan_cells(self.plan_grid.get_matrix())
 
+        adet_total = sum(1 for v in plan_cells.values() if str(v).strip())
+
         prepared_name = self.in_prepared_by.text().strip()
         stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
         prepared_by = f"{prepared_name} - {stamp}" if prepared_name else stamp
@@ -295,6 +305,10 @@ class MainWindow(QMainWindow):
             "prepared_by": prepared_by,
 
             "plan_cells": plan_cells,
+
+            "adet_total": adet_total,
+            "code_definition": self.in_code_definition.text().strip(),
+
         }
 
         self.btn_test_export.setEnabled(True)

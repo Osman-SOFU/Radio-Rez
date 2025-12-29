@@ -8,7 +8,14 @@ import openpyxl
 from openpyxl.drawing.image import Image
 
 from src.util.paths import resource_path
+from copy import copy
 
+import calendar
+from datetime import date
+from openpyxl.utils import get_column_letter
+from collections import Counter
+
+TR_DOW = ["Pt", "Sa", "Ça", "Pş", "Cu", "Ct", "Pa"]  # Monday=0
 
 def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -> Path:
     if not template_path.exists():
@@ -32,6 +39,12 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
 
     ws["A5"].value = "Rezervasyon No:"
     ws["C5"].value = str(payload.get("reservation_no", "")).strip()
+    
+    # --- Header label font fix (A4/A5/A6 da A1 gibi kalın olsun) ---
+    hdr_font = copy(ws["A1"].font)
+    for addr in ("A4", "A5", "A6"):
+        ws[addr].font = hdr_font
+
 
     # Dönemi: AY/YIL (plan_date varsa oradan üret)
     period = str(payload.get("period", "")).strip()
@@ -45,6 +58,116 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
 
     ws["A6"].value = "Dönemi:"
     ws["C6"].value = period
+
+    # --- Ay/Gün başlıklarını plan_date'e göre düzelt + hafta sonu sütunlarını boyala ---
+    plan_date = str(payload.get("plan_date", "")).strip()  # "YYYY-MM-DD"
+    year = month = None
+    try:
+        y, m, _ = plan_date.split("-")
+        year = int(y)
+        month = int(m)
+    except Exception:
+        year = None
+        month = None
+
+    if year and month:
+        days_in_month = calendar.monthrange(year, month)[1]
+        HEADER_ROW = 7          # C7..AG7
+        FIRST_DAY_COL = 3       # C
+        MAX_DAYS = 31
+
+        GRID_START_ROW = 8
+        GRID_ROWS = 52
+
+        # --- Şablondan "weekday/weekend" fill örneklerini otomatik yakala ---
+        # (ODT bir satır seçelim ki DT satır grisiyle karışmasın)
+        sample_row = GRID_START_ROW + 20
+
+        # Grid alanında en sık görülen fill = weekday, daha az görülen = weekend                
+        def fill_sig_from_cell(cell):
+            f = cell.fill
+            # StyleProxy'yi hash'e sokmayacağız; sadece primitive imza
+            pt = getattr(f, "patternType", None)
+            fg = getattr(getattr(f, "fgColor", None), "rgb", None)
+            bg = getattr(getattr(f, "bgColor", None), "rgb", None)
+            return (pt, fg, bg)
+
+        # Grid örnek fill'leri (sadece signature sayacağız)
+        grid_cells = []
+        for d in range(1, MAX_DAYS + 1):
+            c = FIRST_DAY_COL + (d - 1)
+            grid_cells.append(ws.cell(sample_row, c))
+
+        grid_sigs = [fill_sig_from_cell(cell) for cell in grid_cells]
+        g_cnt = Counter(grid_sigs).most_common()
+
+        weekday_sig = g_cnt[0][0] if g_cnt else None
+        weekend_sig = g_cnt[1][0] if len(g_cnt) > 1 else weekday_sig
+
+        # Header örnek fill'leri
+        header_cells = []
+        for d in range(1, MAX_DAYS + 1):
+            c = FIRST_DAY_COL + (d - 1)
+            header_cells.append(ws.cell(HEADER_ROW, c))
+
+        header_sigs = [fill_sig_from_cell(cell) for cell in header_cells]
+        h_cnt = Counter(header_sigs).most_common()
+
+        h_weekday_sig = h_cnt[0][0] if h_cnt else None
+        h_weekend_sig = h_cnt[1][0] if len(h_cnt) > 1 else h_weekday_sig
+
+        def pick_fill(cells, sig):
+            for cell in cells:
+                if fill_sig_from_cell(cell) == sig:
+                    return copy(cell.fill)  # proxy yerine kopya al
+            return None
+
+        weekday_fill = pick_fill(grid_cells, weekday_sig)
+        weekend_fill = pick_fill(grid_cells, weekend_sig) or weekday_fill
+
+        header_weekday_fill = pick_fill(header_cells, h_weekday_sig)
+        header_weekend_fill = pick_fill(header_cells, h_weekend_sig) or header_weekday_fill
+
+        disabled_fill = weekend_fill or weekday_fill
+
+        for day in range(1, MAX_DAYS + 1):
+            col = FIRST_DAY_COL + (day - 1)
+
+            if day <= days_in_month:
+                dow = TR_DOW[date(year, month, day).weekday()]
+                ws.cell(HEADER_ROW, col).value = f"{dow}\n{day}"
+
+                is_weekend = dow in ("Ct", "Pa")
+                hf = header_weekend_fill if is_weekend else header_weekday_fill
+                gf = weekend_fill if is_weekend else weekday_fill
+            else:
+                ws.cell(HEADER_ROW, col).value = None
+                hf = header_weekday_fill  # header çok bozmasın
+                gf = disabled_fill        # grid'i gri yap
+
+            # Header fill uygula
+            if hf is not None:
+                ws.cell(HEADER_ROW, col).fill = hf
+
+            # Grid fill uygula (C8..AG59)
+            if gf is not None:
+                for r in range(GRID_START_ROW, GRID_START_ROW + GRID_ROWS):
+                    ws.cell(r, col).fill = gf
+
+        # Bir önceki export'tan gizli kalmış olabilecek kolonlar sadece 29-31.
+        # 1..28 gibi kolonlara dokunursak şablonun range genişlikleri bozulabiliyor.
+        for day in range(29, 32):
+            col_letter = get_column_letter(FIRST_DAY_COL + (day - 1))
+            if col_letter in ws.column_dimensions:
+                ws.column_dimensions[col_letter].hidden = False
+
+        # Ay dışı gün kolonlarını gizle (29/30/31)
+        for day in range(days_in_month + 1, MAX_DAYS + 1):
+            col = FIRST_DAY_COL + (day - 1)
+            col_letter = get_column_letter(col)
+            ws.column_dimensions[col_letter].hidden = True
+            # İstersen ekstra: genişliği de sıfıra yakın yap
+            # ws.column_dimensions[col_letter].width = 0.1
 
     # Kanal adı
     ch = str(payload.get("channel_name", "")).strip()
@@ -95,18 +218,24 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
             # bozuk key gelirse export'u patlatmayalım
             continue
 
-    # --- Logo: openpyxl kaydederken uçtuğu için yeniden ekliyoruz ---
-    logo_path = resource_path("assets/RADIOSCOPE.PNG")
+    # --- Logo ---
+    logo_path = template_path.parent / "RADIOSCOPE.PNG"
+    if not logo_path.exists():
+        logo_path = resource_path("assets/RADIOSCOPE.PNG")
+
     try:
-        ws._images = []  # tekrarlı basmayı önlemek için
-        if logo_path.exists():
-            img = Image(str(logo_path))
-            img.width = 128
-            img.height = 128
-            img.anchor = "AO1"   # AO/AP civarı
-            ws.add_image(img)
-    except Exception:
-        # Logo basılamasa da export’u çöpe atmayalım
+        ws._images = []  # kalsın, üst üste binmesin
+        if not logo_path.exists():
+            raise FileNotFoundError(f"Logo bulunamadı: {logo_path}")
+
+        img = Image(str(logo_path))
+        img.width = 128
+        img.height = 128
+
+        ws.add_image(img, "AO1")
+
+    except Exception as e:
+        print("[DEBUG] logo add FAILED:", repr(e))
         pass
 
     # --- Değiştirilebilir alt alanlar ---
@@ -119,15 +248,15 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
         except Exception:
             pass
 
-    # D67 adet: şimdilik payload'dan, plan grid gelince otomatik saydırırız
-    if payload.get("adet_total") is not None:
-        try:
-            ws["D67"].value = f"({int(payload.get('adet_total'))} Adet )"
-        except Exception:
-            pass
+    # D67: AH60'daki toplam mantığı -> plan_cells dolu sayısı (parantez içinde)
+    adet_total = payload.get("adet_total")
+    if adet_total is None:
+        adet_total = sum(1 for v in (plan_cells or {}).values() if str(v).strip())
+    ws["D67"].value = f"({int(adet_total)})"
 
-    if payload.get("client_name") is not None:
-        ws["A76"].value = str(payload.get("client_name", "")).strip()
+    # A76: NOT satırının hemen üstü -> Kod Tanımı
+    code_def = str(payload.get("code_definition", "")).strip()
+    ws["A76"].value = code_def if code_def else None
 
     # NOT: sabit, içerik değişebilir
     note = str(payload.get("note_text", "")).strip()
