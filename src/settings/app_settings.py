@@ -1,26 +1,48 @@
-import json
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
+from PySide6.QtCore import QSettings
 
+from src.util.paths import resource_path
 
+ORG = "RadioRez"
+APP = "RadioRez"
+
+@dataclass(frozen=True)
 class AppSettings:
-    def __init__(self, data_dir=None):
-        self.data_dir = data_dir
+    data_dir: Path
+    template_path: Path
 
-    @staticmethod
-    def path():
-        base = Path.home() / ".radio-rez"
-        base.mkdir(exist_ok=True)
-        return base / "settings.json"
+class SettingsService:
+    def __init__(self) -> None:
+        self._qs = QSettings(ORG, APP)
 
-    @classmethod
-    def load(cls):
-        p = cls.path()
-        if not p.exists():
-            return cls()
-        return cls(**json.loads(p.read_text(encoding="utf-8")))
+    def get_data_dir(self) -> Path | None:
+        v = self._qs.value("data_dir", "")
+        v = str(v).strip()
+        return Path(v) if v else None
 
-    def save(self):
-        self.path().write_text(
-            json.dumps({"data_dir": self.data_dir}, indent=2),
-            encoding="utf-8"
+    def set_data_dir(self, p: Path) -> None:
+        self._qs.setValue("data_dir", str(p))
+
+    def get_template_path(self) -> Path:
+        # Şablonu app ile birlikte assets/template.xlsx olarak taşıyoruz.
+        # İleride istersen kullanıcı seçtirebilirsin.
+        v = str(self._qs.value("template_path", "")).strip()
+        if v:
+            return Path(v)
+        return resource_path("assets/template.xlsx")
+
+    def set_template_path(self, p: Path) -> None:
+        self._qs.setValue("template_path", str(p))
+
+    def build(self) -> AppSettings:
+        data_dir = self.get_data_dir()
+        if not data_dir:
+            # Henüz seçilmemiş olabilir; UI bunun için zaten zorlayacak.
+            data_dir = Path.home() / "RadioRezData"
+        return AppSettings(
+            data_dir=data_dir,
+            template_path=self.get_template_path(),
         )

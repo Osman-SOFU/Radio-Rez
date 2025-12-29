@@ -1,144 +1,101 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime, date
-import calendar
-import shutil
-import zipfile
+from typing import Any
+from datetime import datetime
 
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
-from openpyxl.drawing.image import Image as XLImage
+import openpyxl
+from openpyxl.drawing.image import Image
 
-
-_TR_DOW = {
-    0: "Pt",
-    1: "Sa",
-    2: "Ça",
-    3: "Pş",
-    4: "Cu",
-    5: "Ct",
-    6: "Pa",
-}
+from src.util.paths import resource_path
 
 
-def _pick_ws(wb):
-    for name in ("REZERVASYON ve PLANLAMA", "REZERVASYONve PLANLAMA"):
-        if name in wb.sheetnames:
-            return wb[name]
-    return wb.active
-
-
-def export_reservation_excel(
-    *,
-    template_path: str | Path,
-    output_dir: str | Path,
-    advertiser_name: str,
-    channel_name: str,
-    year: int,
-    month: int,
-    reservation_no: str | None,
-
-    # --- yeni alanlar ---
-    agency_name: str = "",
-    product_name: str = "",
-    plan_title: str = "",
-    # A67 / B67 serbest
-    a67_text: str | None = None,
-    b67_text: str | None = None,
-    # alt imza/not alanları
-    a76_text: str | None = None,
-    ak77_name: str | None = None,
-    note_text: str | None = None,
-    # logo
-    logo_path: str | Path | None = None,
-    logo_anchor: str = "AO2",
-    logo_width: int | None = None,
-    logo_height: int | None = None,
-) -> Path:
-    template_path = Path(template_path)
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -> Path:
     if not template_path.exists():
         raise FileNotFoundError(f"Template bulunamadı: {template_path}")
 
-    if not zipfile.is_zipfile(template_path):
-        raise ValueError(
-            f"Template dosyası gerçek .xlsx değil (zip değil): {template_path}\n"
-            "Excel'de açıp 'Farklı Kaydet' ile tekrar .xlsx olarak kaydetmeyi dene."
-        )
+    wb = openpyxl.load_workbook(template_path)
+    ws = wb["REZERVASYON ve PLANLAMA"]
 
-    safe_adv = (advertiser_name or "BILINMEYEN").strip().replace("/", "-")
-    safe_channel = (channel_name or "KANAL").strip().replace("/", "-")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    prefix = reservation_no if reservation_no else "TEST"
-    out_name = f"{prefix}_{safe_adv}_{safe_channel}_{year}-{month:02d}_{stamp}.xlsx"
-    out_path = output_dir / out_name
+    # --- Header labels + values ---
+    ws["A1"].value = "Ajans:"
+    ws["C1"].value = str(payload.get("agency_name", "")).strip()
 
-    shutil.copyfile(template_path, out_path)
+    ws["A2"].value = "Reklam Veren:"
+    ws["C2"].value = str(payload.get("advertiser_name", "")).strip()
 
-    wb = load_workbook(out_path)
-    ws = _pick_ws(wb)
+    ws["A3"].value = "Ürün:"
+    ws["C3"].value = str(payload.get("product_name", "")).strip()
 
-    # --- İstediğin mapping ---
-    # A1 label / C1 value mantığı: biz sadece C kolonuna yazıyoruz.
-    ws["C1"].value = (agency_name or "").strip()          # Ajans
-    ws["C2"].value = (advertiser_name or "").strip()      # Reklam Veren
-    ws["C3"].value = (product_name or "").strip()         # Ürün
-    ws["C4"].value = (plan_title or "").strip()           # Plan Başlığı
-    ws["C5"].value = reservation_no or ""                 # Rezervasyon No
-    ws["C6"].value = f"{month:02d}/{year}"                # Dönemi (AY/YIL)
+    ws["A4"].value = "Plan Başlığı:"
+    ws["C4"].value = str(payload.get("plan_title", "")).strip()
 
-    ws["U2"].value = (channel_name or "").strip()         # Kanal adı
-    ws["U3"].value = "Rezervasyon Formu"                  # Sabit başlık
+    ws["A5"].value = "Rezervasyon No:"
+    ws["C5"].value = str(payload.get("reservation_no", "")).strip()
 
-    # D67: A sayısı (Excel açılınca otomatik hesaplar)
-    ws["D67"].value = '=COUNTIF(C8:AG59,"A")'
+    # Dönemi: AY/YIL (plan_date varsa oradan üret)
+    period = str(payload.get("period", "")).strip()
+    if not period:
+        plan_date = str(payload.get("plan_date", "")).strip()  # "YYYY-MM-DD" bekliyoruz
+        try:
+            y, m, _ = plan_date.split("-")
+            period = f"{m}/{y}"
+        except Exception:
+            period = ""
 
-    # A67 / B67 değişebilir
-    if a67_text is not None:
-        ws["A67"].value = a67_text
-    if b67_text is not None:
-        ws["B67"].value = b67_text
+    ws["A6"].value = "Dönemi:"
+    ws["C6"].value = period
 
-    # A76 / AK77 / NOT alanları
-    if a76_text is not None:
-        ws["A76"].value = a76_text
-    if ak77_name is not None:
-        ws["AK77"].value = ak77_name
+    # Kanal adı
+    ch = str(payload.get("channel_name", "")).strip()
+    if ch:
+        ws["U2"].value = ch
 
-    # NOT: sabit, içerik değişken
-    nt = (note_text or "").strip()
-    ws["A77"].value = "NOT:" if not nt else f"NOT: {nt}"
+    # Sabit başlık
+    ws["U3"].value = "Rezervasyon Formu"
 
-    # Logo (AO/AP civarı)
-    if logo_path:
-        lp = Path(logo_path)
-        if lp.exists():
-            img = XLImage(str(lp))
-            img.anchor = logo_anchor  # default AO2
-            if logo_width is not None:
-                img.width = logo_width
-            if logo_height is not None:
-                img.height = logo_height
+    # --- Logo: openpyxl kaydederken uçtuğu için yeniden ekliyoruz ---
+    logo_path = resource_path("assets/RADIOSCOPE.PNG")
+    try:
+        ws._images = []  # tekrarlı basmayı önlemek için
+        if logo_path.exists():
+            img = Image(str(logo_path))
+            img.width = 128
+            img.height = 128
+            img.anchor = "AO1"   # AO/AP civarı
             ws.add_image(img)
+    except Exception:
+        # Logo basılamasa da export’u çöpe atmayalım
+        pass
 
-    # --- Gün başlıkları (C7=1.gün) ---
-    days_in_month = calendar.monthrange(year, month)[1]
-    for day in range(1, 32):
-        col_idx = 2 + day  # C=3 => day=1
-        col_letter = get_column_letter(col_idx)
-        header_cell = f"{col_letter}7"
+    # --- Değiştirilebilir alt alanlar ---
+    if payload.get("spot_code") is not None:
+        ws["A67"].value = str(payload.get("spot_code", "")).strip()
 
-        if day <= days_in_month:
-            dow = _TR_DOW[date(year, month, day).weekday()]
-            ws[header_cell].value = f"{dow}\n{day}"
-        else:
-            ws[header_cell].value = None
-            for r in range(8, 60):
-                ws[f"{col_letter}{r}"].value = None
+    if payload.get("spot_duration") is not None:
+        try:
+            ws["B67"].value = int(payload.get("spot_duration"))
+        except Exception:
+            pass
 
+    # D67 adet: şimdilik payload'dan, plan grid gelince otomatik saydırırız
+    if payload.get("adet_total") is not None:
+        try:
+            ws["D67"].value = f"({int(payload.get('adet_total'))} Adet )"
+        except Exception:
+            pass
+
+    if payload.get("client_name") is not None:
+        ws["A76"].value = str(payload.get("client_name", "")).strip()
+
+    # NOT: sabit, içerik değişebilir
+    note = str(payload.get("note_text", "")).strip()
+    ws["A77"].value = "NOT:" if not note else f"NOT: {note}"
+
+    # İsim değişebilir
+    if payload.get("prepared_by") is not None:
+        ws["AK77"].value = str(payload.get("prepared_by", "")).strip()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
-    wb.close()
     return out_path
