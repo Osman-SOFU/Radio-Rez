@@ -54,6 +54,47 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     # Sabit başlık
     ws["U3"].value = "Rezervasyon Formu"
 
+    # --- PLAN GRID: temizle + doldur ---
+    plan_cells = payload.get("plan_cells") or {}
+
+    # Template'te plan grid başlangıcı: C8 (gün 1) varsayımı
+    # Satırlar: 07:00-20:00, 15 dk => 52 satır (8..59)
+    # Kolonlar: gün 1..31 => C..AG (3..33)
+    GRID_START_ROW = 8
+    GRID_START_COL = 3   # C
+    GRID_ROWS = 52
+    GRID_DAYS_MAX = 31
+
+    # 1) Önce tüm grid alanını boşalt (eski A'lar geri gelmesin diye)
+    for r in range(GRID_START_ROW, GRID_START_ROW + GRID_ROWS):
+        for c in range(GRID_START_COL, GRID_START_COL + GRID_DAYS_MAX):
+            ws.cell(r, c).value = None
+
+    # 2) Sonra uygulamada girilenleri bas
+    # plan_cells formatı: {(row_idx, day): "A"} veya {"row_idx,day": "A"} gelebilir
+    for key, val in plan_cells.items():
+        try:
+            if isinstance(key, str):
+                # "12,5" gibi gelirse
+                row_idx_str, day_str = key.split(",")
+                row_idx = int(row_idx_str)
+                day = int(day_str)
+            else:
+                row_idx, day = key  # tuple
+                row_idx = int(row_idx)
+                day = int(day)
+
+            if not (0 <= row_idx < GRID_ROWS and 1 <= day <= GRID_DAYS_MAX):
+                continue
+
+            rr = GRID_START_ROW + row_idx
+            cc = GRID_START_COL + (day - 1)
+            ws.cell(rr, cc).value = str(val)
+
+        except Exception:
+            # bozuk key gelirse export'u patlatmayalım
+            continue
+
     # --- Logo: openpyxl kaydederken uçtuğu için yeniden ekliyoruz ---
     logo_path = resource_path("assets/RADIOSCOPE.PNG")
     try:

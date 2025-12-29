@@ -7,13 +7,15 @@ from PySide6.QtCore import Qt, QTime, QDate
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTabWidget, QFileDialog, QMessageBox, QListWidget,
-    QDateEdit, QTimeEdit, QGroupBox
+    QDateEdit, QTimeEdit, QGroupBox, QSpinBox
 )
 
 from src.settings.app_settings import SettingsService, AppSettings
 from src.storage.db import ensure_data_folders, connect_db, migrate_and_seed
 from src.storage.repository import Repository
 from src.export.excel_exporter import export_excel
+from src.ui.planning_grid import PlanningGrid
+
 
 TAB_NAMES = [
     "REZERVASYON ve PLANLAMA",
@@ -127,8 +129,46 @@ class MainWindow(QMainWindow):
         tab = self.tab_widgets["REZERVASYON ve PLANLAMA"]
         layout = QVBoxLayout(tab)
 
+        row0 = QHBoxLayout()
+        layout.addLayout(row0)
+
+        row0.addWidget(QLabel("Ajans:"))
+        self.in_agency = QLineEdit()
+        row0.addWidget(self.in_agency, 2)
+
+        row0.addWidget(QLabel("Ürün:"))
+        self.in_product = QLineEdit()
+        row0.addWidget(self.in_product, 2)
+
+        row0b = QHBoxLayout()
+        layout.addLayout(row0b)
+
+        row0b.addWidget(QLabel("Plan Başlığı:"))
+        self.in_plan_title = QLineEdit()
+        row0b.addWidget(self.in_plan_title, 3)
+
+        row0b.addWidget(QLabel("Kod:"))
+        self.in_spot_code = QLineEdit()
+        row0b.addWidget(self.in_spot_code, 1)
+
+        row0b.addWidget(QLabel("Süre (sn):"))
+        self.in_spot_duration = QSpinBox()
+        self.in_spot_duration.setRange(0, 9999)
+        row0b.addWidget(self.in_spot_duration, 1)
+
+        row0c = QHBoxLayout()
+        layout.addLayout(row0c)
+
+        row0c.addWidget(QLabel("Not:"))
+        self.in_note = QLineEdit()
+        row0c.addWidget(self.in_note, 4)
+
+        row0c.addWidget(QLabel("Formu Oluşturan:"))
+        self.in_prepared_by = QLineEdit()
+        row0c.addWidget(self.in_prepared_by, 2)
         row1 = QHBoxLayout()
         layout.addLayout(row1)
+        
         row1.addWidget(QLabel("Reklamveren:"))
         self.in_advertiser = QLineEdit()
         row1.addWidget(self.in_advertiser, 2)
@@ -152,8 +192,17 @@ class MainWindow(QMainWindow):
 
         self.in_time.timeChanged.connect(self.on_time_changed)
         self.on_time_changed(self.in_time.time())
+        # --- Excel benzeri plan grid ---
+        self.plan_grid = PlanningGrid()
+        layout.addWidget(self.plan_grid, 1)
 
-        layout.addStretch(1)
+        # Tarih değişince grid ay/gün vurgusunu güncelle
+        self.in_date.dateChanged.connect(self.on_plan_date_changed)
+
+        # ilk açılışta da set et
+        self.on_plan_date_changed(self.in_date.date())
+        
+
 
     def on_time_changed(self, qt: QTime) -> None:
         t = time(qt.hour(), qt.minute(), qt.second())
@@ -193,6 +242,16 @@ class MainWindow(QMainWindow):
             return
         self.in_advertiser.setText(item.text())
 
+    def _sanitize_plan_cells(self, plan_cells: dict) -> dict[str, str]:
+        fixed: dict[str, str] = {}
+        for k, v in (plan_cells or {}).items():
+            if isinstance(k, tuple) and len(k) == 2:
+                kk = f"{k[0]},{k[1]}"
+            else:
+                kk = str(k)
+            fixed[kk] = "" if v is None else str(v)
+        return fixed
+
     def on_confirm(self) -> None:
         adv = self.in_advertiser.text().strip()
         if not adv:
@@ -209,16 +268,34 @@ class MainWindow(QMainWindow):
         t = time(qt.hour(), qt.minute(), qt.second())
         dt_odt = classify_dt_odt(t)
 
+        plan_cells = self._sanitize_plan_cells(self.plan_grid.get_matrix())
+
+        prepared_name = self.in_prepared_by.text().strip()
+        stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
+        prepared_by = f"{prepared_name} - {stamp}" if prepared_name else stamp
+
         self.current_payload = {
+            "agency_name": self.in_agency.text().strip(),
             "advertiser_name": adv,
+            "product_name": self.in_product.text().strip(),
+            "plan_title": self.in_plan_title.text().strip(),
+
             "plan_date": d.isoformat(),
             "spot_time": f"{t.hour:02d}:{t.minute:02d}",
             "dt_odt": dt_odt,
+
+            "spot_code": self.in_spot_code.text().strip(),
+            "spot_duration": int(self.in_spot_duration.value()),
+            "note_text": self.in_note.text().strip(),
+            "prepared_by": prepared_by,
+
+            "plan_cells": plan_cells,
         }
 
         self.btn_test_export.setEnabled(True)
         self.btn_save_export.setEnabled(True)
         QMessageBox.information(self, "OK", "Onaylandı. Artık test veya kayıt alabilirsin.")
+
 
     def on_test_export(self) -> None:
         if not self.current_payload:
@@ -259,3 +336,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "OK", f"Kaydedildi ve çıktı alındı:\n{out_path}")
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
+
+    def on_plan_date_changed(self, qd: QDate) -> None:
+        d = qd.toPython()
+        self.plan_grid.set_month(d.year, d.month, d.day)
