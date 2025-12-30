@@ -14,6 +14,7 @@ import calendar
 from datetime import date
 from openpyxl.utils import get_column_letter
 from collections import Counter
+from openpyxl import Workbook
 
 TR_DOW = ["Pt", "Sa", "Ça", "Pş", "Cu", "Ct", "Pa"]  # Monday=0
 
@@ -269,3 +270,86 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
     return out_path
+
+def export_kod_tanimi(out_path, advertiser_name: str, rows: list[dict]) -> None:
+    """
+    KOD TANIMI çıktısını, assets/kod_tanimi_template.xlsx şablonunun görsel stilini koruyarak üretir.
+    Tablo yerleşimi şablondaki gibi C5:F13 aralığındadır.
+    """
+    out_path = Path(out_path)
+
+    template_path = resource_path("assets/kod_tanimi_template.xlsx")
+    if template_path.exists():
+        wb = openpyxl.load_workbook(template_path)
+        ws = wb["KOPYA TANIMI"] if "KOPYA TANIMI" in wb.sheetnames else wb.active
+    else:
+        # Fallback: basit boş dosya
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "KOPYA TANIMI"
+        # Header
+        ws["C5"].value = "Kod"
+        ws["D5"].value = "Kod Tanımı"
+        ws["E5"].value = "Kod Uzunluğu (SN)"
+        ws["F5"].value = "Dağılım"
+
+    start_row = 6
+    base_rows = 7  # şablonda 6..12
+    total_row = start_row + base_rows  # 13
+
+    # --- satır sayısını ihtiyaca göre büyüt (7'yi aşarsa) ---
+    n = len(rows)
+    if n > base_rows:
+        insert_count = n - base_rows
+        ws.insert_rows(total_row, amount=insert_count)
+
+        # 12. satırın (son veri satırı) stilini yeni satırlara kopyala
+        src_row = total_row - 1  # eski 12
+        for i in range(insert_count):
+            dst_row = src_row + 1 + i
+            for col in range(3, 7):  # C..F
+                src = ws.cell(src_row, col)
+                dst = ws.cell(dst_row, col)
+                dst._style = copy(src._style)
+                dst.number_format = src.number_format
+                dst.font = copy(src.font)
+                dst.border = copy(src.border)
+                dst.fill = copy(src.fill)
+                dst.alignment = copy(src.alignment)
+                dst.protection = copy(src.protection)
+                dst.comment = None
+
+        total_row += insert_count
+
+    # --- önce tabloyu temizle (şablondaki örnek veriler varsa sil) ---
+    max_data_rows = max(base_rows, n)
+    for r in range(start_row, start_row + max_data_rows):
+        for c in range(3, 7):  # C..F
+            ws.cell(r, c).value = None
+
+    # --- verileri yaz ---
+    for i, r in enumerate(rows):
+        rr = start_row + i
+        ws.cell(rr, 3).value = r.get("code", "")
+        ws.cell(rr, 4).value = r.get("code_desc", "")
+        ws.cell(rr, 5).value = int(r.get("length_sn", 0) or 0)
+        ws.cell(rr, 6).value = float(r.get("distribution", 0.0) or 0.0)
+
+        # Dağılım yüzde formatında görünsün
+        ws.cell(rr, 6).number_format = "0%"
+
+    # --- kalan satırları boş bırak ama format kalsın ---
+    # (şablon zaten formatlı, biz sadece value None bıraktık)
+
+    # --- Ort.Uzun. formülleri: dinamik aralık ---
+    last_data_row = start_row + max_data_rows - 1
+    ws.cell(total_row, 3).value = "Ort.Uzun."
+    ws.cell(total_row, 5).value = f"=SUMPRODUCT(E{start_row}:E{last_data_row},F{start_row}:F{last_data_row})"
+    ws.cell(total_row, 6).value = f"=SUM(F{start_row}:F{last_data_row})"
+
+    # toplam dağılım hücresi yüzde görünsün
+    ws.cell(total_row, 6).number_format = "0%"
+
+    # küçük bir başlık (dosya adı vs.) istersen buraya eklenir; şimdilik dokunmuyoruz.
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)

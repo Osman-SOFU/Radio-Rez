@@ -4,10 +4,11 @@ from pathlib import Path
 from datetime import time
 
 from PySide6.QtCore import Qt, QTime, QDate
+from PySide6.QtGui import QColor, QBrush, QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTabWidget, QFileDialog, QMessageBox, QListWidget,
-    QDateEdit, QTimeEdit, QGroupBox, QSpinBox
+    QDateEdit, QTimeEdit, QGroupBox, QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView
 )
 
 from src.settings.app_settings import SettingsService, AppSettings
@@ -27,7 +28,7 @@ TAB_NAMES = [
     "REZERVASYON ve PLANLAMA",
     "PLAN ÖZET",
     "SPOTLİST+",
-    "KOPYA TANIMI",
+    "KOD TANIMI",
     "Fiyat ve Kanal Tanımı",
     "DT-ODT",
     "Erişim Örneği",
@@ -118,6 +119,8 @@ class MainWindow(QMainWindow):
         # Bootstrap storage
         self.bootstrap_storage()
 
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        self._build_kod_tanimi_tab()
     def _build_first_tab(self) -> None:
         tab = self.tab_widgets["REZERVASYON ve PLANLAMA"]
         layout = QVBoxLayout(tab)
@@ -320,3 +323,153 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "OK", f"Kaydedildi ve çıktı alındı:\n{out_path}")
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
+
+    def on_tab_changed(self, idx: int) -> None:
+        if self.tabs.tabText(idx) == "KOD TANIMI":
+            self.refresh_kod_tanimi()
+
+    def _build_kod_tanimi_tab(self) -> None:
+        tab = self.tab_widgets["KOD TANIMI"]
+        layout = QVBoxLayout(tab)
+
+        btn_row = QHBoxLayout()
+        layout.addLayout(btn_row)
+
+        self.btn_kod_refresh = QPushButton("Yenile")
+        self.btn_kod_delete = QPushButton("Seçili Kodu Sil")
+        self.btn_kod_export = QPushButton("Excel Çıktısı")
+
+        btn_row.addWidget(self.btn_kod_refresh)
+        btn_row.addWidget(self.btn_kod_delete)
+        btn_row.addWidget(self.btn_kod_export)
+        btn_row.addStretch(1)
+
+        self.kod_table = QTableWidget()
+        self.kod_table.setColumnCount(4)
+        self.kod_table.setHorizontalHeaderLabels(["Kod", "Kod Tanımı", "Kod Uzunluğu (SN)", "Dağılım"])
+        # Görsel stil (Excel'e yakın)
+        self.kod_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.kod_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.kod_table.setAlternatingRowColors(True)
+        self.kod_table.verticalHeader().setVisible(False)
+        self.kod_table.setShowGrid(True)
+
+        hdr = self.kod_table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Kod
+        hdr.setSectionResizeMode(1, QHeaderView.Stretch)           # Kod Tanımı
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # Uzunluk
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Dağılım
+
+        self.kod_table.setStyleSheet("""
+            QHeaderView::section {
+                background-color: #F28C28;
+                color: white;
+                font-weight: bold;
+                padding: 6px;
+                border: 1px solid #B56A1E;
+            }
+            QTableWidget {
+                gridline-color: #A0A0A0;
+                selection-background-color: #CFE8FF;
+            }
+        """)
+
+        layout.addWidget(self.kod_table, 1)
+
+        self.btn_kod_refresh.clicked.connect(self.refresh_kod_tanimi)
+        self.btn_kod_delete.clicked.connect(self.delete_selected_kod)
+        self.btn_kod_export.clicked.connect(self.export_kod_tanimi_excel)
+
+    def refresh_kod_tanimi(self) -> None:
+        if not self.service:
+            return
+        adv = self.in_advertiser.text().strip()
+        if not adv:
+            return
+
+        rows = self.service.get_kod_tanimi_rows(adv)
+        avg_len = self.service.get_kod_tanimi_avg_len(adv)
+
+        data_count = max(len(rows), 7)
+        self.kod_table.setRowCount(data_count + 1)
+
+        # Veri satırları
+        for i, r in enumerate(rows):
+            it0 = QTableWidgetItem(r["code"])
+            it0.setTextAlignment(Qt.AlignCenter)
+            self.kod_table.setItem(i, 0, it0)
+
+            it1 = QTableWidgetItem(r["code_desc"])
+            f_italic = QFont()
+            f_italic.setItalic(True)
+            it1.setFont(f_italic)
+            self.kod_table.setItem(i, 1, it1)
+
+            it2 = QTableWidgetItem(str(int(r["length_sn"])))
+            it2.setTextAlignment(Qt.AlignCenter)
+            self.kod_table.setItem(i, 2, it2)
+
+            it3 = QTableWidgetItem(f"{r['distribution']:.0%}")
+            it3.setTextAlignment(Qt.AlignCenter)
+            self.kod_table.setItem(i, 3, it3)
+
+        # Şablon gibi 7 satıra kadar boş satır göster
+        for rr in range(len(rows), data_count):
+            for cc in range(4):
+                it = QTableWidgetItem("")
+                it.setTextAlignment(Qt.AlignCenter if cc != 1 else Qt.AlignLeft | Qt.AlignVCenter)
+                self.kod_table.setItem(rr, cc, it)
+
+        # Toplam / Ortalama satırı
+        last = data_count
+        f_bi = QFont()
+        f_bi.setBold(True)
+        f_bi.setItalic(True)
+
+        it0 = QTableWidgetItem("Ort.Uzun.")
+        it0.setFont(f_bi)
+        self.kod_table.setItem(last, 0, it0)
+
+        it2 = QTableWidgetItem(f"{avg_len:.2f}")
+        it2.setTextAlignment(Qt.AlignCenter)
+        it2.setFont(f_bi)
+        self.kod_table.setItem(last, 2, it2)
+
+        it3 = QTableWidgetItem(f"{sum(r['distribution'] for r in rows):.0%}")
+        it3.setTextAlignment(Qt.AlignCenter)
+        it3.setFont(f_bi)
+        it3.setBackground(QBrush(QColor("#8BC34A")))
+        self.kod_table.setItem(last, 3, it3)
+
+    def delete_selected_kod(self) -> None:
+        if not self.service:
+            return
+        adv = self.in_advertiser.text().strip()
+        row = self.kod_table.currentRow()
+        if row < 0:
+            return
+        code_item = self.kod_table.item(row, 0)
+        if not code_item:
+            return
+        code = code_item.text().strip()
+        if not code or code == "Ort.Uzun.":
+            return
+
+        deleted = self.service.delete_kod_for_advertiser(adv, code)
+        QMessageBox.information(self, "OK", f"{code} koduna ait {deleted} kayıt silindi.")
+        self.refresh_kod_tanimi()
+
+    def export_kod_tanimi_excel(self) -> None:
+        if not self.service:
+            return
+        adv = self.in_advertiser.text().strip()
+        if not adv:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "KOD TANIMI Excel", f"{adv}_KOD_TANIMI.xlsx", "Excel Files (*.xlsx)")
+        if not path:
+            return
+
+        self.service.export_kod_tanimi_excel(path, adv)
+        QMessageBox.information(self, "OK", f"Excel çıktısı oluşturuldu:\n{path}")

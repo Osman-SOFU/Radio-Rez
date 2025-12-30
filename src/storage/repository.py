@@ -122,3 +122,55 @@ class Repository:
             is_confirmed=1 if confirmed else 0,
             payload=payload,
         )
+
+    def list_confirmed_reservations_by_advertiser(self, advertiser_name: str, limit: int = 5000):
+        cur = self.conn.execute(
+            """
+            SELECT * FROM reservations
+            WHERE advertiser_name = ? AND is_confirmed = 1
+            ORDER BY datetime(created_at) DESC
+            LIMIT ?
+            """,
+            (advertiser_name, limit),
+        )
+        out = []
+        for r in cur.fetchall():
+            out.append(
+                ReservationRecord(
+                    id=r["id"],
+                    reservation_no=r["reservation_no"],
+                    advertiser_name=r["advertiser_name"],
+                    created_at=r["created_at"],
+                    is_confirmed=r["is_confirmed"],
+                    payload=json.loads(r["payload_json"]),
+                )
+            )
+        return out
+
+    def delete_reservations_by_ids(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        self.conn.execute("BEGIN")
+        try:
+            # SQLite 999 param sınırı için chunk
+            for i in range(0, len(ids), 900):
+                chunk = ids[i:i+900]
+                q = ",".join(["?"] * len(chunk))
+                self.conn.execute(f"DELETE FROM reservations WHERE id IN ({q})", chunk)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_reservations_by_advertiser_and_spot_code(self, advertiser_name: str, spot_code: str) -> int:
+        spot_code = (spot_code or "").strip()
+        if not spot_code:
+            return 0
+
+        recs = self.list_confirmed_reservations_by_advertiser(advertiser_name, limit=50000)
+        ids = [
+            r.id for r in recs
+            if (r.payload.get("spot_code") or "").strip() == spot_code
+        ]
+        self.delete_reservations_by_ids(ids)
+        return len(ids)

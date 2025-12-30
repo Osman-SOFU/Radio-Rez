@@ -101,3 +101,53 @@ class ReservationService:
 
         export_excel(template_path, out_path, payload2)
         return out_path
+
+    def get_kod_tanimi_rows(self, advertiser_name: str) -> list[dict]:
+        recs = self.repo.list_confirmed_reservations_by_advertiser(advertiser_name)
+
+        grouped: dict[str, dict] = {}
+        total = 0
+
+        for r in recs:
+            code = (r.payload.get("spot_code") or "").strip()
+            if not code:
+                continue
+
+            total += 1
+            if code not in grouped:
+                grouped[code] = {
+                    "code": code,
+                    "code_desc": (r.payload.get("code_definition") or "").strip(),
+                    "length_sn": int(r.payload.get("spot_duration_sec") or 0),
+                    "count": 0,
+                }
+
+            grouped[code]["count"] += 1
+
+            # aynı koda yeni tanım/süre girildiyse "son kayıt kazansın"
+            cd = (r.payload.get("code_definition") or "").strip()
+            if cd:
+                grouped[code]["code_desc"] = cd
+
+            if r.payload.get("spot_duration_sec") is not None:
+                grouped[code]["length_sn"] = int(r.payload.get("spot_duration_sec") or 0)
+
+        rows = list(grouped.values())
+        rows.sort(key=lambda x: x["code"])
+
+        for row in rows:
+            row["distribution"] = (row["count"] / total) if total > 0 else 0.0
+
+        return rows
+
+    def get_kod_tanimi_avg_len(self, advertiser_name: str) -> float:
+        rows = self.get_kod_tanimi_rows(advertiser_name)
+        return sum(r["length_sn"] * r["distribution"] for r in rows) if rows else 0.0
+
+    def delete_kod_for_advertiser(self, advertiser_name: str, code: str) -> int:
+        return self.repo.delete_reservations_by_advertiser_and_spot_code(advertiser_name, code)
+
+    def export_kod_tanimi_excel(self, out_path, advertiser_name: str) -> None:
+        from src.export.excel_exporter import export_kod_tanimi
+        rows = self.get_kod_tanimi_rows(advertiser_name)
+        export_kod_tanimi(out_path, advertiser_name, rows)
