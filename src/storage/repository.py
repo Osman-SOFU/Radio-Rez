@@ -27,7 +27,6 @@ class Repository:
             "INSERT OR IGNORE INTO advertisers(name) VALUES(?)",
             (name,),
         )
-        self.conn.commit()
 
     def search_advertisers(self, q: str, limit: int = 20) -> list[str]:
         q = q.strip()

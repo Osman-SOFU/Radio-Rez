@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime, date, time
+from datetime import time
 
 from PySide6.QtCore import Qt, QTime, QDate
 from PySide6.QtWidgets import (
@@ -13,8 +13,14 @@ from PySide6.QtWidgets import (
 from src.settings.app_settings import SettingsService, AppSettings
 from src.storage.db import ensure_data_folders, connect_db, migrate_and_seed
 from src.storage.repository import Repository
-from src.export.excel_exporter import export_excel
 from src.ui.planning_grid import PlanningGrid
+
+
+from src.domain.models import ReservationDraft, ConfirmedReservation
+from src.services.reservation_service import ReservationService
+from src.domain.time_rules import classify_dt_odt  # label güncellemek için
+
+
 
 
 TAB_NAMES = [
@@ -27,21 +33,6 @@ TAB_NAMES = [
     "Erişim Örneği",
 ]
 
-def classify_dt_odt(t: time) -> str:
-    # DT: 07:00–10:00 ve 17:00–20:00 (sınırlar dahil varsayıyorum)
-    mins = t.hour * 60 + t.minute
-    dt1 = 7 * 60 <= mins <= 10 * 60
-    dt2 = 17 * 60 <= mins <= 20 * 60
-    return "DT" if (dt1 or dt2) else "ODT"
-
-def validate_day(plan_date: date) -> tuple[bool, str]:
-    # QDate zaten geçersiz gün seçtirmez; yine de kuralı burada tutuyoruz.
-    try:
-        _ = plan_date.toordinal()
-        return True, ""
-    except Exception:
-        return False, "Geçersiz tarih."
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -52,8 +43,9 @@ class MainWindow(QMainWindow):
         self.app_settings: AppSettings = self.settings_service.build()
 
         self.repo: Repository | None = None
-        self.current_payload: dict | None = None
-
+        self.service: ReservationService | None = None
+        self.current_confirmed: ConfirmedReservation | None = None
+        
         root = QWidget()
         self.setCentralWidget(root)
         main = QVBoxLayout(root)
@@ -213,9 +205,7 @@ class MainWindow(QMainWindow):
         self.in_date.dateChanged.connect(self.on_plan_date_changed)
 
         # ilk açılışta da set et
-        self.on_plan_date_changed(self.in_date.date())
-        
-
+        self.on_plan_date_changed(self.in_date.date())       
 
     def on_time_changed(self, qt: QTime) -> None:
         t = time(qt.hour(), qt.minute(), qt.second())
@@ -227,6 +217,7 @@ class MainWindow(QMainWindow):
         conn = connect_db(db_path)
         migrate_and_seed(conn)
         self.repo = Repository(conn)
+        self.service = ReservationService(self.repo)
 
     def pick_data_folder(self) -> None:
         p = QFileDialog.getExistingDirectory(self, "Veri klasörünü seç")
@@ -248,114 +239,84 @@ class MainWindow(QMainWindow):
         for name in self.repo.search_advertisers(text, limit=30):
             self.list_advertisers.addItem(name)
 
-    def on_advertiser_selected(self) -> None:
-        # MVP: seçince sadece reklamveren input'una basıyoruz
-        item = self.list_advertisers.currentItem()
+    def on_advertiser_selected(self, item) -> None:
         if not item:
             return
         self.in_advertiser.setText(item.text())
 
-    def _sanitize_plan_cells(self, plan_cells: dict) -> dict[str, str]:
-        fixed: dict[str, str] = {}
-        for k, v in (plan_cells or {}).items():
-            if isinstance(k, tuple) and len(k) == 2:
-                kk = f"{k[0]},{k[1]}"
-            else:
-                kk = str(k)
-            fixed[kk] = "" if v is None else str(v)
-        return fixed
+    def on_plan_date_changed(self, qd: QDate) -> None:
+        d = qd.toPython()
+        self.plan_grid.set_month(d.year, d.month, d.day)
 
     def on_confirm(self) -> None:
-        adv = self.in_advertiser.text().strip()
-        if not adv:
-            QMessageBox.warning(self, "Hata", "Reklamveren zorunlu.")
+        if not self.service:
+            QMessageBox.warning(self, "Hata", "Servis hazır değil (DB bağlantısı yok).")
             return
 
-        d = self.in_date.date().toPython()
-        ok, msg = validate_day(d)
-        if not ok:
-            QMessageBox.warning(self, "Hata", msg)
-            return
+        try:
+            qt = self.in_time.time()
+            spot_t = time(qt.hour(), qt.minute(), qt.second())
 
-        qt = self.in_time.time()
-        t = time(qt.hour(), qt.minute(), qt.second())
-        dt_odt = classify_dt_odt(t)
+            draft = ReservationDraft(
+                advertiser_name=self.in_advertiser.text(),
+                plan_date=self.in_date.date().toPython(),
+                spot_time=spot_t,
+                agency_name=self.in_agency.text(),
+                product_name=self.in_product.text(),
+                plan_title=self.in_plan_title.text(),
+                spot_code=self.in_spot_code.text(),
+                spot_duration_sec=int(self.in_spot_duration.value()),
+                code_definition=self.in_code_definition.text(),
+                note_text=self.in_note.text(),
+                prepared_by_name=self.in_prepared_by.text(),
+            )
 
-        plan_cells = self._sanitize_plan_cells(self.plan_grid.get_matrix())
+            # ✅ Grid verisi buradan alınacak
+            plan_cells = self.plan_grid.get_matrix()
 
-        adet_total = sum(1 for v in plan_cells.values() if str(v).strip())
+            self.current_confirmed = self.service.confirm(draft, plan_cells)
 
-        prepared_name = self.in_prepared_by.text().strip()
-        stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
-        prepared_by = f"{prepared_name} - {stamp}" if prepared_name else stamp
+            self.btn_test_export.setEnabled(True)
+            self.btn_save_export.setEnabled(True)
 
-        self.current_payload = {
-            "agency_name": self.in_agency.text().strip(),
-            "advertiser_name": adv,
-            "product_name": self.in_product.text().strip(),
-            "plan_title": self.in_plan_title.text().strip(),
+            QMessageBox.information(self, "OK", "Onaylandı. Artık test/kayıt çıktısı alabilirsin.")
+        except Exception as e:
+            QMessageBox.warning(self, "Hata", str(e))
 
-            "plan_date": d.isoformat(),
-            "spot_time": f"{t.hour:02d}:{t.minute:02d}",
-            "dt_odt": dt_odt,
 
-            "spot_code": self.in_spot_code.text().strip(),
-            "spot_duration": int(self.in_spot_duration.value()),
-            "note_text": self.in_note.text().strip(),
-            "prepared_by": prepared_by,
-
-            "plan_cells": plan_cells,
-
-            "adet_total": adet_total,
-            "code_definition": self.in_code_definition.text().strip(),
-
-        }
-
-        self.btn_test_export.setEnabled(True)
-        self.btn_save_export.setEnabled(True)
-        QMessageBox.information(self, "OK", "Onaylandı. Artık test veya kayıt alabilirsin.")
+    def _resolve_template_path(self) -> Path:
+        # AppSettings içinde template_path varsa onu kullan, yoksa assets/template.xlsx'e düş
+        tp = getattr(self.app_settings, "template_path", None)
+        if tp:
+            return Path(tp)
+        return Path("assets") / "template.xlsx"
 
 
     def on_test_export(self) -> None:
-        if not self.current_payload:
+        if not self.service or not self.current_confirmed:
+            QMessageBox.warning(self, "Hata", "Önce Onayla.")
             return
-        out_dir = self.app_settings.data_dir / "exports"
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = out_dir / f"TEST_{ts}.xlsx"
-
-        payload = dict(self.current_payload)
-        payload["reservation_no"] = ""  # testte yok
-        payload["created_at"] = datetime.now().isoformat(timespec="seconds")
 
         try:
-            export_excel(self.app_settings.template_path, out_path, payload)
+            template_path = self._resolve_template_path()
+            out_dir = self.app_settings.data_dir / "exports"
+            out_path = self.service.export_test(template_path, out_dir, self.current_confirmed)
+
             QMessageBox.information(self, "OK", f"Test çıktısı üretildi:\n{out_path}")
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
 
+
     def on_save_export(self) -> None:
-        if not self.current_payload or not self.repo:
+        if not self.service or not self.current_confirmed:
+            QMessageBox.warning(self, "Hata", "Önce Onayla.")
             return
 
         try:
-            rec = self.repo.create_reservation(
-                advertiser_name=self.current_payload["advertiser_name"],
-                payload=self.current_payload,
-                confirmed=True,
-            )
-
+            template_path = self._resolve_template_path()
             out_dir = self.app_settings.data_dir / "exports"
-            out_path = out_dir / f"{rec.reservation_no}.xlsx"
+            out_path = self.service.save_and_export(template_path, out_dir, self.current_confirmed)
 
-            payload = dict(rec.payload)
-            payload["reservation_no"] = rec.reservation_no
-            payload["created_at"] = rec.created_at
-
-            export_excel(self.app_settings.template_path, out_path, payload)
             QMessageBox.information(self, "OK", f"Kaydedildi ve çıktı alındı:\n{out_path}")
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
-
-    def on_plan_date_changed(self, qd: QDate) -> None:
-        d = qd.toPython()
-        self.plan_grid.set_month(d.year, d.month, d.day)

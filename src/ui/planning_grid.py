@@ -8,16 +8,9 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem
 
+from src.domain.time_rules import classify_dt_odt
 
 TR_DOW = ["Pt", "Sa", "Ça", "Pş", "Cu", "Ct", "Pa"]  # Monday=0
-
-
-def classify_dt_odt(t: dtime) -> str:
-    mins = t.hour * 60 + t.minute
-    dt1 = 7 * 60 <= mins <= 10 * 60
-    dt2 = 17 * 60 <= mins <= 20 * 60
-    return "DT" if (dt1 or dt2) else "ODT"
-
 
 def build_timeslots(start="07:00", end="20:00", step_min=15):
     sh, sm = map(int, start.split(":"))
