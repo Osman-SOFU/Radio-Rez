@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import time, datetime
 
-from PySide6.QtCore import Qt, QTime, QDate, QEvent
+from PySide6.QtCore import Qt, QDate, QEvent
 from PySide6.QtGui import QColor, QBrush, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTabWidget, QFileDialog, QMessageBox, QListWidget,
-    QDateEdit, QTimeEdit, QGroupBox, QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox, QApplication, QInputDialog
+    QDateEdit, QGroupBox, QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView, QAbstractItemDelegate, QHeaderView, QComboBox, QApplication, QInputDialog
 )
 
 from src.settings.app_settings import SettingsService, AppSettings
@@ -19,7 +19,7 @@ from src.ui.planning_grid import PlanningGrid
 
 from src.domain.models import ReservationDraft, ConfirmedReservation
 from src.services.reservation_service import ReservationService
-from src.domain.time_rules import classify_dt_odt  # label güncellemek için
+from src.domain.time_rules import classify_dt_odt  # exporter tarafında kullanılıyor; burada sadece ortak import
 
 import re
 
@@ -32,7 +32,6 @@ TAB_NAMES = [
     "SPOTLİST+",
     "KOD TANIMI",
     "Fiyat ve Kanal Tanımı",
-    "DT-ODT",
     "Erişim Örneği",
 ]
 
@@ -194,20 +193,12 @@ class MainWindow(QMainWindow):
         self.in_date.setFixedWidth(120)
         row2.addWidget(self.in_date)
 
-        row2.addWidget(QLabel("Spot Saat:"))
-        self.in_time = QTimeEdit()
-        self.in_time.setTime(QTime.currentTime())
-        self.in_time.setFixedWidth(80)
-        row2.addWidget(self.in_time)
-
-        self.lbl_dt_odt = QLabel("DT/ODT: -")
-        self.lbl_dt_odt.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.lbl_dt_odt.setMinimumWidth(80)
-        row2.addWidget(self.lbl_dt_odt)
+        row2.addSpacing(12)
+        row2.addWidget(QLabel("Kanal:"))
+        self.in_channel = QComboBox()
+        self.in_channel.setMinimumWidth(220)
+        row2.addWidget(self.in_channel)
         row2.addStretch(1)
-
-        self.in_time.timeChanged.connect(self.on_time_changed)
-        self.on_time_changed(self.in_time.time())
         # --- Excel benzeri plan grid ---
         self.plan_grid = PlanningGrid()
         layout.addWidget(self.plan_grid, 1)
@@ -218,9 +209,26 @@ class MainWindow(QMainWindow):
         # ilk açılışta da set et
         self.on_plan_date_changed(self.in_date.date())       
 
-    def on_time_changed(self, qt: QTime) -> None:
-        t = time(qt.hour(), qt.minute(), qt.second())
-        self.lbl_dt_odt.setText(f"DT/ODT: {classify_dt_odt(t)}")
+    def refresh_channel_combo(self) -> None:
+        """Rezervasyon sekmesindeki kanal listesini DB'den yeniler."""
+        if not getattr(self, "repo", None) or not hasattr(self, "in_channel"):
+            return
+        self.in_channel.blockSignals(True)
+        try:
+            current = self.in_channel.currentText().strip()
+            self.in_channel.clear()
+            self.in_channel.addItem("", None)
+
+            for ch in self.repo.list_channels(active_only=True):
+                self.in_channel.addItem(str(ch["name"]), int(ch["id"]))
+
+            # mümkünse eski seçimi geri yükle
+            if current:
+                idx = self.in_channel.findText(current)
+                if idx >= 0:
+                    self.in_channel.setCurrentIndex(idx)
+        finally:
+            self.in_channel.blockSignals(False)
 
     def bootstrap_storage(self) -> None:
         ensure_data_folders(self.app_settings.data_dir)
@@ -229,6 +237,9 @@ class MainWindow(QMainWindow):
         migrate_and_seed(conn)
         self.repo = Repository(conn)
         self.service = ReservationService(self.repo)
+
+        # UI bağımlı listeleri yenile
+        self.refresh_channel_combo()
 
     def pick_data_folder(self) -> None:
         p = QFileDialog.getExistingDirectory(self, "Veri klasörünü seç")
@@ -241,6 +252,7 @@ class MainWindow(QMainWindow):
 
         # Re-bootstrap
         self.bootstrap_storage()
+        self.refresh_price_channel_tab()
         QMessageBox.information(self, "OK", "Veri klasörü kaydedildi ve DB hazırlandı.")
 
     def on_search_changed(self, text: str) -> None:
@@ -253,7 +265,47 @@ class MainWindow(QMainWindow):
     def on_advertiser_selected(self, item) -> None:
         if not item:
             return
-        self.in_advertiser.setText(item.text())
+        name = item.text()
+        self.in_advertiser.setText(name)
+
+        # Seçili reklam veren için son kaydı forma geri getir
+        if not getattr(self, "repo", None):
+            return
+        recs = self.repo.list_confirmed_reservations_by_advertiser(name, limit=1)
+        if not recs:
+            return
+        p = recs[0].payload or {}
+
+        # Basit alanlar
+        self.in_agency.setText(str(p.get("agency_name", "") or ""))
+        self.in_product.setText(str(p.get("product_name", "") or ""))
+        self.in_plan_title.setText(str(p.get("plan_title", "") or ""))
+        self.in_spot_code.setText(str(p.get("spot_code", "") or ""))
+        self.in_code_definition.setText(str(p.get("code_definition", "") or ""))
+        self.in_note.setText(str(p.get("note_text", "") or ""))
+        self.in_prepared_by.setText(str(p.get("prepared_by_name", "") or ""))
+
+        try:
+            self.in_spot_duration.setValue(int(p.get("spot_duration_sec", 0) or 0))
+        except Exception:
+            pass
+
+        # Tarih + grid
+        try:
+            dstr = p.get("plan_date")
+            if dstr:
+                d = datetime.fromisoformat(str(dstr)).date()
+                self.in_date.setDate(QDate(d.year, d.month, d.day))
+        except Exception:
+            pass
+
+        # Kanal seçimi
+        self.refresh_channel_combo()
+        ch = str(p.get("channel_name", "") or "").strip()
+        if ch:
+            idx = self.in_channel.findText(ch)
+            if idx >= 0:
+                self.in_channel.setCurrentIndex(idx)
 
     def on_plan_date_changed(self, qd: QDate) -> None:
         d = qd.toPython()
@@ -265,13 +317,29 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            qt = self.in_time.time()
-            spot_t = time(qt.hour(), qt.minute(), qt.second())
+            # Spot saati kullanıcı girmiyor; Excel zaten çıktıda zaman damgasını basıyor.
+            spot_t = datetime.now().time().replace(microsecond=0)
+
+            # Kanal + plan tarihine göre fiyatlar
+            plan_d = self.in_date.date().toPython()
+            ch_name = self.in_channel.currentText().strip()
+            ch_id = self.in_channel.currentData()
+            dt_price = 0.0
+            odt_price = 0.0
+            if ch_id is not None:
+                try:
+                    price_map = self.repo.get_channel_prices(plan_d.year)
+                    dt_price, odt_price = price_map.get((int(ch_id), int(plan_d.month)), (0.0, 0.0))
+                except Exception:
+                    dt_price, odt_price = (0.0, 0.0)
 
             draft = ReservationDraft(
                 advertiser_name=self.in_advertiser.text(),
-                plan_date=self.in_date.date().toPython(),
+                plan_date=plan_d,
                 spot_time=spot_t,
+                channel_name=ch_name,
+                channel_price_dt=float(dt_price),
+                channel_price_odt=float(odt_price),
                 agency_name=self.in_agency.text(),
                 product_name=self.in_product.text(),
                 plan_title=self.in_plan_title.text(),
@@ -611,6 +679,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Hata", "DB bağlantısı yok.")
             return
 
+        # Hücre editöründe kalmış değer varsa (Enter'a basılmadıysa), kaydetmeden önce commit edelim.
+        try:
+            editor = QApplication.focusWidget()
+            if editor and self.price_table and self.price_table.isAncestorOf(editor):
+                self.price_table.closeEditor(editor, QAbstractItemDelegate.SubmitModelCache)
+                QApplication.processEvents()
+        except Exception:
+            pass
+
         year = int(self.price_year.value())
 
         try:
@@ -637,6 +714,7 @@ class MainWindow(QMainWindow):
 
             self.repo.set_meta("price_year", str(year))
             QMessageBox.information(self, "Tamam", "Fiyatlar kaydedildi.")
+            self.refresh_channel_combo()
         except Exception as e:
             QMessageBox.critical(self, "Hata", f"Kayıt sırasında hata: {e}")
 
@@ -655,6 +733,7 @@ class MainWindow(QMainWindow):
         try:
             self.repo.get_or_create_channel(name)
             self.refresh_price_channel_tab()
+            self.refresh_channel_combo()
         except Exception as e:
             QMessageBox.critical(self, "Hata", f"Kanal eklenemedi: {e}")
 
@@ -691,6 +770,7 @@ class MainWindow(QMainWindow):
         try:
             self.repo.deactivate_channel(int(cid))
             self.refresh_price_channel_tab()
+            self.refresh_channel_combo()
         except Exception as e:
             QMessageBox.critical(self, "Hata", f"Silinemedi: {e}")
 

@@ -59,6 +59,13 @@ class ReservationService:
             "spot_time": draft.spot_time.strftime("%H:%M"),
             "dt_odt": dt_odt,
 
+            # Kanal + fiyat (plan tarihinin AY/YIL'ına göre)
+            "channel_name": (draft.channel_name or "").strip(),
+            "channel_price_year": int(draft.plan_date.year),
+            "channel_price_month": int(draft.plan_date.month),
+            "channel_price_dt": float(draft.channel_price_dt or 0.0),
+            "channel_price_odt": float(draft.channel_price_odt or 0.0),
+
             "plan_cells": cells,
             "adet_total": adet_total,
             

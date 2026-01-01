@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from datetime import datetime
+from datetime import datetime, time
 
 import openpyxl
 from openpyxl.drawing.image import Image
@@ -12,11 +12,21 @@ from copy import copy
 
 import calendar
 from datetime import date
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, column_index_from_string
 from collections import Counter
 from openpyxl import Workbook
 
+from src.domain.time_rules import classify_dt_odt
+
 TR_DOW = ["Pt", "Sa", "Ça", "Pş", "Cu", "Ct", "Pa"]  # Monday=0
+
+
+def _row_idx_to_time(row_idx: int) -> time:
+    """Grid satırı -> kuşak başlangıç saati.
+    Şablon: 07:00-20:00, 15dk.
+    """
+    mins = 7 * 60 + int(row_idx) * 15
+    return time(mins // 60, mins % 60)
 
 def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -> Path:
     if not template_path.exists():
@@ -81,10 +91,11 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
         GRID_ROWS = 52
 
         # --- Şablondan "weekday/weekend" fill örneklerini otomatik yakala ---
-        # (ODT bir satır seçelim ki DT satır grisiyle karışmasın)
-        sample_row = GRID_START_ROW + 20
+        # Not: DT satırlarının şablonda ayrı bir tonu var. Önceki yaklaşım tek bir satırdan
+        # örnek aldığı için DT satırı tonunu ezip geçiyordu. Bu yüzden DT ve ODT için ayrı ayrı
+        # örnekleyip, export sırasında satır tipine göre fill basıyoruz.
 
-        # Grid alanında en sık görülen fill = weekday, daha az görülen = weekend                
+        # Grid alanında en sık görülen fill = weekday, daha az görülen = weekend
         def fill_sig_from_cell(cell):
             f = cell.fill
             # StyleProxy'yi hash'e sokmayacağız; sadece primitive imza
@@ -93,17 +104,27 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
             bg = getattr(getattr(f, "bgColor", None), "rgb", None)
             return (pt, fg, bg)
 
-        # Grid örnek fill'leri (sadece signature sayacağız)
-        grid_cells = []
-        for d in range(1, MAX_DAYS + 1):
-            c = FIRST_DAY_COL + (d - 1)
-            grid_cells.append(ws.cell(sample_row, c))
+        def analyze_grid_row(sample_row: int) -> tuple[Any, Any]:
+            """Verilen satır için (weekday_fill, weekend_fill) döndürür."""
+            cells = []
+            for d in range(1, MAX_DAYS + 1):
+                c = FIRST_DAY_COL + (d - 1)
+                cells.append(ws.cell(sample_row, c))
 
-        grid_sigs = [fill_sig_from_cell(cell) for cell in grid_cells]
-        g_cnt = Counter(grid_sigs).most_common()
+            sigs = [fill_sig_from_cell(cell) for cell in cells]
+            cnt = Counter(sigs).most_common()
+            weekday_sig = cnt[0][0] if cnt else None
+            weekend_sig = cnt[1][0] if len(cnt) > 1 else weekday_sig
 
-        weekday_sig = g_cnt[0][0] if g_cnt else None
-        weekend_sig = g_cnt[1][0] if len(g_cnt) > 1 else weekday_sig
+            def pick_fill(cells2, sig):
+                for cell in cells2:
+                    if fill_sig_from_cell(cell) == sig:
+                        return copy(cell.fill)
+                return None
+
+            weekday_fill = pick_fill(cells, weekday_sig)
+            weekend_fill = pick_fill(cells, weekend_sig) or weekday_fill
+            return weekday_fill, weekend_fill
 
         # Header örnek fill'leri
         header_cells = []
@@ -123,13 +144,18 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
                     return copy(cell.fill)  # proxy yerine kopya al
             return None
 
-        weekday_fill = pick_fill(grid_cells, weekday_sig)
-        weekend_fill = pick_fill(grid_cells, weekend_sig) or weekday_fill
-
         header_weekday_fill = pick_fill(header_cells, h_weekday_sig)
         header_weekend_fill = pick_fill(header_cells, h_weekend_sig) or header_weekday_fill
 
-        disabled_fill = weekend_fill or weekday_fill
+        # DT için örnek satır: 07:00 (row_idx=0)
+        dt_row = GRID_START_ROW + 0
+        # ODT için örnek satır: 11:00 (row_idx=16)  -> 10:15 sonrası ODT
+        odt_row = GRID_START_ROW + 16
+
+        dt_weekday_fill, dt_weekend_fill = analyze_grid_row(dt_row)
+        odt_weekday_fill, odt_weekend_fill = analyze_grid_row(odt_row)
+
+        disabled_fill = odt_weekday_fill or dt_weekday_fill
 
         for day in range(1, MAX_DAYS + 1):
             col = FIRST_DAY_COL + (day - 1)
@@ -140,7 +166,6 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
 
                 is_weekend = dow in ("Ct", "Pa")
                 hf = header_weekend_fill if is_weekend else header_weekday_fill
-                gf = weekend_fill if is_weekend else weekday_fill
             else:
                 ws.cell(HEADER_ROW, col).value = None
                 hf = header_weekday_fill  # header çok bozmasın
@@ -150,10 +175,23 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
             if hf is not None:
                 ws.cell(HEADER_ROW, col).fill = hf
 
-            # Grid fill uygula (C8..AG59)
-            if gf is not None:
-                for r in range(GRID_START_ROW, GRID_START_ROW + GRID_ROWS):
-                    ws.cell(r, col).fill = gf
+            # Grid fill uygula (C8..AG59) - satır tipine göre DT/ODT tonu koru
+            for row_idx in range(0, GRID_ROWS):
+                rr = GRID_START_ROW + row_idx
+
+                if day > days_in_month:
+                    if disabled_fill is not None:
+                        ws.cell(rr, col).fill = disabled_fill
+                    continue
+
+                slot_type = classify_dt_odt(_row_idx_to_time(row_idx))
+                if is_weekend:
+                    gf2 = dt_weekend_fill if slot_type == "DT" else odt_weekend_fill
+                else:
+                    gf2 = dt_weekday_fill if slot_type == "DT" else odt_weekday_fill
+
+                if gf2 is not None:
+                    ws.cell(rr, col).fill = gf2
 
         # Bir önceki export'tan gizli kalmış olabilecek kolonlar sadece 29-31.
         # 1..28 gibi kolonlara dokunursak şablonun range genişlikleri bozulabiliyor.
@@ -170,10 +208,10 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
             # İstersen ekstra: genişliği de sıfıra yakın yap
             # ws.column_dimensions[col_letter].width = 0.1
 
-    # Kanal adı
+    # Kanal adı (Excel'de T2)
     ch = str(payload.get("channel_name", "")).strip()
     if ch:
-        ws["U2"].value = ch
+        ws["T2"].value = ch
 
     # Sabit başlık
     ws["U3"].value = "Rezervasyon Formu"
@@ -219,6 +257,21 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
             # bozuk key gelirse export'u patlatmayalım
             continue
 
+    # --- Birim fiyatı (AO sütunu) ---
+    # DT/ODT fiyatları: seçilen kanalın, plan tarihinin AY/YIL'ına göre.
+    try:
+        unit_price_col = column_index_from_string("AO")
+        dt_price = float(payload.get("channel_price_dt") or 0)
+        odt_price = float(payload.get("channel_price_odt") or 0)
+
+        for row_idx in range(GRID_ROWS):
+            rr = GRID_START_ROW + row_idx
+            slot_type = classify_dt_odt(_row_idx_to_time(row_idx))
+            ws.cell(rr, unit_price_col).value = dt_price if slot_type == "DT" else odt_price
+    except Exception:
+        # birim fiyatı basılamazsa export'u patlatma
+        pass
+
     # --- Logo ---
     logo_path = template_path.parent / "RADIOSCOPE.PNG"
     if not logo_path.exists():
@@ -243,9 +296,14 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     if payload.get("spot_code") is not None:
         ws["A67"].value = str(payload.get("spot_code", "")).strip()
 
-    if payload.get("spot_duration") is not None:
+    # B67: süre (sn)
+    dur_val = payload.get("spot_duration_sec", None)
+    if dur_val is None:
+        # geriye dönük uyumluluk
+        dur_val = payload.get("spot_duration", None)
+    if dur_val is not None:
         try:
-            ws["B67"].value = int(payload.get("spot_duration"))
+            ws["B67"].value = int(dur_val)
         except Exception:
             pass
 
