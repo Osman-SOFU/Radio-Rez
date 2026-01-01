@@ -39,6 +39,28 @@ CREATE TABLE IF NOT EXISTS channel_prices (
   price_odt REAL NOT NULL,
   FOREIGN KEY(channel_id) REFERENCES channels(id)
 );
+
+CREATE TABLE IF NOT EXISTS access_example_sets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  year INTEGER NOT NULL,
+  label TEXT NOT NULL,        -- Örn: "Ekim 2025"
+  periods TEXT,               -- Örn: "Periods (Regions|...)"
+  targets TEXT,               -- Örn: "12+(1)"
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(year, label)
+);
+
+CREATE TABLE IF NOT EXISTS access_example_rows (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  set_id INTEGER NOT NULL,
+  channel TEXT NOT NULL,
+  universe INTEGER,
+  avrch000 INTEGER,
+  avrch_pct REAL,
+  sort_order INTEGER NOT NULL,
+  FOREIGN KEY(set_id) REFERENCES access_example_sets(id) ON DELETE CASCADE
+);
+
 """
 
 def ensure_data_folders(data_dir: Path) -> None:
@@ -48,6 +70,7 @@ def ensure_data_folders(data_dir: Path) -> None:
 def connect_db(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -153,3 +176,48 @@ def migrate_and_seed(conn: sqlite3.Connection) -> None:
 
     conn.commit()
 
+def access_save_db(self) -> None:
+    if not self.repo:
+        QMessageBox.critical(self, "Hata", "Repo yok. DB bağlantısı kurulmamış.")
+        return
+
+    dates = (self.access_dates.text() or "").strip()
+    targets = (self.access_targets.text() or "").strip()
+
+    year = self._parse_year_from_dates(dates)
+    label = dates if dates else f"{year}"
+
+    # aynı Dates>> için tekrar kaydedersen UPDATE gibi davranacak (satırları silip yeniden yazar)
+    set_id = self.repo.get_or_create_access_set(year=year, label=label, periods="", targets=targets)
+    self._access_set_id = set_id
+
+    def _to_int(txt: str):
+        t = (txt or "").strip()
+        return int(t) if t else None
+
+    def _to_float(txt: str):
+        t = (txt or "").strip()
+        if not t:
+            return None
+        return float(t.replace(",", "."))
+
+    rows_out: list[dict] = []
+    for r in range(self.access_table.rowCount()):
+        ch_item = self.access_table.item(r, 0)
+        ch = ch_item.text().strip() if ch_item else ""
+        if not ch:
+            continue
+
+        u = _to_int(self.access_table.item(r, 1).text() if self.access_table.item(r, 1) else "")
+        a0 = _to_int(self.access_table.item(r, 2).text() if self.access_table.item(r, 2) else "")
+        ap = _to_float(self.access_table.item(r, 3).text() if self.access_table.item(r, 3) else "")
+
+        # AvRch% boşsa hesapla (opsiyonel ama hayat kurtarır)
+        if ap is None and u and a0 is not None and u != 0:
+            ap = round((a0 / u) * 100, 2)
+
+        rows_out.append({"channel": ch, "universe": u, "avrch000": a0, "avrch_pct": ap})
+
+    self.repo.save_access_set(set_id=set_id, periods="", targets=targets, rows=rows_out)
+
+    QMessageBox.information(self, "OK", "Erişim örneği DB'ye kaydedildi. Uygulama yeniden açılınca aynen gelecektir.")

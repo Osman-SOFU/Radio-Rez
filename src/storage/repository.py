@@ -174,3 +174,84 @@ class Repository:
         ]
         self.delete_reservations_by_ids(ids)
         return len(ids)
+    def get_or_create_access_set(self, year: int, label: str, periods: str = "", targets: str = "") -> int:
+        label = (label or "").strip()
+        if not label:
+            label = f"{year}"
+
+        cur = self.conn.execute(
+            "SELECT id FROM access_example_sets WHERE year=? AND label=?",
+            (year, label),
+        )
+        row = cur.fetchone()
+        if row:
+            return int(row["id"])
+
+        self.conn.execute(
+            "INSERT INTO access_example_sets(year,label,periods,targets) VALUES(?,?,?,?)",
+            (year, label, periods or "", targets or ""),
+        )
+        return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+    def load_access_set(self, set_id: int) -> tuple[dict, list[dict]]:
+        meta = self.conn.execute(
+            "SELECT * FROM access_example_sets WHERE id=?",
+            (set_id,),
+        ).fetchone()
+        if not meta:
+            raise ValueError("Erişim seti bulunamadı.")
+
+        rows = self.conn.execute(
+            """
+            SELECT * FROM access_example_rows
+            WHERE set_id=?
+            ORDER BY sort_order ASC, id ASC
+            """,
+            (set_id,),
+        ).fetchall()
+
+        return dict(meta), [dict(r) for r in rows]
+
+    def save_access_set(self, set_id: int, periods: str, targets: str, rows: list[dict]) -> None:
+        # Eğer zaten açık transaction varsa tekrar BEGIN deme (SQLite patlıyor)
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN")
+        try:
+            self.conn.execute(
+                "UPDATE access_example_sets SET periods=?, targets=?, created_at=CURRENT_TIMESTAMP WHERE id=?",
+                (periods or "", targets or "", set_id),
+            )
+            self.conn.execute("DELETE FROM access_example_rows WHERE set_id=?", (set_id,))
+
+            for i, r in enumerate(rows):
+                self.conn.execute(
+                    """
+                    INSERT INTO access_example_rows(set_id, channel, universe, avrch000, avrch_pct, sort_order)
+                    VALUES(?,?,?,?,?,?)
+                    """,
+                    (
+                        set_id,
+                        (r.get("channel") or "").strip(),
+                        r.get("universe"),
+                        r.get("avrch000"),
+                        r.get("avrch_pct"),
+                        i,
+                    ),
+                )
+
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+
+    def get_latest_access_set_id(self) -> int | None:
+        row = self.conn.execute(
+            """
+            SELECT id
+            FROM access_example_sets
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        return int(row["id"]) if row else None
