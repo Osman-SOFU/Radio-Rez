@@ -34,11 +34,17 @@ CREATE TABLE IF NOT EXISTS channels (
 
 CREATE TABLE IF NOT EXISTS channel_prices (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  year INTEGER NOT NULL,
+  month INTEGER NOT NULL,        -- 1..12
   channel_id INTEGER NOT NULL,
   price_dt REAL NOT NULL,
   price_odt REAL NOT NULL,
   FOREIGN KEY(channel_id) REFERENCES channels(id)
 );
+
+-- NOT: idx_channel_prices_unique index'i migrate_and_seed içinde yaratıyoruz.
+-- Çünkü eski DB'lerde channel_prices tablosu year/month kolonları olmadan gelmiş olabilir.
+-- SCHEMA_SQL içinde index'i oluşturmak, eski DB'lerde "no such column: year" hatasına sebep olur.
 
 CREATE TABLE IF NOT EXISTS access_example_sets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,6 +167,26 @@ def migrate_and_seed(conn: sqlite3.Connection) -> None:
         "ALTER TABLE reservations ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'",
         "payload_json",
     )
+
+    # Kanal fiyatları için (eski DB'ler): year/month kolonları yoksa ekle
+    _ensure_column(
+        conn,
+        "channel_prices",
+        "ALTER TABLE channel_prices ADD COLUMN year INTEGER NOT NULL DEFAULT 0",
+        "year",
+    )
+    _ensure_column(
+        conn,
+        "channel_prices",
+        "ALTER TABLE channel_prices ADD COLUMN month INTEGER NOT NULL DEFAULT 0",
+        "month",
+    )
+
+    # Unique index (yıl/ay/kanal)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_prices_unique ON channel_prices(year, month, channel_id)"
+    )
+
 
     # default channels seed (MVP)
     conn.executemany(

@@ -255,3 +255,82 @@ class Repository:
             """
         ).fetchone()
         return int(row["id"]) if row else None
+
+    # ------------------------------
+    # Kanal / Fiyat Tanımı (DT-ODT)
+    # ------------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def list_price_years(self) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT year FROM channel_prices WHERE year > 0 ORDER BY year DESC"
+        ).fetchall()
+        return [int(r["year"]) for r in rows]
+
+    def list_channels(self, active_only: bool = True) -> list[dict[str, object]]:
+        sql = "SELECT id, name, is_active FROM channels"
+        if active_only:
+            sql += " WHERE is_active=1"
+        sql += " ORDER BY name COLLATE NOCASE"
+        rows = self.conn.execute(sql).fetchall()
+        return [{"id": int(r["id"]), "name": str(r["name"]), "is_active": int(r["is_active"])} for r in rows]
+
+    def get_or_create_channel(self, name: str) -> int:
+        nm = (name or "").strip()
+        if not nm:
+            raise ValueError("Kanal adı boş olamaz.")
+
+        row = self.conn.execute("SELECT id, is_active FROM channels WHERE name=?", (nm,)).fetchone()
+        if row:
+            if int(row["is_active"]) == 0:
+                self.conn.execute("UPDATE channels SET is_active=1 WHERE id=?", (int(row["id"]),))
+                self.conn.commit()
+            return int(row["id"])
+
+        self.conn.execute("INSERT INTO channels(name, is_active) VALUES(?, 1)", (nm,))
+        cid = int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+        self.conn.commit()
+        return cid
+
+    def update_channel_name(self, channel_id: int, new_name: str) -> None:
+        nm = (new_name or "").strip()
+        if not nm:
+            raise ValueError("Kanal adı boş olamaz.")
+        self.conn.execute("UPDATE channels SET name=? WHERE id=?", (nm, int(channel_id)))
+        self.conn.commit()
+
+    def deactivate_channel(self, channel_id: int) -> None:
+        self.conn.execute("UPDATE channels SET is_active=0 WHERE id=?", (int(channel_id),))
+        self.conn.commit()
+
+    def get_channel_prices(self, year: int) -> dict[tuple[int, int], tuple[float, float]]:
+        rows = self.conn.execute(
+            "SELECT channel_id, month, price_dt, price_odt FROM channel_prices WHERE year=?",
+            (int(year),),
+        ).fetchall()
+        out: dict[tuple[int, int], tuple[float, float]] = {}
+        for r in rows:
+            out[(int(r["channel_id"]), int(r["month"]))] = (float(r["price_dt"]), float(r["price_odt"]))
+        return out
+
+    def upsert_channel_price(self, year: int, month: int, channel_id: int, price_dt: float, price_odt: float) -> None:
+        self.conn.execute(
+            "INSERT INTO channel_prices(year, month, channel_id, price_dt, price_odt) "
+            "VALUES(?,?,?,?,?) "
+            "ON CONFLICT(year, month, channel_id) DO UPDATE SET "
+            "price_dt=excluded.price_dt, "
+            "price_odt=excluded.price_odt",
+            (int(year), int(month), int(channel_id), float(price_dt), float(price_odt)),
+        )
+        self.conn.commit()

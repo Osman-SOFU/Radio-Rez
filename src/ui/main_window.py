@@ -8,7 +8,7 @@ from PySide6.QtGui import QColor, QBrush, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTabWidget, QFileDialog, QMessageBox, QListWidget,
-    QDateEdit, QTimeEdit, QGroupBox, QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox, QApplication
+    QDateEdit, QTimeEdit, QGroupBox, QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView, QComboBox, QApplication, QInputDialog
 )
 
 from src.settings.app_settings import SettingsService, AppSettings
@@ -124,6 +124,7 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self._access_set_id: int | None = None
         self._build_kod_tanimi_tab()
+        self._build_price_channel_tab()
         self._build_access_example_tab()
         
 
@@ -332,8 +333,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Hata", str(e))
 
     def on_tab_changed(self, idx: int) -> None:
-        if self.tabs.tabText(idx) == "KOD TANIMI":
+        tab_name = self.tabs.tabText(idx)
+        if tab_name == "KOD TANIMI":
             self.refresh_kod_tanimi()
+        elif tab_name == "Fiyat ve Kanal Tanımı":
+            self.refresh_price_channel_tab()
 
     def _build_kod_tanimi_tab(self) -> None:
         tab = self.tab_widgets["KOD TANIMI"]
@@ -480,6 +484,216 @@ class MainWindow(QMainWindow):
 
         self.service.export_kod_tanimi_excel(path, adv)
         QMessageBox.information(self, "OK", f"Excel çıktısı oluşturuldu:\n{path}")
+
+    # ------------------------------
+    # Fiyat ve Kanal Tanımı
+    # ------------------------------
+    def _build_price_channel_tab(self) -> None:
+        tab = self.tab_widgets["Fiyat ve Kanal Tanımı"]
+        layout = QVBoxLayout(tab)
+
+        top = QHBoxLayout()
+        layout.addLayout(top)
+
+        top.addWidget(QLabel("Yıl:"))
+        self.price_year = QSpinBox()
+        self.price_year.setRange(2000, 2100)
+        self.price_year.setValue(datetime.now().year)
+        top.addWidget(self.price_year)
+
+        self.btn_price_refresh = QPushButton("Yenile")
+        self.btn_price_save = QPushButton("Kaydet")
+        self.btn_channel_add = QPushButton("Kanal Ekle")
+        self.btn_channel_delete = QPushButton("Seçili Kanalı Sil")
+
+        top.addStretch(1)
+        top.addWidget(self.btn_channel_add)
+        top.addWidget(self.btn_channel_delete)
+        top.addWidget(self.btn_price_refresh)
+        top.addWidget(self.btn_price_save)
+
+        self.price_table = QTableWidget()
+        self.price_table.setAlternatingRowColors(True)
+        self.price_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.price_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.price_table.setEditTriggers(
+            QAbstractItemView.DoubleClicked
+            | QAbstractItemView.EditKeyPressed
+            | QAbstractItemView.AnyKeyPressed
+        )
+        layout.addWidget(self.price_table, 1)
+
+        # Wire
+        self.btn_price_refresh.clicked.connect(self.refresh_price_channel_tab)
+        self.price_year.valueChanged.connect(lambda _v: self.refresh_price_channel_tab())
+        self.btn_price_save.clicked.connect(self.save_price_channel_tab)
+        self.btn_channel_add.clicked.connect(self.add_channel_dialog)
+        self.btn_channel_delete.clicked.connect(self.delete_selected_channel)
+
+    def _month_names_tr(self) -> list[str]:
+        return ["OCAK", "ŞUBAT", "MART", "NİSAN", "MAYIS", "HAZİRAN", "TEMMUZ", "AĞUSTOS", "EYLÜL", "EKİM", "KASIM", "ARALIK"]
+
+    def refresh_price_channel_tab(self) -> None:
+        if not self.repo:
+            return
+
+        # Meta'dan son seçilen yılı çek
+        meta_year = self.repo.get_meta("price_year")
+        if meta_year and meta_year.isdigit():
+            my = int(meta_year)
+            if self.price_year.value() != my:
+                self.price_year.blockSignals(True)
+                self.price_year.setValue(my)
+                self.price_year.blockSignals(False)
+
+        year = int(self.price_year.value())
+        try:
+            self.repo.set_meta("price_year", str(year))
+        except Exception:
+            pass
+
+        months = self._month_names_tr()
+
+        headers = ["KANAL"]
+        for mn in months:
+            headers.append(f"{mn}\nDT")
+            headers.append(f"{mn}\nODT")
+
+        self.price_table.clear()
+        self.price_table.setColumnCount(len(headers))
+        self.price_table.setHorizontalHeaderLabels(headers)
+
+        self.price_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, len(headers)):
+            self.price_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+
+        channels = self.repo.list_channels(active_only=True)
+        prices = self.repo.get_channel_prices(year)
+
+        self.price_table.setRowCount(len(channels))
+
+        for r, ch in enumerate(channels):
+            cid = int(ch["id"])
+            name = str(ch["name"])
+
+            it_name = QTableWidgetItem(name)
+            it_name.setData(Qt.UserRole, cid)
+            self.price_table.setItem(r, 0, it_name)
+
+            col = 1
+            for m in range(1, 13):
+                dt, odt = prices.get((cid, m), (0.0, 0.0))
+
+                it_dt = QTableWidgetItem("" if dt == 0 else f"{dt:g}")
+                it_dt.setTextAlignment(Qt.AlignCenter)
+                self.price_table.setItem(r, col, it_dt)
+                col += 1
+
+                it_odt = QTableWidgetItem("" if odt == 0 else f"{odt:g}")
+                it_odt.setTextAlignment(Qt.AlignCenter)
+                self.price_table.setItem(r, col, it_odt)
+                col += 1
+
+    def _parse_float_cell(self, item: QTableWidgetItem | None) -> float:
+        if not item:
+            return 0.0
+        t = (item.text() or "").strip()
+        if not t:
+            return 0.0
+        t = t.replace(",", ".")
+        try:
+            return float(t)
+        except ValueError:
+            return 0.0
+
+    def save_price_channel_tab(self) -> None:
+        if not self.repo:
+            QMessageBox.warning(self, "Hata", "DB bağlantısı yok.")
+            return
+
+        year = int(self.price_year.value())
+
+        try:
+            for r in range(self.price_table.rowCount()):
+                it_name = self.price_table.item(r, 0)
+                name = (it_name.text() if it_name else "").strip()
+                if not name:
+                    continue
+
+                cid = it_name.data(Qt.UserRole) if it_name else None
+                if cid:
+                    self.repo.update_channel_name(int(cid), name)
+                    channel_id = int(cid)
+                else:
+                    channel_id = self.repo.get_or_create_channel(name)
+                    it_name.setData(Qt.UserRole, channel_id)
+
+                col = 1
+                for m in range(1, 13):
+                    price_dt = self._parse_float_cell(self.price_table.item(r, col))
+                    price_odt = self._parse_float_cell(self.price_table.item(r, col + 1))
+                    self.repo.upsert_channel_price(year, m, channel_id, price_dt, price_odt)
+                    col += 2
+
+            self.repo.set_meta("price_year", str(year))
+            QMessageBox.information(self, "Tamam", "Fiyatlar kaydedildi.")
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Kayıt sırasında hata: {e}")
+
+    def add_channel_dialog(self) -> None:
+        if not self.repo:
+            QMessageBox.warning(self, "Hata", "DB bağlantısı yok.")
+            return
+
+        name, ok = QInputDialog.getText(self, "Kanal Ekle", "Kanal adı:")
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            return
+
+        try:
+            self.repo.get_or_create_channel(name)
+            self.refresh_price_channel_tab()
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Kanal eklenemedi: {e}")
+
+    def delete_selected_channel(self) -> None:
+        if not self.repo:
+            QMessageBox.warning(self, "Hata", "DB bağlantısı yok.")
+            return
+
+        r = self.price_table.currentRow()
+        if r < 0:
+            QMessageBox.information(self, "Bilgi", "Silmek için bir kanal seç.")
+            return
+
+        it = self.price_table.item(r, 0)
+        if not it:
+            return
+
+        cid = it.data(Qt.UserRole)
+        name = it.text()
+
+        if not cid:
+            self.price_table.removeRow(r)
+            return
+
+        ans = QMessageBox.question(
+            self,
+            "Onay",
+            f"'{name}' kanalı silinsin mi? (DB'de pasif yapılacak)",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        try:
+            self.repo.deactivate_channel(int(cid))
+            self.refresh_price_channel_tab()
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Silinemedi: {e}")
+
 
     def _build_access_example_tab(self) -> None:
         tab = self.tab_widgets["Erişim Örneği"]
