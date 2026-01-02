@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import time, datetime
+from datetime import time, datetime, date
 
 from PySide6.QtCore import Qt, QDate, QEvent
 from PySide6.QtGui import QColor, QBrush, QFont, QKeySequence
@@ -122,6 +122,7 @@ class MainWindow(QMainWindow):
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self._access_set_id: int | None = None
+        self._build_spotlist_tab()
         self._build_kod_tanimi_tab()
         self._build_price_channel_tab()
         self._build_access_example_tab()
@@ -307,6 +308,18 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.in_channel.setCurrentIndex(idx)
 
+        # Eğer kullanıcı başka sekmedeyse, seçime göre anında tazele
+        try:
+            current_tab = self.tabs.tabText(self.tabs.currentIndex())
+            if current_tab == "SPOTLİST+":
+                self.refresh_spotlist()
+            elif current_tab == "KOD TANIMI":
+                self.refresh_kod_tanimi()
+            elif current_tab == "Fiyat ve Kanal Tanımı":
+                self.refresh_price_channel_tab()
+        except Exception:
+            pass
+
     def on_plan_date_changed(self, qd: QDate) -> None:
         d = qd.toPython()
         self.plan_grid.set_month(d.year, d.month, d.day)
@@ -404,8 +417,372 @@ class MainWindow(QMainWindow):
         tab_name = self.tabs.tabText(idx)
         if tab_name == "KOD TANIMI":
             self.refresh_kod_tanimi()
+        elif tab_name == "SPOTLİST+":
+            self.refresh_spotlist()
         elif tab_name == "Fiyat ve Kanal Tanımı":
             self.refresh_price_channel_tab()
+
+    def _build_spotlist_tab(self) -> None:
+        tab = self.tab_widgets["SPOTLİST+"]
+        layout = QVBoxLayout(tab)
+
+        # --- Üst bar (butonlar + filtreler) ---
+        top = QHBoxLayout()
+        layout.addLayout(top)
+
+        self.btn_spot_refresh = QPushButton("Yenile")
+        self.btn_spot_save = QPushButton("Kaydet")
+        self.btn_spot_export = QPushButton("Excel Çıktısı")
+        self.btn_spot_save.setEnabled(False)
+
+        top.addWidget(self.btn_spot_refresh)
+        top.addWidget(self.btn_spot_save)
+        top.addWidget(self.btn_spot_export)
+        top.addSpacing(16)
+
+        top.addWidget(QLabel("Tarih:"))
+
+        self.spot_from = QDateEdit()
+        self.spot_from.setCalendarPopup(True)
+        self.spot_from.setDisplayFormat("dd.MM.yyyy")
+
+        self.spot_to = QDateEdit()
+        self.spot_to.setCalendarPopup(True)
+        self.spot_to.setDisplayFormat("dd.MM.yyyy")
+
+        top.addWidget(self.spot_from)
+        top.addWidget(QLabel(" - "))
+        top.addWidget(self.spot_to)
+
+        top.addSpacing(12)
+        top.addWidget(QLabel("Durum:"))
+        self.spot_pub_filter = QComboBox()
+        self.spot_pub_filter.addItems(["Tümü", "Yayınlandı (1)", "Yayınlanmadı (0)"])
+        top.addWidget(self.spot_pub_filter)
+
+        self.btn_spot_clear_filters = QPushButton("Filtreyi Temizle")
+        top.addWidget(self.btn_spot_clear_filters)
+        top.addStretch(1)
+
+        # --- Tablo ---
+        self.spot_table = QTableWidget()
+        self.spot_table.setColumnCount(12)
+        self.spot_table.setHorizontalHeaderLabels(
+            [
+                "Sıra",
+                "TARİH",
+                "ANA YAYIN",
+                "REKLAMIN FIRMASI",
+                "ADET",
+                "BAŞLANGIÇ",
+                "SÜRE",
+                "Spot Kodu",
+                "DT-ODT",
+                "Birim Saniye",
+                "Bütçe Net TL",
+                "Yayınlandı Durum",
+            ]
+        )
+
+        self.spot_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.spot_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.spot_table.setAlternatingRowColors(True)
+        self.spot_table.verticalHeader().setVisible(False)
+        self.spot_table.setShowGrid(True)
+
+        header = self.spot_table.horizontalHeader()
+        header.setStretchLastSection(True)
+
+        # Excel'e yakın: bazı kolonlar sabit, bazıları esnek
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # sıra
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # tarih
+        header.setSectionResizeMode(2, QHeaderView.Stretch)           # ana yayın
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # firma
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # adet
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # başlangıç
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # süre
+        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)  # spot kodu
+        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)  # dt-odt
+        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)  # birim saniye
+        header.setSectionResizeMode(10, QHeaderView.ResizeToContents) # bütçe
+        header.setSectionResizeMode(11, QHeaderView.Stretch)          # yayınlandı
+
+        # Stil
+        self.spot_table.setStyleSheet('''
+            QHeaderView::section {
+                background-color: #F28C28;
+                color: white;
+                font-weight: bold;
+                padding: 6px;
+                border: 1px solid #B56A1E;
+            }
+            QTableWidget {
+                gridline-color: #A0A0A0;
+                selection-background-color: #CFE8FF;
+            }
+        ''')
+
+        # --- Özet bar ---
+        self.spot_summary = QLabel("")
+        font = self.spot_summary.font()
+        font.setBold(True)
+        self.spot_summary.setFont(font)
+
+        layout.addWidget(self.spot_table, 1)
+        layout.addWidget(self.spot_summary)
+
+        # --- State ---
+        self.spot_all_rows = []
+        self.spot_dirty = {}              # (reservation_id, day, row_idx) -> 0/1
+        self.spot_current_adv = ""
+        self.spot_filters_initialized = False
+
+        # --- Signals ---
+        self.btn_spot_refresh.clicked.connect(self.refresh_spotlist)
+        self.btn_spot_export.clicked.connect(self.on_spotlist_export)
+        self.btn_spot_save.clicked.connect(self.on_spotlist_save)
+
+        self.spot_from.dateChanged.connect(self._apply_spotlist_filters)
+        self.spot_to.dateChanged.connect(self._apply_spotlist_filters)
+        self.spot_pub_filter.currentIndexChanged.connect(self._apply_spotlist_filters)
+        self.btn_spot_clear_filters.clicked.connect(self._spotlist_clear_filters)
+
+    def refresh_spotlist(self) -> None:
+        if not self.service:
+            return
+
+        adv = (self.in_advertiser.text() or "").strip()
+        if not adv:
+            self.spot_table.setRowCount(0)
+            self.spot_summary.setText("")
+            return
+
+        # reklam veren değiştiyse dirty temizle (karışmasın)
+        if adv != self.spot_current_adv:
+            self.spot_dirty.clear()
+            self.btn_spot_save.setEnabled(False)
+            self.spot_filters_initialized = False
+            self.spot_current_adv = adv
+
+        self.spot_all_rows = self.service.get_spotlist_rows(adv)
+
+        # Tarih filtre aralığını ilk yüklemede dataya göre ayarla
+        if self.spot_all_rows and not self.spot_filters_initialized:
+            try:
+                dmin = min(r["datetime"].date() for r in self.spot_all_rows)
+                dmax = max(r["datetime"].date() for r in self.spot_all_rows)
+            except Exception:
+                dmin = date.today()
+                dmax = date.today()
+
+            self.spot_from.blockSignals(True)
+            self.spot_to.blockSignals(True)
+            self.spot_from.setDate(QDate(dmin.year, dmin.month, dmin.day))
+            self.spot_to.setDate(QDate(dmax.year, dmax.month, dmax.day))
+            self.spot_from.blockSignals(False)
+            self.spot_to.blockSignals(False)
+
+            self.spot_pub_filter.setCurrentIndex(0)
+            self.spot_filters_initialized = True
+
+        self._apply_spotlist_filters()
+
+    def _spotlist_clear_filters(self) -> None:
+        if not self.spot_all_rows:
+            return
+        try:
+            dmin = min(r["datetime"].date() for r in self.spot_all_rows)
+            dmax = max(r["datetime"].date() for r in self.spot_all_rows)
+        except Exception:
+            dmin = date.today()
+            dmax = date.today()
+
+        self.spot_from.blockSignals(True)
+        self.spot_to.blockSignals(True)
+        self.spot_pub_filter.blockSignals(True)
+
+        self.spot_from.setDate(QDate(dmin.year, dmin.month, dmin.day))
+        self.spot_to.setDate(QDate(dmax.year, dmax.month, dmax.day))
+        self.spot_pub_filter.setCurrentIndex(0)
+
+        self.spot_from.blockSignals(False)
+        self.spot_to.blockSignals(False)
+        self.spot_pub_filter.blockSignals(False)
+
+        self._apply_spotlist_filters()
+
+    def _filtered_spotlist_rows(self) -> list[dict]:
+        if not self.spot_all_rows:
+            return []
+
+        d1 = self.spot_from.date().toPython()
+        d2 = self.spot_to.date().toPython()
+        if d1 > d2:
+            d1, d2 = d2, d1
+
+        mode = self.spot_pub_filter.currentIndex()  # 0 all, 1 pub=1, 2 pub=0
+
+        out = []
+        for rr in self.spot_all_rows:
+            dtv = rr.get("datetime")
+            if not dtv:
+                continue
+            dd = dtv.date()
+            if dd < d1 or dd > d2:
+                continue
+
+            key = (int(rr.get("reservation_id")), int(rr.get("day")), int(rr.get("row_idx")))
+            pub = int(self.spot_dirty.get(key, rr.get("published", 0) or 0))
+            rr2 = dict(rr)
+            rr2["published"] = pub
+
+            if mode == 1 and pub != 1:
+                continue
+            if mode == 2 and pub != 0:
+                continue
+
+            out.append(rr2)
+
+        for i, rr in enumerate(out, start=1):
+            rr["sira"] = i
+        return out
+
+    def _apply_spotlist_filters(self, *args) -> None:
+        rows = self._filtered_spotlist_rows()
+        self._render_spotlist(rows)
+        self._update_spotlist_summary(rows)
+
+    def _render_spotlist(self, rows: list[dict]) -> None:
+        self.spot_table.setRowCount(len(rows))
+
+        for r_idx, rr in enumerate(rows):
+            vals = [
+                rr.get("sira", ""),
+                rr.get("tarih", ""),
+                rr.get("ana_yayin", ""),
+                rr.get("reklam_firmasi", ""),
+                rr.get("adet", ""),
+                rr.get("baslangic", ""),
+                rr.get("sure", ""),
+                rr.get("spot_kodu", ""),
+                rr.get("dt_odt", ""),
+                rr.get("birim_saniye", 0.0),
+                rr.get("butce_net", 0.0),
+            ]
+
+            for c in range(0, 11):
+                item = QTableWidgetItem()
+                if c in (0, 4, 6):  # int
+                    try:
+                        item.setText(str(int(vals[c])))
+                    except Exception:
+                        item.setText(str(vals[c]))
+                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
+                elif c in (9, 10):  # float
+                    try:
+                        item.setText(f"{float(vals[c]):.2f}")
+                    except Exception:
+                        item.setText(str(vals[c]))
+                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
+                else:
+                    item.setText(str(vals[c]))
+                    item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+
+                item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                self.spot_table.setItem(r_idx, c, item)
+
+            key = (int(rr.get("reservation_id")), int(rr.get("day")), int(rr.get("row_idx")))
+            pub_val = 1 if int(rr.get("published", 0) or 0) else 0
+
+            combo = QComboBox()
+            combo.addItems(["0", "1"])
+            combo.blockSignals(True)
+            combo.setCurrentText("1" if pub_val == 1 else "0")
+            combo.blockSignals(False)
+            combo.currentTextChanged.connect(lambda txt, k=key: self.on_spot_published_changed(k, txt))
+            self.spot_table.setCellWidget(r_idx, 11, combo)
+
+        self.spot_table.resizeRowsToContents()
+
+    def _update_spotlist_summary(self, rows: list[dict]) -> None:
+        if not rows:
+            self.spot_summary.setText("Kayıt yok.")
+            return
+
+        total_adet = sum(int(r.get("adet", 1) or 1) for r in rows)
+        total_budget = sum(float(r.get("butce_net", 0.0) or 0.0) for r in rows)
+        durations = [int(r.get("sure", 0) or 0) for r in rows]
+        avg_duration = (sum(durations) / len(durations)) if durations else 0.0
+
+        self.spot_summary.setText(
+            f"Toplam Satır: {len(rows)}    "
+            f"Toplam Adet: {total_adet}    "
+            f"Toplam Bütçe: {total_budget:,.2f} TL    "
+            f"Ortalama Süre: {avg_duration:.1f} sn"
+        )
+
+    def on_spot_published_changed(self, key: tuple[int, int, int], txt: str) -> None:
+        try:
+            val = 1 if str(txt).strip() == "1" else 0
+            self.spot_dirty[key] = val
+            self.btn_spot_save.setEnabled(True)
+
+            # Filtre durumuna göre görünürlük değişebilir
+            if self.spot_pub_filter.currentIndex() != 0:
+                self._apply_spotlist_filters()
+            else:
+                self._update_spotlist_summary(self._filtered_spotlist_rows())
+        except Exception as e:
+            QMessageBox.warning(self, "Hata", str(e))
+
+    def on_spotlist_save(self) -> None:
+        if not self.service:
+            return
+        if not self.spot_dirty:
+            QMessageBox.information(self, "Bilgi", "Kaydedilecek değişiklik yok.")
+            return
+
+        try:
+            changes = [(k[0], k[1], k[2], int(v)) for k, v in self.spot_dirty.items()]
+            self.service.set_spotlist_published_bulk(changes)
+            self.spot_dirty.clear()
+            self.btn_spot_save.setEnabled(False)
+
+            # DB'den güncel değerleri tekrar çek
+            self.spot_all_rows = self.service.get_spotlist_rows(self.spot_current_adv)
+            self._apply_spotlist_filters()
+
+            QMessageBox.information(self, "OK", "Değişiklikler kaydedildi.")
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", str(e))
+
+    def on_spotlist_export(self) -> None:
+        if not self.service:
+            QMessageBox.warning(self, "Hata", "Servis hazır değil.")
+            return
+        adv = (self.in_advertiser.text() or "").strip()
+        if not adv:
+            QMessageBox.warning(self, "Hata", "Önce bir reklam veren seç.")
+            return
+
+        default_name = f"SPOTLIST_{adv}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        default_path = str((self.app_settings.data_dir / "exports" / default_name).resolve())
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "SPOTLİST+ Excel Çıktısı",
+            default_path,
+            "Excel Files (*.xlsx)"
+        )
+        if not path:
+            return
+
+        try:
+            rows = self._filtered_spotlist_rows()
+            self.service.export_spotlist_excel_with_rows(path, adv, rows)
+            QMessageBox.information(self, "OK", f"Excel çıktısı üretildi:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", str(e))
 
     def _build_kod_tanimi_tab(self) -> None:
         tab = self.tab_widgets["KOD TANIMI"]

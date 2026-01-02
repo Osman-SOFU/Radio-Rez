@@ -411,3 +411,137 @@ def export_kod_tanimi(out_path, advertiser_name: str, rows: list[dict]) -> None:
     # küçük bir başlık (dosya adı vs.) istersen buraya eklenir; şimdilik dokunmuyoruz.
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
+
+
+def export_spotlist(out_path, advertiser_name: str, rows: list[dict]) -> None:
+    """SPOTLİST+ çıktısını şablonun stilini bozmadan üretir.
+
+    Şablon: assets/spotlist_template.xlsx (sheet: "SPOTLİST+")
+    Data satırları: 2. satırdan itibaren.
+    """
+    out_path = Path(out_path)
+
+    template_path = resource_path("assets/spotlist_template.xlsx")
+    if template_path.exists():
+        wb = openpyxl.load_workbook(template_path)
+        ws = wb["SPOTLİST+"] if "SPOTLİST+" in wb.sheetnames else wb.active
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "SPOTLİST+"
+        headers = [
+            "Sıra",
+            "TARIH",
+            "ANA YAYIN",
+            "REKLAMIN FIRMASI",
+            "ADET",
+            "BASLANGIC",
+            "SURE",
+            "Spot Kodu",
+            "DT-ODT",
+            "Birim Saniye ",
+            "Bütçe  Net TL",
+            "Yayınlandı Durum",
+        ]
+        for i, h in enumerate(headers, start=1):
+            ws.cell(1, i).value = h
+
+    start_row = 2
+    n = len(rows)
+
+    # Şablonda hazır satır yoksa (veya yetmezse) satır ekle ve stil kopyala
+    if ws.max_row < start_row:
+        ws.insert_rows(start_row, amount=1)
+
+    # Stil kopyalama için referans satır: start_row
+    style_row = start_row if ws.max_row >= start_row else 1
+
+    needed_last = start_row + max(n, 0) - 1
+    if needed_last > ws.max_row:
+        insert_count = needed_last - ws.max_row
+        ws.insert_rows(ws.max_row + 1, amount=insert_count)
+        # son mevcut stil satırını kopyala
+        src_row = style_row
+        for i in range(0, insert_count):
+            dst_row = ws.max_row - insert_count + 1 + i
+            for col in range(1, 13):
+                src = ws.cell(src_row, col)
+                dst = ws.cell(dst_row, col)
+                dst._style = copy(src._style)
+                dst.number_format = src.number_format
+                dst.font = copy(src.font)
+                dst.border = copy(src.border)
+                dst.fill = copy(src.fill)
+                dst.alignment = copy(src.alignment)
+                dst.protection = copy(src.protection)
+                dst.comment = None
+
+    # Önce eski değerleri temizle (önceki export'tan kalmasın)
+    # Template çok büyük olabiliyor, o yüzden sadece "kullanılmış" aralığı temizliyoruz.
+    last_used = 1
+    for r in range(start_row, ws.max_row + 1):
+        v = ws.cell(r, 1).value
+        if v is not None and str(v).strip() != "":
+            last_used = r
+    clear_last = max(last_used, needed_last)
+    for r in range(start_row, clear_last + 1):
+        for c in range(1, 13):
+            ws.cell(r, c).value = None
+
+    # Veriyi bas
+    for i, rr in enumerate(rows):
+        r = start_row + i
+        ws.cell(r, 1).value = int(rr.get("sira", i + 1) or (i + 1))
+        ws.cell(r, 2).value = rr.get("tarih", "")
+        ws.cell(r, 3).value = rr.get("ana_yayin", "")
+        ws.cell(r, 4).value = rr.get("reklam_firmasi", advertiser_name)
+        ws.cell(r, 5).value = int(rr.get("adet", 1) or 1)
+        ws.cell(r, 6).value = rr.get("baslangic", "")
+        ws.cell(r, 7).value = int(rr.get("sure", 0) or 0)
+        ws.cell(r, 8).value = rr.get("spot_kodu", "")
+        ws.cell(r, 9).value = rr.get("dt_odt", "")
+        ws.cell(r, 10).value = float(rr.get("birim_saniye", 0.0) or 0.0)
+        ws.cell(r, 11).value = float(rr.get("butce_net", 0.0) or 0.0)
+        ws.cell(r, 12).value = int(rr.get("published", 0) or 0)
+
+    
+    # Özet satırı (filtrelenmiş listeye göre)
+    total_adet = sum(int(r.get("adet", 1) or 1) for r in rows) if rows else 0
+    total_budget = sum(float(r.get("butce_net", 0.0) or 0.0) for r in rows) if rows else 0.0
+    durations = [int(r.get("sure", 0) or 0) for r in rows] if rows else []
+    avg_duration = (sum(durations) / len(durations)) if durations else 0.0
+
+    sum_row = start_row + n
+    if sum_row > ws.max_row:
+        ws.insert_rows(ws.max_row + 1, amount=(sum_row - ws.max_row))
+
+    # Stil kopyala (kenarlıklar vs kalsın)
+    for col in range(1, 13):
+        src = ws.cell(style_row, col)
+        dst = ws.cell(sum_row, col)
+        dst._style = copy(src._style)
+        dst.number_format = src.number_format
+        dst.font = copy(src.font)
+        dst.border = copy(src.border)
+        dst.fill = copy(src.fill)
+        dst.alignment = copy(src.alignment)
+        dst.protection = copy(src.protection)
+        dst.comment = None
+
+    # Değerleri yaz
+    for c in range(1, 13):
+        ws.cell(sum_row, c).value = None
+
+    ws.cell(sum_row, 2).value = "TOPLAM"
+    ws.cell(sum_row, 5).value = int(total_adet)
+    ws.cell(sum_row, 7).value = float(avg_duration)
+    ws.cell(sum_row, 11).value = float(total_budget)
+
+    # Kalın yaz
+    for c in range(1, 13):
+        cell = ws.cell(sum_row, c)
+        cell.font = copy(cell.font)
+        cell.font = cell.font.copy(bold=True)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)

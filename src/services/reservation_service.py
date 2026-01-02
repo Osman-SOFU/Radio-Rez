@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date, time
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,14 @@ from src.storage.repository import Repository
 @dataclass
 class ReservationService:
     repo: Repository
+
+    def _row_idx_to_time(self, row_idx: int) -> time:
+        """Plan grid satırı -> kuşak başlangıç saati.
+
+        Şablon: 07:00-20:00, 15dk adım.
+        """
+        mins = 7 * 60 + int(row_idx) * 15
+        return time(mins // 60, mins % 60)
     def sanitize_plan_cells(self, plan_cells: dict) -> dict[str, str]:
         fixed: dict[str, str] = {}
         for k, v in (plan_cells or {}).items():
@@ -158,3 +166,111 @@ class ReservationService:
         from src.export.excel_exporter import export_kod_tanimi
         rows = self.get_kod_tanimi_rows(advertiser_name)
         export_kod_tanimi(out_path, advertiser_name, rows)
+
+    # ------------------------------
+    # SPOTLİST+
+    # ------------------------------
+
+    def get_spotlist_rows(self, advertiser_name: str) -> list[dict[str, Any]]:
+        """Seçili reklam veren için SPOTLİST+ satırlarını üretir.
+
+        Her satır, confirmed reservation payload'ındaki plan_cells içindeki dolu hücrelerden türetilir.
+        """
+        adv = (advertiser_name or "").strip()
+        if not adv:
+            return []
+
+        recs = self.repo.list_confirmed_reservations_by_advertiser(adv, limit=50000)
+        if not recs:
+            return []
+
+        status_map = self.repo.get_spotlist_status_map([r.id for r in recs])
+
+        rows: list[dict[str, Any]] = []
+        for r in recs:
+            p = r.payload or {}
+
+            # plan ay/yıl
+            try:
+                y, m, _d = str(p.get("plan_date") or "").split("-")
+                yy = int(y)
+                mm = int(m)
+            except Exception:
+                continue
+
+            channel_name = str(p.get("channel_name") or "").strip()
+            spot_code = str(p.get("spot_code") or "").strip()
+            duration = int(p.get("spot_duration_sec") or 0)
+            price_dt = float(p.get("channel_price_dt") or 0.0)
+            price_odt = float(p.get("channel_price_odt") or 0.0)
+
+            cells: dict[str, str] = p.get("plan_cells") or {}
+            for k, v in cells.items():
+                if not str(v or "").strip():
+                    continue
+                try:
+                    if isinstance(k, str):
+                        row_idx_s, day_s = k.split(",")
+                        row_idx = int(row_idx_s)
+                        day = int(day_s)
+                    else:
+                        row_idx, day = k
+                        row_idx = int(row_idx)
+                        day = int(day)
+                except Exception:
+                    continue
+
+                # gerçek tarih + saat
+                try:
+                    dt = date(yy, mm, day)
+                except Exception:
+                    continue
+
+                t0 = self._row_idx_to_time(row_idx)
+                dt_odt = classify_dt_odt(t0)
+                unit = price_dt if dt_odt == "DT" else price_odt
+                budget = float(unit) * float(duration)
+
+                pub = int(status_map.get((r.id, day, row_idx), 0))
+                rows.append(
+                    {
+                        "reservation_id": r.id,
+                        "day": day,
+                        "row_idx": row_idx,
+                        "datetime": datetime(dt.year, dt.month, dt.day, t0.hour, t0.minute),
+                        "tarih": dt.strftime("%d.%m.%Y"),
+                        "ana_yayin": channel_name,
+                        "reklam_firmasi": adv,
+                        "adet": 1,
+                        "baslangic": t0.strftime("%H:%M"),
+                        "sure": duration,
+                        "spot_kodu": spot_code,
+                        "dt_odt": dt_odt,
+                        "birim_saniye": unit,
+                        "butce_net": budget,
+                        "published": pub,
+                    }
+                )
+
+        rows.sort(key=lambda x: x["datetime"])
+        for i, rr in enumerate(rows, start=1):
+            rr["sira"] = i
+        return rows
+
+    def set_spotlist_published(self, reservation_id: int, day: int, row_idx: int, published: int) -> None:
+        self.repo.upsert_spotlist_published(reservation_id, day, row_idx, published)
+
+
+    def set_spotlist_published_bulk(self, changes: list[tuple[int, int, int, int]]) -> None:
+        """Toplu kaydet: (reservation_id, day, row_idx, published)"""
+        self.repo.upsert_spotlist_published_many(changes)
+
+    def export_spotlist_excel_with_rows(self, out_path, advertiser_name: str, rows: list[dict]) -> None:
+        """Filtrelenmiş satırlarla SPOTLİST+ Excel çıktısı al."""
+        from src.export.excel_exporter import export_spotlist
+        export_spotlist(out_path, advertiser_name, rows)
+
+    def export_spotlist_excel(self, out_path, advertiser_name: str) -> None:
+        """Tüm satırları çekip SPOTLİST+ Excel çıktısı al."""
+        rows = self.get_spotlist_rows(advertiser_name)
+        self.export_spotlist_excel_with_rows(out_path, advertiser_name, rows)

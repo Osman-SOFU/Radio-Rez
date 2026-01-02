@@ -334,3 +334,60 @@ class Repository:
             (int(year), int(month), int(channel_id), float(price_dt), float(price_odt)),
         )
         self.conn.commit()
+
+
+    # ------------------------------
+    # SPOTLİST+ (yayınlandı durumu)
+    # ------------------------------
+
+    def get_spotlist_status_map(self, reservation_ids: list[int]) -> dict[tuple[int, int, int], int]:
+        """reservation_id listesi için (reservation_id, day, row_idx) -> published map."""
+        if not reservation_ids:
+            return {}
+
+        out: dict[tuple[int, int, int], int] = {}
+        # SQLite 999 param sınırına göre chunk
+        for i in range(0, len(reservation_ids), 900):
+            chunk = reservation_ids[i:i+900]
+            q = ",".join(["?"] * len(chunk))
+            rows = self.conn.execute(
+                f"SELECT reservation_id, day, row_idx, published FROM spotlist_status WHERE reservation_id IN ({q})",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                out[(int(r["reservation_id"]), int(r["day"]), int(r["row_idx"]))] = int(r["published"])
+        return out
+
+    def upsert_spotlist_published(self, reservation_id: int, day: int, row_idx: int, published: int) -> None:
+        self.conn.execute(
+            "INSERT INTO spotlist_status(reservation_id, day, row_idx, published, updated_at) "
+            "VALUES(?,?,?,?, datetime('now')) "
+            "ON CONFLICT(reservation_id, day, row_idx) DO UPDATE SET "
+            "published=excluded.published, "
+            "updated_at=datetime('now')",
+            (int(reservation_id), int(day), int(row_idx), 1 if int(published) else 0),
+        )
+        self.conn.commit()
+
+
+    def upsert_spotlist_published_many(self, changes: list[tuple[int, int, int, int]]) -> None:
+        """Toplu upsert: (reservation_id, day, row_idx, published) listesi."""
+        if not changes:
+            return
+
+        # Eğer zaten açık transaction varsa tekrar BEGIN deme (SQLite patlıyor)
+        if not self.conn.in_transaction:
+            self.conn.execute("BEGIN")
+        try:
+            self.conn.executemany(
+                "INSERT INTO spotlist_status(reservation_id, day, row_idx, published, updated_at) "
+                "VALUES(?,?,?,?, datetime('now')) "
+                "ON CONFLICT(reservation_id, day, row_idx) DO UPDATE SET "
+                "published=excluded.published, "
+                "updated_at=datetime('now')",
+                [(int(rid), int(day), int(row_idx), 1 if int(pub) else 0) for rid, day, row_idx, pub in changes],
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise

@@ -67,6 +67,19 @@ CREATE TABLE IF NOT EXISTS access_example_rows (
   FOREIGN KEY(set_id) REFERENCES access_example_sets(id) ON DELETE CASCADE
 );
 
+-- SPOTLİST+ için yayınlandı durumu (0/1)
+-- Her bir yayın satırı, reservations.payload_json içindeki plan_cells'in (day,row_idx)
+-- kombinasyonundan türetilir. Bu tablo sadece kullanıcı işaretini saklar.
+CREATE TABLE IF NOT EXISTS spotlist_status (
+  reservation_id INTEGER NOT NULL,
+  day INTEGER NOT NULL,
+  row_idx INTEGER NOT NULL,
+  published INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY(reservation_id, day, row_idx),
+  FOREIGN KEY(reservation_id) REFERENCES reservations(id) ON DELETE CASCADE
+);
+
 """
 
 def ensure_data_folders(data_dir: Path) -> None:
