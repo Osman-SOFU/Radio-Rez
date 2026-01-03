@@ -8,7 +8,8 @@ from PySide6.QtGui import QColor, QBrush, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTabWidget, QFileDialog, QMessageBox, QListWidget,
-    QDateEdit, QGroupBox, QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView, QAbstractItemDelegate, QHeaderView, QComboBox, QApplication, QInputDialog
+    QDateEdit, QGroupBox, QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView, QAbstractItemDelegate,
+    QHeaderView, QComboBox, QApplication, QInputDialog, QPlainTextEdit
 )
 
 from src.settings.app_settings import SettingsService, AppSettings
@@ -122,7 +123,9 @@ class MainWindow(QMainWindow):
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self._access_set_id: int | None = None
+        self._po_syncing: bool = False
         self._build_spotlist_tab()
+        self._build_plan_ozet_tab()
         self._build_kod_tanimi_tab()
         self._build_price_channel_tab()
         self._build_access_example_tab()
@@ -313,6 +316,9 @@ class MainWindow(QMainWindow):
             current_tab = self.tabs.tabText(self.tabs.currentIndex())
             if current_tab == "SPOTLİST+":
                 self.refresh_spotlist()
+            elif current_tab == "PLAN ÖZET":
+                self._set_plan_ozet_period_from_latest(name)
+                self.refresh_plan_ozet()
             elif current_tab == "KOD TANIMI":
                 self.refresh_kod_tanimi()
             elif current_tab == "Fiyat ve Kanal Tanımı":
@@ -419,6 +425,9 @@ class MainWindow(QMainWindow):
             self.refresh_kod_tanimi()
         elif tab_name == "SPOTLİST+":
             self.refresh_spotlist()
+        elif tab_name == "PLAN ÖZET":
+            self._set_plan_ozet_period_from_latest(self.in_advertiser.text())
+            self.refresh_plan_ozet()
         elif tab_name == "Fiyat ve Kanal Tanımı":
             self.refresh_price_channel_tab()
 
@@ -783,6 +792,333 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "OK", f"Excel çıktısı üretildi:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
+
+
+    # ------------------------------
+    # PLAN ÖZET (ay bazlı birleştirilmiş özet)
+    # ------------------------------
+
+    def _build_plan_ozet_tab(self) -> None:
+        tab = self.tab_widgets["PLAN ÖZET"]
+        layout = QVBoxLayout(tab)
+
+        # Üst bar: yıl/ay seçimi
+        top = QHBoxLayout()
+        layout.addLayout(top)
+
+        top.addWidget(QLabel("Yıl:"))
+        self.po_year = QSpinBox()
+        self.po_year.setRange(2000, 2100)
+        self.po_year.setValue(date.today().year)
+        top.addWidget(self.po_year)
+
+        top.addWidget(QLabel("Ay:"))
+        self.po_month = QComboBox()
+        self.po_month.addItems([
+            "OCAK", "ŞUBAT", "MART", "NİSAN", "MAYIS", "HAZİRAN",
+            "TEMMUZ", "AĞUSTOS", "EYLÜL", "EKİM", "KASIM", "ARALIK"
+        ])
+        self.po_month.setCurrentIndex(date.today().month - 1)
+        top.addWidget(self.po_month)
+
+        self.btn_po_refresh = QPushButton("Yenile")
+        self.btn_po_export = QPushButton("Excel Çıktısı")
+        top.addWidget(self.btn_po_export)
+        top.addWidget(self.btn_po_refresh)
+        top.addStretch(1)
+
+        # Header alanları (Excel'deki gibi)
+        header_box = QGroupBox()
+        header_box.setTitle("")
+        header_layout = QVBoxLayout(header_box)
+        layout.addWidget(header_box)
+
+        def _row(label: str, widget: QWidget) -> None:
+            r = QHBoxLayout()
+            lab = QLabel(label)
+            lab.setFixedWidth(160)
+            lab.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+            lab.setStyleSheet("background:#0b2f6b;color:white;padding:6px;font-weight:bold;")
+            r.addWidget(lab)
+            r.addWidget(widget, 1)
+            header_layout.addLayout(r)
+
+        self.po_agency = QLineEdit(); self.po_agency.setReadOnly(True)
+        self.po_advertiser = QLineEdit(); self.po_advertiser.setReadOnly(True)
+        self.po_product = QLineEdit(); self.po_product.setReadOnly(True)
+        self.po_plan_title = QLineEdit(); self.po_plan_title.setReadOnly(True)
+
+        # Rezervasyon no: çoklu olunca listelenecek, o yüzden multi-line
+        self.po_resno = QPlainTextEdit()
+        self.po_resno.setReadOnly(True)
+        self.po_resno.setMaximumHeight(72)
+
+        self.po_period = QLineEdit(); self.po_period.setReadOnly(True)
+        self.po_spot_len = QLineEdit(); self.po_spot_len.setReadOnly(True)
+
+        _row("Ajans", self.po_agency)
+        _row("Reklamveren", self.po_advertiser)
+        _row("Ürün", self.po_product)
+        _row("Plan Başlığı", self.po_plan_title)
+        _row("Rezervasyon No", self.po_resno)
+        _row("Dönemi", self.po_period)
+        _row("Spot Süresi -Sn", self.po_spot_len)
+
+        # Tablo
+        self.po_table = QTableWidget()
+        self.po_table.setAlternatingRowColors(True)
+        self.po_table.verticalHeader().setVisible(False)
+        self.po_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.po_table.setShowGrid(True)
+        self.po_table.horizontalHeader().setStretchLastSection(True)
+        self.po_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        self.po_table.horizontalHeader().setStyleSheet(
+            "QHeaderView::section{background:#e67e22;color:white;font-weight:bold;border:1px solid #c66a1d;padding:6px;}"
+        )
+        layout.addWidget(self.po_table, 1)
+
+        # Wire
+        self.btn_po_refresh.clicked.connect(self.refresh_plan_ozet)
+        self.btn_po_export.clicked.connect(self.export_plan_ozet_excel)
+        self.po_year.valueChanged.connect(lambda *_: self.refresh_plan_ozet())
+        self.po_month.currentIndexChanged.connect(lambda *_: self.refresh_plan_ozet())
+        self.po_table.cellChanged.connect(self._po_on_cell_changed)
+
+    def _set_plan_ozet_period_from_latest(self, advertiser_name: str) -> None:
+        """Reklamveren seçilince plan özetin yıl/ayını en son rezervasyona göre ayarla."""
+        adv = (advertiser_name or "").strip()
+        if not adv or not getattr(self, "repo", None):
+            return
+        try:
+            recs = self.repo.list_confirmed_reservations_by_advertiser(adv, limit=1)
+            if not recs:
+                return
+            p = recs[0].payload or {}
+            dstr = p.get("plan_date")
+            if not dstr:
+                return
+            d = datetime.fromisoformat(str(dstr)).date()
+            self.po_year.blockSignals(True)
+            self.po_month.blockSignals(True)
+            self.po_year.setValue(d.year)
+            self.po_month.setCurrentIndex(d.month - 1)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.po_year.blockSignals(False)
+                self.po_month.blockSignals(False)
+            except Exception:
+                pass
+
+    def _po_on_cell_changed(self, row: int, col: int) -> None:
+        """Yayın grubu tek yerden girilsin diye aynı kanalın DT/ODT satırlarını senkron tut."""
+        if self._po_syncing:
+            return
+        if col != 1:
+            return
+        if not hasattr(self, "po_table"):
+            return
+        # Toplam satırını karıştırma
+        if row >= self.po_table.rowCount() - 1:
+            return
+        ch_item = self.po_table.item(row, 0)
+        if not ch_item:
+            return
+        ch = ch_item.text()
+        val_item = self.po_table.item(row, 1)
+        val = val_item.text() if val_item else ""
+
+        try:
+            self._po_syncing = True
+            for r in range(self.po_table.rowCount() - 1):
+                if r == row:
+                    continue
+                it = self.po_table.item(r, 0)
+                if it and it.text() == ch:
+                    tgt = self.po_table.item(r, 1)
+                    if tgt is None:
+                        tgt = QTableWidgetItem(val)
+                        self.po_table.setItem(r, 1, tgt)
+                    else:
+                        tgt.setText(val)
+        finally:
+            self._po_syncing = False
+
+    def refresh_plan_ozet(self) -> None:
+        if not getattr(self, "service", None):
+            return
+        adv = (self.in_advertiser.text() or "").strip()
+        if not adv:
+            return
+
+        yy = int(self.po_year.value())
+        mm = int(self.po_month.currentIndex()) + 1
+
+        try:
+            data = self.service.get_plan_ozet_data(adv, yy, mm)
+            header = data.get("header") or {}
+            rows = data.get("rows") or []
+            days = int(data.get("days") or 0)
+
+            # Header alanları
+            self.po_agency.setText(str(header.get("agency", "") or ""))
+            self.po_advertiser.setText(str(header.get("advertiser", adv) or adv))
+            self.po_product.setText(str(header.get("product", "") or ""))
+            self.po_plan_title.setText(str(header.get("plan_title", "") or ""))
+            self.po_resno.setPlainText(str(header.get("reservation_no", "") or ""))
+            self.po_period.setText(str(header.get("period", "") or ""))
+            sl = header.get("spot_len", 0) or 0
+            try:
+                sl = float(sl)
+                self.po_spot_len.setText("" if sl == 0 else f"{sl:.2f}")
+            except Exception:
+                self.po_spot_len.setText(str(sl))
+
+            month_name = str(header.get("month_name", "") or "")
+
+            # Kolonlar
+            base_headers = ["KANAL", "YAYIN GRUBU", "DT/ODT", "DİNLENME ORANI"]
+            day_headers = [str(i) for i in range(1, days + 1)]
+            tail_headers = [
+                f"{month_name} Adet" if month_name else "Ay Adet",
+                f"{month_name} Saniye" if month_name else "Ay Saniye",
+                "Birim sn. (TL)",
+                "Toplam Bütçe Net TL",
+            ]
+            headers = base_headers + day_headers + tail_headers
+
+            self.po_table.blockSignals(True)
+            self.po_table.clear()
+            self.po_table.setColumnCount(len(headers))
+            self.po_table.setHorizontalHeaderLabels(headers)
+
+            totals = data.get("totals") or {}
+            total_rows = len(rows) + 1  # + toplam satırı
+            self.po_table.setRowCount(total_rows)
+
+            def _fmt(v):
+                if v in (None, ""):
+                    return ""
+                try:
+                    f = float(v)
+                    if abs(f - int(f)) < 1e-9:
+                        return str(int(f))
+                    return f"{f:.2f}"
+                except Exception:
+                    return str(v)
+
+            # Data satırları
+            for r_i, rr in enumerate(rows):
+                # Kanal
+                it0 = QTableWidgetItem(str(rr.get("channel", "") or ""))
+                it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)
+                self.po_table.setItem(r_i, 0, it0)
+
+                # Yayın grubu (editable)
+                it1 = QTableWidgetItem(str(rr.get("publish_group", "") or ""))
+                self.po_table.setItem(r_i, 1, it1)
+
+                # DT/ODT
+                it2 = QTableWidgetItem(str(rr.get("dt_odt", "") or ""))
+                it2.setFlags(it2.flags() & ~Qt.ItemIsEditable)
+                self.po_table.setItem(r_i, 2, it2)
+
+                # Dinlenme oranı
+                it3 = QTableWidgetItem(str(rr.get("dinlenme_orani", "") or "NA"))
+                it3.setFlags(it3.flags() & ~Qt.ItemIsEditable)
+                self.po_table.setItem(r_i, 3, it3)
+
+                # Günler
+                day_vals = rr.get("days") or []
+                for di in range(days):
+                    v = day_vals[di] if di < len(day_vals) else ""
+                    it = QTableWidgetItem(_fmt(v))
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                    self.po_table.setItem(r_i, 4 + di, it)
+
+                # Ay toplamları
+                base = 4 + days
+                tail = [rr.get("month_adet"), rr.get("month_saniye"), rr.get("unit_price"), rr.get("budget")]
+                for j, v in enumerate(tail):
+                    it = QTableWidgetItem(_fmt(v))
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                    self.po_table.setItem(r_i, base + j, it)
+
+            # Toplam satırı
+            t_row = len(rows)
+            bold = QFont(); bold.setBold(True)
+
+            it_t0 = QTableWidgetItem("Toplam")
+            it_t0.setFont(bold)
+            it_t0.setFlags(it_t0.flags() & ~Qt.ItemIsEditable)
+            self.po_table.setItem(t_row, 0, it_t0)
+
+            # boş publish group / dtodt / dinlenme
+            for c in (1, 2, 3):
+                it = QTableWidgetItem("")
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                self.po_table.setItem(t_row, c, it)
+
+            t_days = totals.get("days") or []
+            for di in range(days):
+                v = t_days[di] if di < len(t_days) else ""
+                it = QTableWidgetItem(_fmt(v))
+                it.setFont(bold)
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                self.po_table.setItem(t_row, 4 + di, it)
+
+            base = 4 + days
+            tail = [totals.get("month_adet"), totals.get("month_saniye"), "", totals.get("budget")]
+            for j, v in enumerate(tail):
+                it = QTableWidgetItem(_fmt(v))
+                it.setFont(bold)
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                self.po_table.setItem(t_row, base + j, it)
+
+            self.po_table.resizeColumnsToContents()
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", str(e))
+        finally:
+            try:
+                self.po_table.blockSignals(False)
+            except Exception:
+                pass
+
+    def export_plan_ozet_excel(self) -> None:
+        if not getattr(self, "service", None):
+            return
+        adv = (self.in_advertiser.text() or "").strip()
+        if not adv:
+            return
+
+        yy = int(self.po_year.value())
+        mm = int(self.po_month.currentIndex()) + 1
+
+        default_name = f"PLAN_OZET_{adv}_{yy}_{mm:02d}.xlsx"
+        out_dir = self.app_settings.data_dir / "exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        default_path = str((out_dir / default_name).resolve())
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Plan Özet Excel Kaydet",
+            default_path,
+            "Excel Files (*.xlsx)"
+        )
+        if not path:
+            return
+
+        try:
+            self.service.export_plan_ozet_excel(path, adv, yy, mm)
+            QMessageBox.information(self, "OK", f"Excel çıktısı oluşturuldu:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", str(e))
+
 
     def _build_kod_tanimi_tab(self) -> None:
         tab = self.tab_widgets["KOD TANIMI"]

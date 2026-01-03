@@ -545,3 +545,174 @@ def export_spotlist(out_path, advertiser_name: str, rows: list[dict]) -> None:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
+
+
+# ------------------------------
+# PLAN ÖZET (ay bazlı birleştirilmiş özet)
+# ------------------------------
+
+def export_plan_ozet(out_path, data: dict) -> None:
+    """Plan Özet ekranındaki tabloyu, örnek PLAN ÖZET şablonuyla Excel'e döker.
+
+    Not: Formüller openpyxl tarafından hesaplanmaz. Excel açıldığında hesaplanır.
+    """
+
+    def _copy_row_style(ws, src_row: int, dst_row: int, min_col: int, max_col: int) -> None:
+        ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+        for col in range(min_col, max_col + 1):
+            s = ws.cell(src_row, col)
+            d = ws.cell(dst_row, col)
+            d._style = copy(s._style)
+            d.number_format = s.number_format
+            d.font = copy(s.font)
+            d.border = copy(s.border)
+            d.fill = copy(s.fill)
+            d.alignment = copy(s.alignment)
+            d.protection = copy(s.protection)
+            d.comment = None
+
+    out_path = Path(out_path)
+
+    template_path = resource_path("assets/plan_ozet_template.xlsx")
+    if not template_path.exists():
+        raise FileNotFoundError(f"Plan özet şablonu bulunamadı: {template_path}")
+
+    wb = openpyxl.load_workbook(template_path)
+    ws = wb["PLAN ÖZET"] if "PLAN ÖZET" in wb.sheetnames else wb.active
+
+    header = data.get("header") or {}
+    rows = data.get("rows") or []
+    days_in_month = int(data.get("days") or 31)
+
+    # --- Üst bilgiler ---
+    ws["C2"].value = str(header.get("agency", "") or "")
+    ws["C3"].value = str(header.get("advertiser", "") or "")
+    ws["C4"].value = str(header.get("product", "") or "")
+    ws["C5"].value = str(header.get("plan_title", "") or "")
+    ws["C6"].value = str(header.get("reservation_no", "") or "")
+    ws["C7"].value = str(header.get("period", "") or "")
+
+    spot_len = header.get("spot_len", 0) or 0
+    try:
+        ws["C8"].value = float(spot_len)
+    except Exception:
+        ws["C8"].value = 0
+
+    month_name = str(header.get("month_name", "") or "").strip().upper()
+
+    # --- Ay başlığı / kolon başlıkları ---
+    if month_name:
+        ws["F9"].value = month_name
+        ws["AK9"].value = f"{month_name} Toplam"
+        ws["AK10"].value = f"{month_name} Adet"
+        ws["AL10"].value = f"{month_name} Saniye"
+
+    # Gün başlıkları (1..31)
+    header_row = 10
+    day_start_col = 6   # F
+    for d in range(1, 32):
+        c = day_start_col + (d - 1)
+        ws.cell(header_row, c).value = d if d <= days_in_month else None
+
+    # --- Tablo alanı boyutlandır ---
+    start_row = 11
+    # toplam satırını bul
+    total_row = None
+    for r in range(start_row, ws.max_row + 1):
+        v = ws.cell(r, 2).value
+        if isinstance(v, str) and v.strip().lower() == "toplam":
+            total_row = r
+            break
+    if total_row is None:
+        total_row = ws.max_row + 1
+
+    current_capacity = total_row - start_row
+    n_rows = len(rows)
+
+    # Gerekirse satır ekle/sil
+    if n_rows > current_capacity:
+        add = n_rows - current_capacity
+        ws.insert_rows(total_row, amount=add)
+        # eklenen satırlara stil bas (DT/ODT satır alternansı)
+        for i in range(add):
+            dst_r = total_row + i
+            src_r = start_row if ((dst_r - start_row) % 2 == 0) else (start_row + 1)
+            _copy_row_style(ws, src_r, dst_r, 2, 40)  # B..AN
+    elif n_rows < current_capacity:
+        remove = current_capacity - n_rows
+        ws.delete_rows(start_row + n_rows, amount=remove)
+
+    # Yeni total satırı konumu
+    total_row = start_row + n_rows
+    last_data_row = total_row - 1
+
+    # --- Satırları yaz ---
+    col_channel = 2      # B
+    col_group = 3        # C
+    col_dtodt = 4        # D
+    col_ratio = 5        # E
+    col_month_adet = 37  # AK
+    col_month_sn = 38    # AL
+    col_unit_price = 39  # AM
+    col_budget = 40      # AN
+
+    for i, rr in enumerate(rows):
+        r = start_row + i
+
+        ws.cell(r, col_channel).value = str(rr.get("channel", "") or "")
+        ws.cell(r, col_group).value = str(rr.get("publish_group", "") or "")
+        ws.cell(r, col_dtodt).value = str(rr.get("dt_odt", "") or "")
+        ws.cell(r, col_ratio).value = str(rr.get("dinlenme_orani", "NA") or "NA")
+
+        # Günler
+        day_vals = rr.get("days") or []
+        for d in range(1, 32):
+            c = day_start_col + (d - 1)
+            if d <= len(day_vals):
+                v = day_vals[d - 1]
+                try:
+                    ws.cell(r, c).value = int(v) if str(v).strip() != "" else None
+                except Exception:
+                    ws.cell(r, c).value = None
+            else:
+                ws.cell(r, c).value = None
+
+        # Birim sn
+        unit = rr.get("unit_price", 0) or 0
+        try:
+            ws.cell(r, col_unit_price).value = float(unit)
+        except Exception:
+            ws.cell(r, col_unit_price).value = 0.0
+
+        # Formüller (Excel açılınca hesaplanacak)
+        ws.cell(r, col_month_adet).value = f"=SUM(F{r}:AJ{r})"
+        ws.cell(r, col_month_sn).value = f"=AK{r}*$C$8"
+        ws.cell(r, col_budget).value = f"=AL{r}*AM{r}"
+
+    # --- Toplam satırı ---
+    ws.cell(total_row, col_channel).value = "Toplam"
+    ws.cell(total_row, col_group).value = None
+    ws.cell(total_row, col_dtodt).value = None
+    ws.cell(total_row, col_ratio).value = None
+
+    if last_data_row >= start_row:
+        # Gün toplamları
+        for d in range(1, 32):
+            c = day_start_col + (d - 1)
+            col_letter = get_column_letter(c)
+            ws.cell(total_row, c).value = f"=SUM({col_letter}{start_row}:{col_letter}{last_data_row})"
+
+        ws.cell(total_row, col_month_adet).value = f"=SUM(AK{start_row}:AK{last_data_row})"
+        ws.cell(total_row, col_month_sn).value = f"=SUM(AL{start_row}:AL{last_data_row})"
+        ws.cell(total_row, col_unit_price).value = None
+        ws.cell(total_row, col_budget).value = f"=SUM(AN{start_row}:AN{last_data_row})"
+    else:
+        for d in range(1, 32):
+            ws.cell(total_row, day_start_col + (d - 1)).value = None
+        ws.cell(total_row, col_month_adet).value = 0
+        ws.cell(total_row, col_month_sn).value = 0
+        ws.cell(total_row, col_unit_price).value = None
+        ws.cell(total_row, col_budget).value = 0
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)

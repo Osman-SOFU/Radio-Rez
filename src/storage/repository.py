@@ -212,6 +212,15 @@ class Repository:
 
         return dict(meta), [dict(r) for r in rows]
 
+    def get_access_rows(self, set_id: int) -> list[dict]:
+        """Erişim örneği (Access Example) satırlarını döndürür.
+
+        PLAN ÖZET sayfası dinlenme oranı (AvRch%) bilgisini buradan okur.
+        """
+        _meta, rows = self.load_access_set(int(set_id))
+        return rows
+
+
     def save_access_set(self, set_id: int, periods: str, targets: str, rows: list[dict]) -> None:
         # Eğer zaten açık transaction varsa tekrar BEGIN deme (SQLite patlıyor)
         if not self.conn.in_transaction:
@@ -253,6 +262,20 @@ class Repository:
             ORDER BY datetime(created_at) DESC, id DESC
             LIMIT 1
             """
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    def get_latest_access_set_id_for_year(self, year: int) -> int | None:
+        """İstenen yıl için en son kaydedilmiş erişim setinin id'si."""
+        row = self.conn.execute(
+            """
+            SELECT id
+            FROM access_example_sets
+            WHERE year=?
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT 1
+            """,
+            (int(year),),
         ).fetchone()
         return int(row["id"]) if row else None
 
