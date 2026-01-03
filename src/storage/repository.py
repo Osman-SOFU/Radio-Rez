@@ -28,15 +28,19 @@ class Repository:
             (name,),
         )
 
-    def search_advertisers(self, q: str, limit: int = 20) -> list[str]:
-        q = q.strip()
-        if not q:
-            return []
-        cur = self.conn.execute(
-            "SELECT name FROM advertisers WHERE name LIKE ? ORDER BY name LIMIT ?",
-            (f"%{q}%", limit),
-        )
-        return [r["name"] for r in cur.fetchall()]
+    def search_advertisers(self, text: str, limit: int = 30) -> list[str]:
+        sql = """
+            SELECT DISTINCT advertiser_name
+            FROM reservations
+            WHERE is_confirmed = 1
+            AND advertiser_name IS NOT NULL
+            AND advertiser_name != ''
+            AND UPPER(advertiser_name) LIKE UPPER(?)
+            ORDER BY advertiser_name
+            LIMIT ?
+        """
+        cur = self.conn.execute(sql, (f"%{text}%", limit))
+        return [r[0] for r in cur.fetchall()]
 
     def list_reservations_by_advertiser(self, advertiser_name: str, limit: int = 50) -> list[ReservationRecord]:
         cur = self.conn.execute(

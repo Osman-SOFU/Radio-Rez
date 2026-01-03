@@ -50,7 +50,87 @@ class PlanningGrid(QWidget):
         self.table.setAlternatingRowColors(False)
         self.table.setSortingEnabled(False)
 
+        # dışarıdan okunabilirlik: kayıtlı rezervasyonu sadece görmek için
+        self._read_only: bool = False
+
         self.set_month(self.year, self.month, None)
+
+    def set_read_only(self, read_only: bool) -> None:
+        """Gün hücrelerini düzenlenemez yapar (Kuşak/Dolar zaten sabit)."""
+        self._read_only = bool(read_only)
+        self._apply_read_only_flags()
+
+    def clear_matrix(self) -> None:
+        """Sadece gün hücrelerini temizle."""
+        import calendar
+
+        days_in_month = calendar.monthrange(self.year, self.month)[1]
+        for r in range(self.table.rowCount()):
+            for day in range(1, days_in_month + 1):
+                c = 1 + day
+                it = self.table.item(r, c)
+                if it:
+                    it.setText("")
+
+    def set_matrix(self, plan_cells: dict) -> None:
+        """DB'den gelen plan_cells'i grid'e basar.
+
+        plan_cells anahtar formatı: "row_idx,day" (string) veya (row_idx, day)
+        """
+        import calendar
+
+        self.clear_matrix()
+        if not plan_cells:
+            self._apply_read_only_flags()
+            return
+
+        days_in_month = calendar.monthrange(self.year, self.month)[1]
+
+        for k, v in (plan_cells or {}).items():
+            if not str(v or "").strip():
+                continue
+            try:
+                if isinstance(k, str):
+                    r_s, d_s = k.split(",")
+                    r = int(r_s)
+                    day = int(d_s)
+                else:
+                    r, day = k
+                    r = int(r)
+                    day = int(day)
+            except Exception:
+                continue
+
+            if r < 0 or r >= self.table.rowCount():
+                continue
+            if day < 1 or day > days_in_month:
+                continue
+
+            c = 1 + day
+            it = self.table.item(r, c)
+            if not it:
+                it = QTableWidgetItem("")
+                self.table.setItem(r, c, it)
+            it.setText(str(v))
+
+        self._apply_read_only_flags()
+
+    def _apply_read_only_flags(self) -> None:
+        """Sadece gün hücrelerinde editable flag kontrolü."""
+        import calendar
+
+        days_in_month = calendar.monthrange(self.year, self.month)[1]
+        for r in range(self.table.rowCount()):
+            for day in range(1, days_in_month + 1):
+                c = 1 + day
+                it = self.table.item(r, c)
+                if not it:
+                    continue
+                flags = it.flags()
+                if self._read_only:
+                    it.setFlags(flags & ~Qt.ItemIsEditable)
+                else:
+                    it.setFlags(flags | Qt.ItemIsEditable)
 
     def set_month(self, year: int, month: int, selected_day: int | None):
         self.year = year
@@ -120,6 +200,9 @@ class PlanningGrid(QWidget):
             font.setBold(True)
             self.table.horizontalHeaderItem(sel_col).setFont(font)
             self.table.horizontalHeaderItem(sel_col).setBackground(QBrush(QColor("#d0d0d0")))
+
+        # read-only mod açıksa hücre flag'lerini tekrar uygula
+        self._apply_read_only_flags()
 
     def get_matrix(self) -> dict[str, str]:
         out: dict[str, str] = {}

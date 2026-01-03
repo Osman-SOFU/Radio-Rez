@@ -28,12 +28,28 @@ import re
 
 
 TAB_NAMES = [
-    "REZERVASYON ve PLANLAMA",
+    "ANA SAYFA",
+    "REZERVASYONLAR",
     "PLAN ÖZET",
     "SPOTLİST+",
     "KOD TANIMI",
     "Fiyat ve Kanal Tanımı",
     "Erişim Örneği",
+]
+
+MONTHS_TR = [
+    "OCAK",
+    "ŞUBAT",
+    "MART",
+    "NİSAN",
+    "MAYIS",
+    "HAZİRAN",
+    "TEMMUZ",
+    "AĞUSTOS",
+    "EYLÜL",
+    "EKİM",
+    "KASIM",
+    "ARALIK",
 ]
 
 class MainWindow(QMainWindow):
@@ -89,8 +105,11 @@ class MainWindow(QMainWindow):
             self.tab_widgets[name] = w
             self.tabs.addTab(w, name)
 
-        # First tab content (minimal form)
-        self._build_first_tab()
+        # ANA SAYFA (rezervasyon girişi)
+        self._build_home_tab()
+
+        # REZERVASYONLAR (kayıtlı rezervasyonları gör/sil)
+        self._build_reservations_tab()
 
         # Bottom buttons
         bottom = QHBoxLayout()
@@ -132,8 +151,8 @@ class MainWindow(QMainWindow):
         
 
 
-    def _build_first_tab(self) -> None:
-        tab = self.tab_widgets["REZERVASYON ve PLANLAMA"]
+    def _build_home_tab(self) -> None:
+        tab = self.tab_widgets["ANA SAYFA"]
         layout = QVBoxLayout(tab)
 
         row0 = QHBoxLayout()
@@ -213,6 +232,9 @@ class MainWindow(QMainWindow):
         # ilk açılışta da set et
         self.on_plan_date_changed(self.in_date.date())       
 
+        # formda yüklü olan kayıt (kayıtlı rezervasyonları görüntülerken işimize yarıyor)
+        self._loaded_reservation_id: int | None = None
+
     def refresh_channel_combo(self) -> None:
         """Rezervasyon sekmesindeki kanal listesini DB'den yeniler."""
         if not getattr(self, "repo", None) or not hasattr(self, "in_channel"):
@@ -244,6 +266,10 @@ class MainWindow(QMainWindow):
 
         # UI bağımlı listeleri yenile
         self.refresh_channel_combo()
+        try:
+            self.refresh_reservation_channel_filter()
+        except Exception:
+            pass
 
     def pick_data_folder(self) -> None:
         p = QFileDialog.getExistingDirectory(self, "Veri klasörünü seç")
@@ -287,7 +313,8 @@ class MainWindow(QMainWindow):
         self.in_spot_code.setText(str(p.get("spot_code", "") or ""))
         self.in_code_definition.setText(str(p.get("code_definition", "") or ""))
         self.in_note.setText(str(p.get("note_text", "") or ""))
-        self.in_prepared_by.setText(str(p.get("prepared_by_name", "") or ""))
+        # payload'ta prepared_by olarak tutuluyor
+        self.in_prepared_by.setText(str(p.get("prepared_by", "") or ""))
 
         try:
             self.in_spot_duration.setValue(int(p.get("spot_duration_sec", 0) or 0))
@@ -299,9 +326,26 @@ class MainWindow(QMainWindow):
             dstr = p.get("plan_date")
             if dstr:
                 d = datetime.fromisoformat(str(dstr)).date()
+                # dateChanged sinyali grid'i resetlediği için önce tarihi set edip sonra matrix basıyoruz
+                self.in_date.blockSignals(True)
                 self.in_date.setDate(QDate(d.year, d.month, d.day))
+                self.in_date.blockSignals(False)
+                self.on_plan_date_changed(self.in_date.date())
         except Exception:
             pass
+
+        # Plan hücrelerini de getir (en büyük eksik buydu)
+        try:
+            self.plan_grid.set_read_only(False)
+            self.plan_grid.set_matrix(p.get("plan_cells") or {})
+        except Exception:
+            pass
+
+        # Bu formda yüklü olan kayıt id'si
+        try:
+            self._loaded_reservation_id = int(recs[0].id)
+        except Exception:
+            self._loaded_reservation_id = None
 
         # Kanal seçimi
         self.refresh_channel_combo()
@@ -316,6 +360,8 @@ class MainWindow(QMainWindow):
             current_tab = self.tabs.tabText(self.tabs.currentIndex())
             if current_tab == "SPOTLİST+":
                 self.refresh_spotlist()
+            elif current_tab == "REZERVASYONLAR":
+                self.refresh_reservations_tab()
             elif current_tab == "PLAN ÖZET":
                 self._set_plan_ozet_period_from_latest(name)
                 self.refresh_plan_ozet()
@@ -323,6 +369,12 @@ class MainWindow(QMainWindow):
                 self.refresh_kod_tanimi()
             elif current_tab == "Fiyat ve Kanal Tanımı":
                 self.refresh_price_channel_tab()
+        except Exception:
+            pass
+
+        # rezervasyonlar tabı açık değilse bile, arama ile reklamvereni seçince liste tazelensin
+        try:
+            self.refresh_reservations_tab()
         except Exception:
             pass
 
@@ -421,6 +473,8 @@ class MainWindow(QMainWindow):
 
     def on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
+        if tab_name == "REZERVASYONLAR":
+            self.refresh_reservations_tab()
         if tab_name == "KOD TANIMI":
             self.refresh_kod_tanimi()
         elif tab_name == "SPOTLİST+":
@@ -430,6 +484,315 @@ class MainWindow(QMainWindow):
             self.refresh_plan_ozet()
         elif tab_name == "Fiyat ve Kanal Tanımı":
             self.refresh_price_channel_tab()
+
+    # ------------------------------
+    # REZERVASYONLAR (kayıtlı rezervasyonları gör/sil)
+    # ------------------------------
+
+    def _build_reservations_tab(self) -> None:
+        tab = self.tab_widgets["REZERVASYONLAR"]
+        layout = QVBoxLayout(tab)
+
+        top = QHBoxLayout()
+        layout.addLayout(top)
+
+        self.btn_res_refresh = QPushButton("Yenile")
+        self.btn_res_open = QPushButton("Seçileni Aç")
+        self.btn_res_delete = QPushButton("Seçileni Sil")
+
+        top.addWidget(self.btn_res_refresh)
+        top.addWidget(self.btn_res_open)
+        top.addWidget(self.btn_res_delete)
+        top.addSpacing(16)
+
+        top.addWidget(QLabel("Yıl:"))
+        self.res_year = QSpinBox()
+        self.res_year.setRange(2000, 2100)
+        self.res_year.setValue(QDate.currentDate().year())
+        self.res_year.setFixedWidth(90)
+        top.addWidget(self.res_year)
+
+        top.addWidget(QLabel("Ay:"))
+        self.res_month = QComboBox()
+        self.res_month.addItem("TÜMÜ", 0)
+        for i, m in enumerate(MONTHS_TR, start=1):
+            self.res_month.addItem(m, i)
+        self.res_month.setFixedWidth(120)
+        top.addWidget(self.res_month)
+
+        top.addSpacing(12)
+        top.addWidget(QLabel("Kanal:"))
+        self.res_channel = QComboBox()
+        self.res_channel.setMinimumWidth(220)
+        top.addWidget(self.res_channel)
+        top.addStretch(1)
+
+        # Liste
+        self.res_table = QTableWidget()
+        self.res_table.setColumnCount(7)
+        self.res_table.setHorizontalHeaderLabels(
+            [
+                "Rezervasyon No",
+                "Plan Tarihi",
+                "Kanal",
+                "Spot Kodu",
+                "Süre (sn)",
+                "Adet",
+                "Kayıt Zamanı",
+            ]
+        )
+        self.res_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.res_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.res_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.res_table.verticalHeader().setVisible(False)
+        self.res_table.setAlternatingRowColors(True)
+        self.res_table.horizontalHeader().setStretchLastSection(True)
+        self.res_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        layout.addWidget(self.res_table, 2)
+
+        # Preview
+        self.res_preview_title = QLabel("")
+        font = self.res_preview_title.font()
+        font.setBold(True)
+        self.res_preview_title.setFont(font)
+        layout.addWidget(self.res_preview_title)
+
+        self.res_preview_grid = PlanningGrid()
+        self.res_preview_grid.set_read_only(True)
+        layout.addWidget(self.res_preview_grid, 3)
+
+        self._res_records = []  # ReservationRecord[]
+
+        # Signals
+        self.btn_res_refresh.clicked.connect(self.refresh_reservations_tab)
+        self.btn_res_open.clicked.connect(self.on_reservation_open)
+        self.btn_res_delete.clicked.connect(self.on_reservation_delete)
+        self.res_table.itemSelectionChanged.connect(self.on_reservation_selected)
+
+        self.res_year.valueChanged.connect(self.refresh_reservations_tab)
+        self.res_month.currentIndexChanged.connect(self.refresh_reservations_tab)
+        self.res_channel.currentIndexChanged.connect(self.refresh_reservations_tab)
+
+        self.refresh_reservation_channel_filter()
+
+    def refresh_reservation_channel_filter(self) -> None:
+        if not getattr(self, "repo", None) or not hasattr(self, "res_channel"):
+            return
+        current = self.res_channel.currentText().strip() if self.res_channel.count() else ""
+        self.res_channel.blockSignals(True)
+        try:
+            self.res_channel.clear()
+            self.res_channel.addItem("TÜMÜ", "")
+            for ch in self.repo.list_channels(active_only=True):
+                self.res_channel.addItem(str(ch["name"]), str(ch["name"]))
+            if current:
+                idx = self.res_channel.findText(current)
+                if idx >= 0:
+                    self.res_channel.setCurrentIndex(idx)
+        finally:
+            self.res_channel.blockSignals(False)
+
+    def refresh_reservations_tab(self) -> None:
+        if not getattr(self, "repo", None):
+            return
+
+        adv = (self.in_advertiser.text() or "").strip()
+        self._res_records = []
+        self.res_table.setRowCount(0)
+        self.res_preview_title.setText("")
+        try:
+            self.res_preview_grid.clear_matrix()
+        except Exception:
+            pass
+
+        if not adv:
+            return
+
+        year = int(self.res_year.value())
+        month = int(self.res_month.currentData() or 0)
+        ch_filter = str(self.res_channel.currentData() or "").strip()
+
+        recs = self.repo.list_confirmed_reservations_by_advertiser(adv, limit=50000)
+        # filtrele
+        filtered = []
+        for r in recs:
+            p = r.payload or {}
+            try:
+                y, m, d = str(p.get("plan_date") or "").split("-")
+                yy = int(y)
+                mm = int(m)
+            except Exception:
+                continue
+
+            if yy != year:
+                continue
+            if month and mm != month:
+                continue
+            if ch_filter:
+                if str(p.get("channel_name") or "").strip() != ch_filter:
+                    continue
+            filtered.append(r)
+
+        # yeni -> eski
+        filtered.sort(key=lambda x: x.created_at, reverse=True)
+
+        self._res_records = filtered
+        self.res_table.setRowCount(len(filtered))
+
+        for i, r in enumerate(filtered):
+            p = r.payload or {}
+            res_no = str(r.reservation_no or "")
+            plan_date = str(p.get("plan_date") or "")
+            channel = str(p.get("channel_name") or "")
+            spot_code = str(p.get("spot_code") or "")
+            duration = str(p.get("spot_duration_sec") or "")
+            adet = str(p.get("adet_total") or "")
+            created = str(r.created_at or "")
+
+            for col, val in enumerate([res_no, plan_date, channel, spot_code, duration, adet, created]):
+                it = QTableWidgetItem(str(val))
+                self.res_table.setItem(i, col, it)
+
+    def _get_selected_reservation_records(self) -> list:
+        rows = {idx.row() for idx in self.res_table.selectionModel().selectedRows()}
+        out = []
+        for r in sorted(rows):
+            if 0 <= r < len(self._res_records):
+                out.append(self._res_records[r])
+        return out
+
+    def on_reservation_selected(self) -> None:
+        recs = self._get_selected_reservation_records()
+        if len(recs) != 1:
+            self.res_preview_title.setText("")
+            try:
+                self.res_preview_grid.clear_matrix()
+            except Exception:
+                pass
+            return
+
+        r = recs[0]
+        p = r.payload or {}
+        res_no = str(r.reservation_no or "")
+        channel = str(p.get("channel_name") or "")
+        plan_date = str(p.get("plan_date") or "")
+        self.res_preview_title.setText(f"{res_no}  |  {channel}  |  {plan_date}")
+
+        try:
+            y, m, d = plan_date.split("-")
+            self.res_preview_grid.set_month(int(y), int(m), int(d))
+            self.res_preview_grid.set_matrix(p.get("plan_cells") or {})
+            self.res_preview_grid.set_read_only(True)
+        except Exception:
+            pass
+
+    def on_reservation_open(self) -> None:
+        recs = self._get_selected_reservation_records()
+        if len(recs) != 1:
+            QMessageBox.information(self, "Bilgi", "Lütfen tek bir rezervasyon seç.")
+            return
+        self._load_reservation_into_form(recs[0])
+        # ANA SAYFA'ya geç
+        idx = self.tabs.indexOf(self.tab_widgets["ANA SAYFA"])
+        if idx >= 0:
+            self.tabs.setCurrentIndex(idx)
+
+    def _load_reservation_into_form(self, rec) -> None:
+        """Kayıtlı rezervasyonu ANA SAYFA formuna basar."""
+        p = rec.payload or {}
+
+        self.in_advertiser.setText(str(p.get("advertiser_name", "") or ""))
+        self.in_agency.setText(str(p.get("agency_name", "") or ""))
+        self.in_product.setText(str(p.get("product_name", "") or ""))
+        self.in_plan_title.setText(str(p.get("plan_title", "") or ""))
+        self.in_spot_code.setText(str(p.get("spot_code", "") or ""))
+        self.in_code_definition.setText(str(p.get("code_definition", "") or ""))
+        self.in_note.setText(str(p.get("note_text", "") or ""))
+
+        # prepared_by payload'ta "prepared_by" adıyla saklanıyor
+        self.in_prepared_by.setText(str(p.get("prepared_by", "") or ""))
+
+        try:
+            self.in_spot_duration.setValue(int(p.get("spot_duration_sec", 0) or 0))
+        except Exception:
+            pass
+
+        try:
+            dstr = p.get("plan_date")
+            if dstr:
+                d = datetime.fromisoformat(str(dstr)).date()
+                self.in_date.blockSignals(True)
+                self.in_date.setDate(QDate(d.year, d.month, d.day))
+                self.in_date.blockSignals(False)
+                self.on_plan_date_changed(self.in_date.date())
+        except Exception:
+            pass
+
+        self.refresh_channel_combo()
+        ch = str(p.get("channel_name", "") or "").strip()
+        if ch:
+            idx = self.in_channel.findText(ch)
+            if idx >= 0:
+                self.in_channel.setCurrentIndex(idx)
+
+        try:
+            self.plan_grid.set_read_only(False)
+            self.plan_grid.set_matrix(p.get("plan_cells") or {})
+        except Exception:
+            pass
+
+        try:
+            self._loaded_reservation_id = int(rec.id)
+        except Exception:
+            self._loaded_reservation_id = None
+
+    def on_reservation_delete(self) -> None:
+        if not getattr(self, "repo", None):
+            return
+        recs = self._get_selected_reservation_records()
+        if not recs:
+            QMessageBox.information(self, "Bilgi", "Silmek için en az 1 rezervasyon seç.")
+            return
+
+        # kullanıcıya net liste göster
+        lines = [str(r.reservation_no or "") for r in recs]
+        lines = [x for x in lines if x]
+        msg = "\n".join(lines[:15])
+        if len(lines) > 15:
+            msg += f"\n... (+{len(lines)-15} adet)"
+
+        ok = QMessageBox.question(
+            self,
+            "Silme Onayı",
+            f"Seçili rezervasyon(lar) kalıcı olarak silinecek. Emin misin?\n\n{msg}",
+        )
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+
+        ids = [int(r.id) for r in recs]
+        self.repo.delete_reservations_by_ids(ids)
+
+        # eğer formda yüklü olan kayıt silindiyse form id'sini temizle
+        if self._loaded_reservation_id in ids:
+            self._loaded_reservation_id = None
+
+        # tüm sayfalar DB'den okuduğu için refresh yeterli
+        self.refresh_reservations_tab()
+        try:
+            self.refresh_spotlist()
+        except Exception:
+            pass
+        try:
+            self.refresh_kod_tanimi()
+        except Exception:
+            pass
+        try:
+            self.refresh_plan_ozet()
+        except Exception:
+            pass
+        
+        self.on_search_changed(self.search_edit.text())
+        QMessageBox.information(self, "OK", "Seçili rezervasyon(lar) silindi.")
 
     def _build_spotlist_tab(self) -> None:
         tab = self.tab_widgets["SPOTLİST+"]
