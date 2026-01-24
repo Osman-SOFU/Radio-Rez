@@ -37,7 +37,7 @@ class ReservationService:
 
     def confirm(self, draft: ReservationDraft, plan_cells: dict) -> ConfirmedReservation:
         adv = draft.advertiser_name.strip()
-        if not adv:
+        if not pt:
             raise ValueError("Reklamveren zorunlu.")
 
         ok, msg = validate_day(draft.plan_date)
@@ -118,8 +118,8 @@ class ReservationService:
         export_excel(template_path, out_path, payload2)
         return out_path
 
-    def get_kod_tanimi_rows(self, advertiser_name: str) -> list[dict]:
-        recs = self.repo.list_confirmed_reservations_by_advertiser(advertiser_name)
+    def get_kod_tanimi_rows(self, plan_title: str) -> list[dict]:
+        recs = self.repo.list_confirmed_reservations_by_plan_title(plan_title)
 
         grouped: dict[str, dict] = {}
         total = 0
@@ -156,32 +156,32 @@ class ReservationService:
 
         return rows
 
-    def get_kod_tanimi_avg_len(self, advertiser_name: str) -> float:
-        rows = self.get_kod_tanimi_rows(advertiser_name)
+    def get_kod_tanimi_avg_len(self, plan_title: str) -> float:
+        rows = self.get_kod_tanimi_rows(plan_title)
         return sum(r["length_sn"] * r["distribution"] for r in rows) if rows else 0.0
 
-    def delete_kod_for_advertiser(self, advertiser_name: str, code: str) -> int:
-        return self.repo.delete_reservations_by_advertiser_and_spot_code(advertiser_name, code)
+    def delete_kod_for_plan_title(self, plan_title: str, code: str) -> int:
+        return self.repo.delete_reservations_by_plan_title_and_spot_code(plan_title, code)
 
-    def export_kod_tanimi_excel(self, out_path, advertiser_name: str) -> None:
+    def export_kod_tanimi_excel(self, out_path, plan_title: str) -> None:
         from src.export.excel_exporter import export_kod_tanimi
-        rows = self.get_kod_tanimi_rows(advertiser_name)
-        export_kod_tanimi(out_path, advertiser_name, rows)
+        rows = self.get_kod_tanimi_rows(plan_title)
+        export_kod_tanimi(out_path, plan_title, rows)
 
     # ------------------------------
     # SPOTLİST+
     # ------------------------------
 
-    def get_spotlist_rows(self, advertiser_name: str) -> list[dict[str, Any]]:
-        """Seçili reklam veren için SPOTLİST+ satırlarını üretir.
+    def get_spotlist_rows(self, plan_title: str) -> list[dict[str, Any]]:
+        """Seçili plan başlığı için SPOTLİST+ satırlarını üretir.
 
         Her satır, confirmed reservation payload'ındaki plan_cells içindeki dolu hücrelerden türetilir.
         """
-        adv = (advertiser_name or "").strip()
-        if not adv:
+        pt = (plan_title or "").strip()
+        if not pt:
             return []
 
-        recs = self.repo.list_confirmed_reservations_by_advertiser(adv, limit=50000)
+        recs = self.repo.list_confirmed_reservations_by_plan_title(pt, limit=50000)
         if not recs:
             return []
 
@@ -241,7 +241,7 @@ class ReservationService:
                         "datetime": datetime(dt.year, dt.month, dt.day, t0.hour, t0.minute),
                         "tarih": dt.strftime("%d.%m.%Y"),
                         "ana_yayin": channel_name,
-                        "reklam_firmasi": adv,
+                        "reklam_firmasi": str(p.get("advertiser_name") or "").strip(),
                         "adet": 1,
                         "baslangic": t0.strftime("%H:%M"),
                         "sure": duration,
@@ -266,15 +266,15 @@ class ReservationService:
         """Toplu kaydet: (reservation_id, day, row_idx, published)"""
         self.repo.upsert_spotlist_published_many(changes)
 
-    def export_spotlist_excel_with_rows(self, out_path, advertiser_name: str, rows: list[dict]) -> None:
+    def export_spotlist_excel_with_rows(self, out_path, plan_title: str, rows: list[dict]) -> None:
         """Filtrelenmiş satırlarla SPOTLİST+ Excel çıktısı al."""
         from src.export.excel_exporter import export_spotlist
-        export_spotlist(out_path, advertiser_name, rows)
+        export_spotlist(out_path, plan_title, rows)
 
-    def export_spotlist_excel(self, out_path, advertiser_name: str) -> None:
+    def export_spotlist_excel(self, out_path, plan_title: str) -> None:
         """Tüm satırları çekip SPOTLİST+ Excel çıktısı al."""
-        rows = self.get_spotlist_rows(advertiser_name)
-        self.export_spotlist_excel_with_rows(out_path, advertiser_name, rows)
+        rows = self.get_spotlist_rows(plan_title)
+        self.export_spotlist_excel_with_rows(out_path, plan_title, rows)
 
 
     # ------------------------------
@@ -310,15 +310,15 @@ class ReservationService:
         # farklı formatlar için lexicographic fallback
         return (9999, 99, 999999999, s)
 
-    def get_plan_ozet_data(self, advertiser_name: str, year: int, month: int) -> dict[str, Any]:
-        """Seçili reklamveren + yıl/ay için PLAN ÖZET datasını üretir.
+    def get_plan_ozet_data(self, plan_title: str, year: int, month: int) -> dict[str, Any]:
+        """Seçili plan başlığı + yıl/ay için PLAN ÖZET datasını üretir.
 
-        - Bu özet tek rezervasyon değil; ay içinde aynı reklamverene ait tüm rezervasyonları birleştirir.
+        - Bu özet tek rezervasyon değil; ay içinde aynı plan başlığına ait tüm rezervasyonları birleştirir.
         - Eğer ay içinde 1'den fazla rezervasyon varsa Rezervasyon No alanı "ÇOKLU" olur ve numaralar
           sıralı şekilde listelenir.
         """
-        adv = (advertiser_name or "").strip()
-        if not adv:
+        pt = (plan_title or "").strip()
+        if not pt:
             return {
                 "header": {},
                 "year": int(year),
@@ -334,7 +334,7 @@ class ReservationService:
         month_name = self._MONTHS_TR[mm - 1]
 
         # rezervasyonları ay bazlı filtrele
-        recs = self.repo.list_confirmed_reservations_by_advertiser(adv, limit=5000)
+        recs = self.repo.list_confirmed_reservations_by_plan_title(pt, limit=5000)
         month_recs = []
         for r in recs:
             p = r.payload or {}
@@ -357,6 +357,8 @@ class ReservationService:
         agency = _uniq_or_coklu([str((r.payload or {}).get("agency_name") or "") for r in month_recs])
         product = _uniq_or_coklu([str((r.payload or {}).get("product_name") or "") for r in month_recs])
         plan_title = _uniq_or_coklu([str((r.payload or {}).get("plan_title") or "") for r in month_recs])
+        advertiser = _uniq_or_coklu([str((r.payload or {}).get("advertiser_name") or "") for r in month_recs])
+
 
         res_nos = [str(getattr(r, "reservation_no", "") or "") for r in month_recs if getattr(r, "reservation_no", None)]
         res_nos_sorted = sorted(res_nos, key=self._sort_reservation_no)
@@ -369,7 +371,7 @@ class ReservationService:
             reservation_no_display = "ÇOKLU\n" + "\n".join(res_nos_sorted)
 
         # Spot süresi: kod tanımı sayfasındaki ort. uzunluk
-        spot_len = float(self.get_kod_tanimi_avg_len(adv) or 0.0)
+        spot_len = float(self.get_kod_tanimi_avg_len(pt) or 0.0)
 
         # Dinlenme oranı (AvRch%) - erişim örneğinden
         access_set_id = self.repo.get_latest_access_set_id_for_year(yy) or self.repo.get_latest_access_set_id()
@@ -492,7 +494,7 @@ class ReservationService:
 
         header = {
             "agency": agency,
-            "advertiser": adv,
+            "advertiser": advertiser,
             "product": product,
             "plan_title": plan_title,
             "reservation_no": reservation_no_display,
@@ -510,8 +512,8 @@ class ReservationService:
             "totals": totals,
         }
 
-    def export_plan_ozet_excel(self, out_path, advertiser_name: str, year: int, month: int) -> None:
+    def export_plan_ozet_excel(self, out_path, plan_title: str, year: int, month: int) -> None:
         """Plan Özet ekranındaki birleştirilmiş özetin Excel çıktısını üretir."""
         from src.export.excel_exporter import export_plan_ozet
-        data = self.get_plan_ozet_data(advertiser_name, int(year), int(month))
+        data = self.get_plan_ozet_data(plan_title, int(year), int(month))
         export_plan_ozet(out_path, data)

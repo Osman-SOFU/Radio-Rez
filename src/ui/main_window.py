@@ -75,9 +75,9 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         main.addLayout(top)
 
-        top.addWidget(QLabel("Reklam veren Ara:"))
+        top.addWidget(QLabel("Plan Başlığı Ara:"))
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Örn: MURATBEY")
+        self.search_edit.setPlaceholderText("Örn: TEST BAŞLIĞI")
         top.addWidget(self.search_edit, 2)
 
         self.data_dir_label = QLabel(f"Veri Klasörü: {self.app_settings.data_dir}")
@@ -294,22 +294,24 @@ class MainWindow(QMainWindow):
         self.list_advertisers.clear()
         if not self.repo:
             return
-        for name in self.repo.search_advertisers(text, limit=30):
+        for name in self.repo.search_plan_titles(text, limit=30):
             self.list_advertisers.addItem(name)
 
     def on_advertiser_selected(self, item) -> None:
         if not item:
             return
         name = item.text()
-        self.in_advertiser.setText(name)
+        self.in_plan_title.setText(name)
 
         # Seçili reklam veren için son kaydı forma geri getir
         if not getattr(self, "repo", None):
             return
-        recs = self.repo.list_confirmed_reservations_by_advertiser(name, limit=1)
+        recs = self.repo.list_confirmed_reservations_by_plan_title(name, limit=1)
         if not recs:
             return
         p = recs[0].payload or {}
+        # Plan başlığı seçimi ile birlikte reklamvereni de payload içinden güncelle
+        self.in_advertiser.setText(str(p.get("advertiser_name") or ""))
 
         # Basit alanlar
         self.in_agency.setText(str(p.get("agency_name", "") or ""))
@@ -485,7 +487,7 @@ class MainWindow(QMainWindow):
         elif tab_name == "SPOTLİST+":
             self.refresh_spotlist()
         elif tab_name == "PLAN ÖZET":
-            self._set_plan_ozet_period_from_latest(self.in_advertiser.text())
+            self._set_plan_ozet_period_from_latest(self.in_plan_title.text())
             self.refresh_plan_ozet()
         elif tab_name == "Fiyat ve Kanal Tanımı":
             self.refresh_price_channel_tab()
@@ -534,10 +536,11 @@ class MainWindow(QMainWindow):
 
         # Liste
         self.res_table = QTableWidget()
-        self.res_table.setColumnCount(7)
+        self.res_table.setColumnCount(8)
         self.res_table.setHorizontalHeaderLabels(
             [
                 "Rezervasyon No",
+                "Plan Başlığı",
                 "Plan Tarihi",
                 "Kanal",
                 "Spot Kodu",
@@ -601,7 +604,7 @@ class MainWindow(QMainWindow):
         if not getattr(self, "repo", None):
             return
 
-        adv = (self.in_advertiser.text() or "").strip()
+        pt = (self.in_plan_title.text() or "").strip()
         self._res_records = []
         self.res_table.setRowCount(0)
         self.res_preview_title.setText("")
@@ -610,14 +613,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        if not adv:
+        if not pt:
             return
 
         year = int(self.res_year.value())
         month = int(self.res_month.currentData() or 0)
         ch_filter = str(self.res_channel.currentData() or "").strip()
 
-        recs = self.repo.list_confirmed_reservations_by_advertiser(adv, limit=50000)
+        recs = self.repo.list_confirmed_reservations_by_plan_title(pt, limit=50000)
         # filtrele
         filtered = []
         for r in recs:
@@ -647,6 +650,7 @@ class MainWindow(QMainWindow):
         for i, r in enumerate(filtered):
             p = r.payload or {}
             res_no = str(r.reservation_no or "")
+            plan_title = str(p.get("plan_title") or "")
             plan_date = str(p.get("plan_date") or "")
             channel = str(p.get("channel_name") or "")
             spot_code = str(p.get("spot_code") or "")
@@ -654,7 +658,7 @@ class MainWindow(QMainWindow):
             adet = str(p.get("adet_total") or "")
             created = str(r.created_at or "")
 
-            for col, val in enumerate([res_no, plan_date, channel, spot_code, duration, adet, created]):
+            for col, val in enumerate([res_no, plan_title, plan_date, channel, spot_code, duration, adet, created]):
                 it = QTableWidgetItem(str(val))
                 self.res_table.setItem(i, col, it)
 
@@ -680,6 +684,7 @@ class MainWindow(QMainWindow):
         p = r.payload or {}
         res_no = str(r.reservation_no or "")
         channel = str(p.get("channel_name") or "")
+        plan_title = str(p.get("plan_title") or "")
         plan_date = str(p.get("plan_date") or "")
         self.res_preview_title.setText(f"{res_no}  |  {channel}  |  {plan_date}")
 
@@ -928,8 +933,8 @@ class MainWindow(QMainWindow):
         if not self.service:
             return
 
-        adv = (self.in_advertiser.text() or "").strip()
-        if not adv:
+        pt = (self.in_plan_title.text() or "").strip()
+        if not pt:
             self.spot_table.setRowCount(0)
             self.spot_summary.setText("")
             return
@@ -941,7 +946,7 @@ class MainWindow(QMainWindow):
             self.spot_filters_initialized = False
             self.spot_current_adv = adv
 
-        self.spot_all_rows = self.service.get_spotlist_rows(adv)
+        self.spot_all_rows = self.service.get_spotlist_rows(pt)
 
         # Tarih filtre aralığını ilk yüklemede dataya göre ayarla
         if self.spot_all_rows and not self.spot_filters_initialized:
@@ -1137,8 +1142,8 @@ class MainWindow(QMainWindow):
         if not self.service:
             QMessageBox.warning(self, "Hata", "Servis hazır değil.")
             return
-        adv = (self.in_advertiser.text() or "").strip()
-        if not adv:
+        pt = (self.in_plan_title.text() or "").strip()
+        if not pt:
             QMessageBox.warning(self, "Hata", "Önce bir reklam veren seç.")
             return
 
@@ -1252,13 +1257,13 @@ class MainWindow(QMainWindow):
         self.po_month.currentIndexChanged.connect(lambda *_: self.refresh_plan_ozet())
         self.po_table.cellChanged.connect(self._po_on_cell_changed)
 
-    def _set_plan_ozet_period_from_latest(self, advertiser_name: str) -> None:
+    def _set_plan_ozet_period_from_latest(self, plan_title: str) -> None:
         """Reklamveren seçilince plan özetin yıl/ayını en son rezervasyona göre ayarla."""
-        adv = (advertiser_name or "").strip()
-        if not adv or not getattr(self, "repo", None):
+        pt = (plan_title or "").strip()
+        if not pt or not getattr(self, "repo", None):
             return
         try:
-            recs = self.repo.list_confirmed_reservations_by_advertiser(adv, limit=1)
+            recs = self.repo.list_confirmed_reservations_by_plan_title(pt, limit=1)
             if not recs:
                 return
             p = recs[0].payload or {}
@@ -1316,22 +1321,22 @@ class MainWindow(QMainWindow):
     def refresh_plan_ozet(self) -> None:
         if not getattr(self, "service", None):
             return
-        adv = (self.in_advertiser.text() or "").strip()
-        if not adv:
+        pt = (self.in_plan_title.text() or "").strip()
+        if not pt:
             return
 
         yy = int(self.po_year.value())
         mm = int(self.po_month.currentIndex()) + 1
 
         try:
-            data = self.service.get_plan_ozet_data(adv, yy, mm)
+            data = self.service.get_plan_ozet_data(pt, yy, mm)
             header = data.get("header") or {}
             rows = data.get("rows") or []
             days = int(data.get("days") or 0)
 
             # Header alanları
             self.po_agency.setText(str(header.get("agency", "") or ""))
-            self.po_advertiser.setText(str(header.get("advertiser", adv) or adv))
+            self.po_advertiser.setText(str(header.get("advertiser", "") or ""))
             self.po_product.setText(str(header.get("product", "") or ""))
             self.po_plan_title.setText(str(header.get("plan_title", "") or ""))
             self.po_resno.setPlainText(str(header.get("reservation_no", "") or ""))
@@ -1460,14 +1465,14 @@ class MainWindow(QMainWindow):
     def export_plan_ozet_excel(self) -> None:
         if not getattr(self, "service", None):
             return
-        adv = (self.in_advertiser.text() or "").strip()
-        if not adv:
+        pt = (self.in_plan_title.text() or "").strip()
+        if not pt:
             return
 
         yy = int(self.po_year.value())
         mm = int(self.po_month.currentIndex()) + 1
 
-        default_name = f"PLAN_OZET_{adv}_{yy}_{mm:02d}.xlsx"
+        default_name = f"PLAN_OZET_{pt}_{yy}_{mm:02d}.xlsx"
         out_dir = self.app_settings.data_dir / "exports"
         out_dir.mkdir(parents=True, exist_ok=True)
         default_path = str((out_dir / default_name).resolve())
@@ -1482,7 +1487,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self.service.export_plan_ozet_excel(path, adv, yy, mm)
+            self.service.export_plan_ozet_excel(path, pt, yy, mm)
             QMessageBox.information(self, "OK", f"Excel çıktısı oluşturuldu:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
@@ -1544,12 +1549,12 @@ class MainWindow(QMainWindow):
     def refresh_kod_tanimi(self) -> None:
         if not self.service:
             return
-        adv = self.in_advertiser.text().strip()
-        if not adv:
+        pt = self.in_plan_title.text().strip()
+        if not pt:
             return
 
-        rows = self.service.get_kod_tanimi_rows(adv)
-        avg_len = self.service.get_kod_tanimi_avg_len(adv)
+        rows = self.service.get_kod_tanimi_rows(pt)
+        avg_len = self.service.get_kod_tanimi_avg_len(pt)
 
         data_count = max(len(rows), 7)
         self.kod_table.setRowCount(data_count + 1)
@@ -1605,7 +1610,7 @@ class MainWindow(QMainWindow):
     def delete_selected_kod(self) -> None:
         if not self.service:
             return
-        adv = self.in_advertiser.text().strip()
+        pt = self.in_plan_title.text().strip()
         row = self.kod_table.currentRow()
         if row < 0:
             return
@@ -1616,22 +1621,22 @@ class MainWindow(QMainWindow):
         if not code or code == "Ort.Uzun.":
             return
 
-        deleted = self.service.delete_kod_for_advertiser(adv, code)
+        deleted = self.service.delete_kod_for_plan_title(pt, code)
         QMessageBox.information(self, "OK", f"{code} koduna ait {deleted} kayıt silindi.")
         self.refresh_kod_tanimi()
 
     def export_kod_tanimi_excel(self) -> None:
         if not self.service:
             return
-        adv = self.in_advertiser.text().strip()
-        if not adv:
+        pt = self.in_plan_title.text().strip()
+        if not pt:
             return
 
-        path, _ = QFileDialog.getSaveFileName(self, "KOD TANIMI Excel", f"{adv}_KOD_TANIMI.xlsx", "Excel Files (*.xlsx)")
+        path, _ = QFileDialog.getSaveFileName(self, "KOD TANIMI Excel", f"{pt}_KOD_TANIMI.xlsx", "Excel Files (*.xlsx)")
         if not path:
             return
 
-        self.service.export_kod_tanimi_excel(path, adv)
+        self.service.export_kod_tanimi_excel(path, pt)
         QMessageBox.information(self, "OK", f"Excel çıktısı oluşturuldu:\n{path}")
 
     # ------------------------------

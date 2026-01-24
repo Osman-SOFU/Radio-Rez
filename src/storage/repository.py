@@ -11,6 +11,7 @@ class ReservationRecord:
     id: int
     reservation_no: str | None
     advertiser_name: str
+    plan_title: str
     created_at: str
     is_confirmed: int
     payload: dict[str, Any]
@@ -42,6 +43,50 @@ class Repository:
         cur = self.conn.execute(sql, (f"%{text}%", limit))
         return [r[0] for r in cur.fetchall()]
 
+
+    # ------------------------------
+    # PLAN BAŞLIĞI bazlı aramalar
+    # ------------------------------
+    def search_plan_titles(self, text: str, limit: int = 30) -> list[str]:
+        sql = """
+            SELECT DISTINCT plan_title
+            FROM reservations
+            WHERE is_confirmed = 1
+            AND plan_title IS NOT NULL
+            AND plan_title != ''
+            AND UPPER(plan_title) LIKE UPPER(?)
+            ORDER BY plan_title
+            LIMIT ?
+        """
+        cur = self.conn.execute(sql, (f"%{text}%", limit))
+        return [r[0] for r in cur.fetchall()]
+
+    def list_confirmed_reservations_by_plan_title(self, plan_title: str, limit: int = 5000) -> list[ReservationRecord]:
+        pt = (plan_title or "").strip()
+        cur = self.conn.execute(
+            """
+            SELECT * FROM reservations
+            WHERE plan_title = ? AND is_confirmed = 1
+            ORDER BY datetime(created_at) DESC
+            LIMIT ?
+            """,
+            (pt, limit),
+        )
+        out: list[ReservationRecord] = []
+        for r in cur.fetchall():
+            out.append(
+                ReservationRecord(
+                    id=r["id"],
+                    reservation_no=r["reservation_no"],
+                    advertiser_name=r["advertiser_name"],
+                    plan_title=(r["plan_title"] if "plan_title" in r.keys() else (json.loads(r["payload_json"] or "{}").get("plan_title") or "")),
+                    created_at=r["created_at"],
+                    is_confirmed=r["is_confirmed"],
+                    payload=json.loads(r["payload_json"]),
+                )
+            )
+        return out
+
     def list_reservations_by_advertiser(self, advertiser_name: str, limit: int = 50) -> list[ReservationRecord]:
         cur = self.conn.execute(
             """
@@ -59,6 +104,7 @@ class Repository:
                     id=r["id"],
                     reservation_no=r["reservation_no"],
                     advertiser_name=r["advertiser_name"],
+                    plan_title=(r["plan_title"] if "plan_title" in r.keys() else (json.loads(r["payload_json"] or "{}").get("plan_title") or "")),
                     created_at=r["created_at"],
                     is_confirmed=r["is_confirmed"],
                     payload=json.loads(r["payload_json"]),
@@ -104,10 +150,10 @@ class Repository:
 
             self.conn.execute(
                 """
-                INSERT INTO reservations(reservation_no, advertiser_name, created_at, is_confirmed, payload_json)
-                VALUES(?, ?, ?, ?, ?)
+                INSERT INTO reservations(reservation_no, advertiser_name, plan_title, created_at, is_confirmed, payload_json)
+                VALUES(?, ?, ?, ?, ?, ?)
                 """,
-                (reservation_no, advertiser_name, now, 1 if confirmed else 0, json.dumps(payload, ensure_ascii=False)),
+                (reservation_no, advertiser_name, str(payload.get("plan_title") or "").strip(), now, 1 if confirmed else 0, json.dumps(payload, ensure_ascii=False)),
             )
 
             self.upsert_advertiser(advertiser_name)
@@ -122,6 +168,7 @@ class Repository:
             id=rid,
             reservation_no=reservation_no,
             advertiser_name=advertiser_name,
+            plan_title=str(payload.get("plan_title") or "").strip(),
             created_at=now,
             is_confirmed=1 if confirmed else 0,
             payload=payload,
@@ -144,6 +191,7 @@ class Repository:
                     id=r["id"],
                     reservation_no=r["reservation_no"],
                     advertiser_name=r["advertiser_name"],
+                    plan_title=(r["plan_title"] if "plan_title" in r.keys() else (json.loads(r["payload_json"] or "{}").get("plan_title") or "")),
                     created_at=r["created_at"],
                     is_confirmed=r["is_confirmed"],
                     payload=json.loads(r["payload_json"]),
@@ -172,6 +220,20 @@ class Repository:
             return 0
 
         recs = self.list_confirmed_reservations_by_advertiser(advertiser_name, limit=50000)
+        ids = [
+            r.id for r in recs
+            if (r.payload.get("spot_code") or "").strip() == spot_code
+        ]
+        self.delete_reservations_by_ids(ids)
+        return len(ids)
+
+
+    def delete_reservations_by_plan_title_and_spot_code(self, plan_title: str, spot_code: str) -> int:
+        spot_code = (spot_code or "").strip()
+        if not spot_code:
+            return 0
+
+        recs = self.list_confirmed_reservations_by_plan_title(plan_title, limit=50000)
         ids = [
             r.id for r in recs
             if (r.payload.get("spot_code") or "").strip() == spot_code

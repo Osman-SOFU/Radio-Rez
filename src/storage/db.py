@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from pathlib import Path
 
 SCHEMA_SQL = """
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS reservations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   reservation_no TEXT UNIQUE,
   advertiser_name TEXT NOT NULL,
+  plan_title TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   is_confirmed INTEGER NOT NULL DEFAULT 0,
   payload_json TEXT NOT NULL
@@ -108,6 +110,33 @@ def _table_cols(conn: sqlite3.Connection, table: str) -> dict[str, dict]:
         cols[r["name"]] = {"notnull": r["notnull"], "dflt": r["dflt_value"]}
     return cols
 
+def _backfill_plan_title_from_payload(conn: sqlite3.Connection) -> None:
+    """Eski kayıtlarda plan_title kolonu yoktu; payload_json içinden doldurur."""
+    try:
+        cur = conn.execute(
+            """
+            SELECT id, payload_json
+            FROM reservations
+            WHERE plan_title IS NULL OR plan_title = ''
+            """
+        )
+    except sqlite3.OperationalError:
+        # plan_title kolonu daha eklenmemiş olabilir
+        return
+
+    rows = cur.fetchall()
+    for r in rows:
+        rid = r["id"]
+        try:
+            payload = json.loads(r["payload_json"] or "{}")
+        except Exception:
+            payload = {}
+        pt = str(payload.get("plan_title") or "").strip()
+        if not pt:
+            continue
+        conn.execute("UPDATE reservations SET plan_title=? WHERE id=?", (pt, rid))
+
+
 
 def _rebuild_reservations_if_legacy(conn: sqlite3.Connection) -> None:
     cols = _table_cols(conn, "reservations")
@@ -179,6 +208,19 @@ def migrate_and_seed(conn: sqlite3.Connection) -> None:
         "reservations",
         "ALTER TABLE reservations ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'",
         "payload_json",
+    )
+
+    # plan_title kolonunu ekle ve eski kayıtları payload'dan doldur
+    _ensure_column(
+        conn,
+        "reservations",
+        "ALTER TABLE reservations ADD COLUMN plan_title TEXT NOT NULL DEFAULT ''",
+        "plan_title",
+    )
+    _backfill_plan_title_from_payload(conn)
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reservations_plan_title ON reservations(plan_title)"
     )
 
     # Kanal fiyatları için (eski DB'ler): year/month kolonları yoksa ekle
