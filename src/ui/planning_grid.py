@@ -6,7 +6,9 @@ from datetime import datetime, timedelta, time as dtime
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor, QFont
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QTableWidgetItem, QAbstractItemView
+
+from src.ui.excel_table import ExcelTableWidget
 
 from src.domain.time_rules import classify_dt_odt
 
@@ -42,7 +44,7 @@ class PlanningGrid(QWidget):
         self.month = datetime.now().month
         self.selected_day: int | None = None
 
-        self.table = QTableWidget(self)
+        self.table = ExcelTableWidget(self)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.table)
@@ -50,10 +52,67 @@ class PlanningGrid(QWidget):
         self.table.setAlternatingRowColors(False)
         self.table.setSortingEnabled(False)
 
+        # Excel-like selection (row/column/block)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
+
+        # Daha kompakt görünüm
+        f = self.table.font()
+        try:
+            f.setPointSize(8)
+        except Exception:
+            pass
+        self.table.setFont(f)
+
         # dışarıdan okunabilirlik: kayıtlı rezervasyonu sadece görmek için
         self._read_only: bool = False
 
+        # Sizing preferences ("no-scroll" hedefi için dinamik daraltma)
+        self._fixed_col_widths = {0: 140, 1: 70}
+        self._day_col_min = 28
+        self._day_col_max = 60
+        self._row_min = 14
+        self._row_max = 22
+
+        self.table.horizontalHeader().setMinimumSectionSize(self._day_col_min)
+
         self.set_month(self.year, self.month, None)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_dynamic_sizes()
+
+    def _apply_dynamic_sizes(self) -> None:
+        """Try to fit the whole month horizontally; reduce row height for less vertical scroll."""
+        try:
+            days_in_month = calendar.monthrange(self.year, self.month)[1]
+            total_cols = 2 + days_in_month
+
+            # fixed columns
+            fixed_total = 0
+            for c, w in self._fixed_col_widths.items():
+                self.table.setColumnWidth(c, w)
+                fixed_total += w
+
+            # remaining width for day columns
+            avail = max(0, self.table.viewport().width() - fixed_total - 2)
+            if days_in_month > 0:
+                day_w = int(avail / days_in_month) if avail > 0 else self._day_col_min
+                day_w = max(self._day_col_min, min(self._day_col_max, day_w))
+            else:
+                day_w = self._day_col_min
+
+            for c in range(2, total_cols):
+                self.table.setColumnWidth(c, day_w)
+
+            # row height attempt
+            rows = self.table.rowCount() or 1
+            rh_avail = max(0, self.table.viewport().height() - self.table.horizontalHeader().height() - 2)
+            row_h = int(rh_avail / rows) if rh_avail > 0 else self._row_min
+            row_h = max(self._row_min, min(self._row_max, row_h))
+            self.table.verticalHeader().setDefaultSectionSize(row_h)
+        except Exception:
+            pass
 
     def set_read_only(self, read_only: bool) -> None:
         """Gün hücrelerini düzenlenemez yapar (Kuşak/Dolar zaten sabit)."""
@@ -151,11 +210,14 @@ class PlanningGrid(QWidget):
             headers.append(f"{dow}\n{d}")
         self.table.setHorizontalHeaderLabels(headers)
 
-        # Kolon genişlikleri (istersen sonra ayarlarız)
-        self.table.setColumnWidth(0, 140)
-        self.table.setColumnWidth(1, 80)
+        # Başlangıç kolon genişlikleri; resizeEvent ile dinamik ayarlanır.
+        for c, w in self._fixed_col_widths.items():
+            if c < total_cols:
+                self.table.setColumnWidth(int(c), int(w))
         for c in range(2, total_cols):
-            self.table.setColumnWidth(c, 60)
+            self.table.setColumnWidth(c, self._day_col_max)
+        for c in range(2, total_cols):
+            self.table.setColumnWidth(c, self._day_col_max)
 
         # Satırları doldur
         dt_row_brush = QBrush(QColor("#e0e0e0"))
@@ -203,6 +265,9 @@ class PlanningGrid(QWidget):
 
         # read-only mod açıksa hücre flag'lerini tekrar uygula
         self._apply_read_only_flags()
+
+        # mümkün olduğunca scroll ihtiyacını azalt
+        self._apply_dynamic_sizes()
 
     def get_matrix(self) -> dict[str, str]:
         out: dict[str, str] = {}

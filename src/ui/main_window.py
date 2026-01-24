@@ -16,6 +16,7 @@ from src.settings.app_settings import SettingsService, AppSettings
 from src.storage.db import ensure_data_folders, connect_db, migrate_and_seed
 from src.storage.repository import Repository
 from src.ui.planning_grid import PlanningGrid
+from src.ui.excel_table import ExcelTableWidget
 
 
 from src.domain.models import ReservationDraft, ConfirmedReservation
@@ -56,7 +57,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Radio-Rez (MVP)")
-        self.resize(1200, 700)
+        # Daha geniş default: ana sayfada gereksiz scroll ihtiyacını azaltır.
+        self.resize(1500, 850)
 
         self.settings_service = SettingsService()
         self.app_settings: AppSettings = self.settings_service.build()
@@ -175,11 +177,14 @@ class MainWindow(QMainWindow):
 
         row0b.addWidget(QLabel("Kod:"))
         self.in_spot_code = QLineEdit()
+        self.in_spot_code.setMaxLength(10)
+        self.in_spot_code.setFixedWidth(90)
         row0b.addWidget(self.in_spot_code, 1)
 
         row0b.addWidget(QLabel("Süre (sn):"))
         self.in_spot_duration = QSpinBox()
         self.in_spot_duration.setRange(0, 9999)
+        self.in_spot_duration.setFixedWidth(90)
         row0b.addWidget(self.in_spot_duration, 1)
 
         row_code_def = QHBoxLayout()
@@ -219,7 +224,7 @@ class MainWindow(QMainWindow):
         row2.addSpacing(12)
         row2.addWidget(QLabel("Kanal:"))
         self.in_channel = QComboBox()
-        self.in_channel.setMinimumWidth(220)
+        self.in_channel.setMinimumWidth(200)
         row2.addWidget(self.in_channel)
         row2.addStretch(1)
         # --- Excel benzeri plan grid ---
@@ -1656,10 +1661,11 @@ class MainWindow(QMainWindow):
         top.addWidget(self.btn_price_refresh)
         top.addWidget(self.btn_price_save)
 
-        self.price_table = QTableWidget()
+        self.price_table = ExcelTableWidget()
         self.price_table.setAlternatingRowColors(True)
-        self.price_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.price_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        # Excel gibi satır/kolon/blok seçimi + kopyala/yapıştır
+        self.price_table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        self.price_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.price_table.setEditTriggers(
             QAbstractItemView.DoubleClicked
             | QAbstractItemView.EditKeyPressed
@@ -1707,9 +1713,11 @@ class MainWindow(QMainWindow):
         self.price_table.setColumnCount(len(headers))
         self.price_table.setHorizontalHeaderLabels(headers)
 
+        # Kanal adı genişleyebilir; fiyat kolonlarını dar tutuyoruz ki mümkün olduğunca yatay scroll istemesin.
         self.price_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for c in range(1, len(headers)):
-            self.price_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+            self.price_table.horizontalHeader().setSectionResizeMode(c, QHeaderView.Fixed)
+            self.price_table.setColumnWidth(c, 55)
 
         channels = self.repo.list_channels(active_only=True)
         prices = self.repo.get_channel_prices(year)
