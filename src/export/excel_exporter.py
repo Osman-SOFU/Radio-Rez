@@ -307,15 +307,15 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
         except Exception:
             pass
 
-    # D67: AH60'daki toplam mantığı -> plan_cells dolu sayısı (parantez içinde)
+    # F67: AH60'daki toplam mantığı -> plan_cells dolu sayısı (parantez içinde)
     adet_total = payload.get("adet_total")
     if adet_total is None:
         adet_total = sum(1 for v in (plan_cells or {}).values() if str(v).strip())
-    ws["D67"].value = f"({int(adet_total)})"
+    ws["F67"].value = f"({int(adet_total)})"
 
-    # A76: NOT satırının hemen üstü -> Kod Tanımı
+    # D67: Kod Tanımı
     code_def = str(payload.get("code_definition", "")).strip()
-    ws["A76"].value = code_def if code_def else None
+    ws["D67"].value = code_def if code_def else None
 
     # NOT: sabit, içerik değişebilir
     note = str(payload.get("note_text", "")).strip()
