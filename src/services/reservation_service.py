@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, date, time
 import calendar
+import re
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,18 @@ from src.storage.repository import Repository
 @dataclass
 class ReservationService:
     repo: Repository
+
+    _PREPARED_BY_STAMP_RE = re.compile(r"\s-\s\d{2}\.\d{2}\.\d{4}\s\d{2}:\d{2}.*$")
+
+    def _clean_prepared_by_name(self, raw: str) -> str:
+        """UI/DB'den gelebilen 'İSİM - dd.mm.yyyy hh:mm - ...' değerinden sadece ismi al.
+
+        Amaç: Kullanıcı formu tekrar onayladığında ismin yanına tekrar tekrar tarih eklenmesini engellemek.
+        """
+        s = (raw or "").strip()
+        if not s:
+            return ""
+        return self._PREPARED_BY_STAMP_RE.sub("", s).strip()
 
     def _row_idx_to_time(self, row_idx: int) -> time:
         """Plan grid satırı -> kuşak başlangıç saati.
@@ -36,8 +49,12 @@ class ReservationService:
         return fixed
 
     def confirm(self, draft: ReservationDraft, plan_cells: dict) -> ConfirmedReservation:
-        adv = draft.advertiser_name.strip()
+        adv = (draft.advertiser_name or "").strip()
+        pt = (draft.plan_title or "").strip()
+
         if not pt:
+            raise ValueError("Plan başlığı zorunlu.")
+        if not adv:
             raise ValueError("Reklamveren zorunlu.")
 
         ok, msg = validate_day(draft.plan_date)
@@ -48,7 +65,8 @@ class ReservationService:
 
         # prepared_by: "İsim - dd.mm.yyyy hh:mm"
         stamp = datetime.now().strftime("%d.%m.%Y %H:%M")
-        prepared_by = f"{draft.prepared_by_name.strip()} - {stamp}" if draft.prepared_by_name.strip() else stamp
+        pb_name = self._clean_prepared_by_name(draft.prepared_by_name)
+        prepared_by = f"{pb_name} - {stamp}" if pb_name else stamp
 
         cells = self.sanitize_plan_cells(plan_cells)
         adet_total = sum(1 for v in cells.values() if str(v).strip())
@@ -57,7 +75,7 @@ class ReservationService:
             "agency_name": draft.agency_name.strip(),
             "advertiser_name": adv,
             "product_name": draft.product_name.strip(),
-            "plan_title": draft.plan_title.strip(),
+            "plan_title": pt,
             "spot_code": draft.spot_code.strip(),
             "spot_duration_sec": int(draft.spot_duration_sec or 0),
             "code_definition": draft.code_definition.strip(),

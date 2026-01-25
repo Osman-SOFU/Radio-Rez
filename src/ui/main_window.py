@@ -320,8 +320,11 @@ class MainWindow(QMainWindow):
         self.in_spot_code.setText(str(p.get("spot_code", "") or ""))
         self.in_code_definition.setText(str(p.get("code_definition", "") or ""))
         self.in_note.setText(str(p.get("note_text", "") or ""))
-        # payload'ta prepared_by olarak tutuluyor
-        self.in_prepared_by.setText(str(p.get("prepared_by", "") or ""))
+        # payload'ta prepared_by "İSİM - dd.mm.yyyy hh:mm" şeklinde tutuluyor.
+        # Formda ise sadece isim görünsün ki tekrar onaylandığında tarih tekrar tekrar eklenmesin.
+        pb_raw = str(p.get("prepared_by", "") or "").strip()
+        pb_name = pb_raw.split(" - ", 1)[0].strip() if pb_raw else ""
+        self.in_prepared_by.setText(pb_name)
 
         try:
             self.in_spot_duration.setValue(int(p.get("spot_duration_sec", 0) or 0))
@@ -719,8 +722,9 @@ class MainWindow(QMainWindow):
         self.in_code_definition.setText(str(p.get("code_definition", "") or ""))
         self.in_note.setText(str(p.get("note_text", "") or ""))
 
-        # prepared_by payload'ta "prepared_by" adıyla saklanıyor
-        self.in_prepared_by.setText(str(p.get("prepared_by", "") or ""))
+        pb_raw = str(p.get("prepared_by", "") or "").strip()
+        pb_name = pb_raw.split(" - ", 1)[0].strip() if pb_raw else ""
+        self.in_prepared_by.setText(pb_name)
 
         try:
             self.in_spot_duration.setValue(int(p.get("spot_duration_sec", 0) or 0))
@@ -916,6 +920,8 @@ class MainWindow(QMainWindow):
         # --- State ---
         self.spot_all_rows = []
         self.spot_dirty = {}              # (reservation_id, day, row_idx) -> 0/1
+        # Not: SPOTLİST+ artık reklamverene göre değil, plan başlığına göre çalışıyor.
+        # Bu state değişkeni de "mevcut plan başlığı" olarak kullanılır.
         self.spot_current_adv = ""
         self.spot_filters_initialized = False
 
@@ -939,12 +945,12 @@ class MainWindow(QMainWindow):
             self.spot_summary.setText("")
             return
 
-        # reklam veren değiştiyse dirty temizle (karışmasın)
-        if adv != self.spot_current_adv:
+        # plan başlığı değiştiyse dirty temizle (karışmasın)
+        if pt != self.spot_current_adv:
             self.spot_dirty.clear()
             self.btn_spot_save.setEnabled(False)
             self.spot_filters_initialized = False
-            self.spot_current_adv = adv
+            self.spot_current_adv = pt
 
         self.spot_all_rows = self.service.get_spotlist_rows(pt)
 
@@ -1144,10 +1150,12 @@ class MainWindow(QMainWindow):
             return
         pt = (self.in_plan_title.text() or "").strip()
         if not pt:
-            QMessageBox.warning(self, "Hata", "Önce bir reklam veren seç.")
+            QMessageBox.warning(self, "Hata", "Önce bir plan başlığı seç.")
             return
 
-        default_name = f"SPOTLIST_{adv}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        safe_pt = "".join(ch if ch.isalnum() or ch in ("-", "_", " ") else "_" for ch in pt).strip()
+        safe_pt = safe_pt.replace(" ", "_")[:60] or "PLAN"
+        default_name = f"SPOTLIST_{safe_pt}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         default_path = str((self.app_settings.data_dir / "exports" / default_name).resolve())
 
         path, _ = QFileDialog.getSaveFileName(
@@ -1161,7 +1169,7 @@ class MainWindow(QMainWindow):
 
         try:
             rows = self._filtered_spotlist_rows()
-            self.service.export_spotlist_excel_with_rows(path, adv, rows)
+            self.service.export_spotlist_excel_with_rows(path, pt, rows)
             QMessageBox.information(self, "OK", f"Excel çıktısı üretildi:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
