@@ -769,15 +769,26 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            # Rezervasyon Excel çıktıları bu klasöre üretilecek.
+            template_path = self._resolve_template_path()
+            out_dir = self.app_settings.data_dir / "exports"
+            out_paths: list[Path] = []
+            export_failures: list[str] = []
+
             # Spot saati kullanıcı girmiyor; SpotList+ zaten kuşak saatlerini kullanıyor.
             spot_t = datetime.now().time().replace(microsecond=0)
 
             # Ay bazında matrisleri al
-            if getattr(self.plan_grid, "is_span_mode", lambda: False)():
+            span_mode = bool(getattr(self.plan_grid, "is_span_mode", lambda: False)())
+            if span_mode:
                 month_matrices = self.plan_grid.get_span_month_matrices()
             else:
                 d0 = self.in_date.date().toPython()
                 month_matrices = {(d0.year, d0.month): self.plan_grid.get_matrix()}
+
+            # Span modunda kullanıcı aralığı
+            rs = self.in_range_start.date().toPython()
+            re = self.in_range_end.date().toPython()
 
             # Kod tanımları
             code_defs = self._get_code_defs_from_ui()
@@ -864,9 +875,98 @@ class MainWindow(QMainWindow):
                     )
                     created.append(dbrec)
 
+                    # Excel çıktısı:
+                    # - Span modunda ay ay dosya üretmek yerine, aralığı tek dosyada toplayacağız.
+                    # - Month modunda eski davranış devam.
+                    if not span_mode:
+                        try:
+                            from src.export.excel_exporter import export_excel
+
+                            out_path = out_dir / f"{dbrec.reservation_no}.xlsx"
+                            payload2 = dict(dbrec.payload or {})
+                            payload2["reservation_no"] = dbrec.reservation_no
+                            payload2["created_at"] = dbrec.created_at
+                            export_excel(template_path, out_path, payload2)
+                            out_paths.append(out_path)
+                        except Exception as ex2:
+                            export_failures.append(f"{dbrec.reservation_no}: {ex2}")
+
             if not created:
                 QMessageBox.information(self, "Bilgi", "Kaydedilecek bir hücre bulunamadı.")
                 return
+
+            # Span modunda: seçili tarih aralığına göre *tek dosya* rezervasyon çıktısı üret.
+            if span_mode:
+                try:
+                    from src.export.excel_exporter import export_excel_span
+
+                    # Güvenli dosya adı
+                    def _safe_name(s: str) -> str:
+                        s = "".join(ch if ch.isalnum() or ch in (" ", "-", "_", ".") else "_" for ch in (s or ""))
+                        s = "_".join(s.strip().split())
+                        return s[:120] if s else "RESERVATION"
+
+                    # Kanal bazında tek rezervasyon no: DB'de ay ay kayıt açıldığı için bir kanala
+                    # birden fazla reservation_no oluşur. Kullanıcı kanal çıktısında tek no görmek
+                    # istediğinden, aynı kanal için oluşan ilk reservation_no'yu kullanacağız.
+                    first_res_no_by_channel: dict[str, str] = {}
+                    for r in created:
+                        try:
+                            p = r.payload or {}
+                            chn = str(p.get("channel_name") or "").strip()
+                            if not chn:
+                                continue
+                            if chn not in first_res_no_by_channel:
+                                first_res_no_by_channel[chn] = str(getattr(r, "reservation_no", "") or "").strip()
+                        except Exception:
+                            continue
+
+                    # Bir dosya / kanal
+                    for ch_name in selected_channels:
+                        # fiyatlar: span başlangıç ayına göre (AO sütunu satır bazında tek fiyat olduğu için)
+                        dt_price = 0.0
+                        odt_price = 0.0
+                        try:
+                            yy0, mm0 = rs.year, rs.month
+                            if yy0 not in price_maps:
+                                price_maps[yy0] = self.repo.get_channel_prices(yy0)
+                            ch = ch_by_norm.get(ch_name.strip().lower())
+                            ch_id = int(ch.get("id")) if ch else None
+                            if ch_id is not None:
+                                dt_price, odt_price = price_maps[yy0].get((ch_id, int(mm0)), (0.0, 0.0))
+                        except Exception:
+                            pass
+
+                        payload_span = {
+                            "agency_name": self.in_agency.text().strip(),
+                            "advertiser_name": self.in_advertiser.text().strip(),
+                            "product_name": self.in_product.text().strip(),
+                            "plan_title": plan_title,
+                            "reservation_no": first_res_no_by_channel.get(ch_name, ""),
+                            "spot_code": self.in_spot_code.text().strip(),
+                            "spot_duration_sec": int(self.in_spot_duration.value()),
+                            "code_definition": self.in_code_definition.text().strip(),
+                            "code_defs": code_defs,
+                            "note_text": self.in_note.text().strip(),
+                            "prepared_by": self.in_prepared_by.text().strip(),
+                            "channel_name": ch_name,
+                            "channel_price_dt": float(dt_price),
+                            "channel_price_odt": float(odt_price),
+                        }
+
+                        fname = f"{_safe_name(plan_title)}__{_safe_name(ch_name)}__{rs:%Y%m%d}-{re:%Y%m%d}.xlsx"
+                        out_path = out_dir / fname
+                        export_excel_span(
+                            template_path=template_path,
+                            out_path=out_path,
+                            payload=payload_span,
+                            month_matrices=month_matrices,
+                            span_start=rs,
+                            span_end=re,
+                        )
+                        out_paths.append(out_path)
+                except Exception as exs:
+                    export_failures.append(f"SPAN_EXPORT: {exs}")
 
             # UI refresh
             self.refresh_reservations_tab()
@@ -879,8 +979,20 @@ class MainWindow(QMainWindow):
                 "Kaydedildi",
                 f"DB'ye {len(created)} kayıt eklendi.\n"
                 f"(Kanal x Ay kırılımı)\n\n"
+                f"Excel çıktısı: {len(out_paths)} adet\n"
+                f"Klasör: {out_dir}\n\n"
                 f"İpucu: Rezervasyonlar sekmesinden filtreleyebilirsin.",
             )
+
+            # Export hataları varsa kullanıcıyı bilgilendir.
+            if export_failures:
+                QMessageBox.warning(
+                    self,
+                    "Excel çıktısı üretilemedi",
+                    "Bazı kayıtlar DB'ye yazıldı ama Excel çıktısı üretilemedi:\n\n"
+                    + "\n".join(export_failures[:15])
+                    + ("\n..." if len(export_failures) > 15 else ""),
+                )
 
         except Exception as ex:
             QMessageBox.critical(self, "Hata", str(ex))
@@ -1005,11 +1117,27 @@ class MainWindow(QMainWindow):
 
 
     def _resolve_template_path(self) -> Path:
-        # AppSettings içinde template_path varsa onu kullan, yoksa assets/template.xlsx'e düş
+        """Rezervasyon Excel şablonunu çöz.
+
+        Not: Uygulama farklı CWD ile açılabildiği ve PyInstaller'da dosyalar _MEIPASS altına
+        çıktığı için resource_path fallback'i yapıyoruz.
+        """
+        from src.util.paths import resource_path
+
         tp = getattr(self.app_settings, "template_path", None)
         if tp:
-            return Path(tp)
-        return Path("assets") / "template.xlsx"
+            p = Path(tp)
+            if p.exists():
+                return p
+            # relatifse proje köküne göre dene
+            p2 = resource_path(str(p).replace('\\', '/'))
+            return p2
+
+        # default: assets/template.xlsx
+        p = Path("assets") / "template.xlsx"
+        if p.exists():
+            return p
+        return resource_path("assets/template.xlsx")
 
 
     def on_test_export(self) -> None:
@@ -1070,9 +1198,16 @@ class MainWindow(QMainWindow):
         self.btn_res_open = QPushButton("Seçileni Aç")
         self.btn_res_delete = QPushButton("Seçileni Sil")
 
+        self.btn_res_export_selected = QPushButton("Seçileni Excel'e Aktar")
+        self.btn_res_export_filtered = QPushButton("Filtredekileri Excel'e Aktar")
+        self.btn_res_open_exports = QPushButton("Exports Klasörünü Aç")
+
         top.addWidget(self.btn_res_refresh)
         top.addWidget(self.btn_res_open)
         top.addWidget(self.btn_res_delete)
+        top.addWidget(self.btn_res_export_selected)
+        top.addWidget(self.btn_res_export_filtered)
+        top.addWidget(self.btn_res_open_exports)
         top.addSpacing(16)
 
         top.addWidget(QLabel("Yıl:"))
@@ -1138,6 +1273,9 @@ class MainWindow(QMainWindow):
         self.btn_res_refresh.clicked.connect(self.refresh_reservations_tab)
         self.btn_res_open.clicked.connect(self.on_reservation_open)
         self.btn_res_delete.clicked.connect(self.on_reservation_delete)
+        self.btn_res_export_selected.clicked.connect(self.on_reservation_export_selected)
+        self.btn_res_export_filtered.clicked.connect(self.on_reservation_export_filtered)
+        self.btn_res_open_exports.clicked.connect(self.open_exports_folder)
         self.res_table.itemSelectionChanged.connect(self.on_reservation_selected)
 
         self.res_year.valueChanged.connect(self.refresh_reservations_tab)
@@ -1367,6 +1505,89 @@ class MainWindow(QMainWindow):
         
         self.on_search_changed(self.search_edit.text())
         QMessageBox.information(self, "OK", "Seçili rezervasyon(lar) silindi.")
+
+    # ------------------------------
+    # Rezervasyon Excel Export (REZERVASYONLAR sekmesi)
+    # ------------------------------
+
+    def open_exports_folder(self) -> None:
+        """Exports klasörünü açar."""
+        try:
+            out_dir = (self.app_settings.data_dir / "exports")
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(out_dir)))
+        except Exception as ex:
+            QMessageBox.warning(self, "Hata", f"Exports klasörü açılamadı: {ex}")
+
+    def _export_reservation_records(self, recs: list) -> None:
+        if not recs:
+            QMessageBox.information(self, "Bilgi", "Export edilecek kayıt yok.")
+            return
+
+        try:
+            template_path = self._resolve_template_path()
+            out_dir = self.app_settings.data_dir / "exports"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            from src.export.excel_exporter import export_excel
+
+            ok_paths: list[Path] = []
+            failures: list[str] = []
+
+            for r in recs:
+                res_no = str(getattr(r, "reservation_no", "") or "").strip()
+                if not res_no:
+                    failures.append("(rezervasyon no yok) -> export atlandı")
+                    continue
+
+                payload2 = dict(getattr(r, "payload", {}) or {})
+                payload2["reservation_no"] = res_no
+                payload2["created_at"] = str(getattr(r, "created_at", "") or "")
+
+                out_path = out_dir / f"{res_no}.xlsx"
+                try:
+                    export_excel(template_path, out_path, payload2)
+                    ok_paths.append(out_path)
+                except Exception as ex2:
+                    failures.append(f"{res_no}: {ex2}")
+
+            # Sonuç mesajı
+            msg = (
+                f"Excel çıktısı üretildi: {len(ok_paths)} adet\n"
+                f"Klasör: {out_dir}\n\n"
+                "Not: Aynı rezervasyon no ile dosya varsa üzerine yazar."
+            )
+            QMessageBox.information(self, "Export", msg)
+
+            if failures:
+                QMessageBox.warning(
+                    self,
+                    "Bazı dosyalar üretilemedi",
+                    "Aşağıdaki kayıt(lar) için export başarısız oldu:\n\n"
+                    + "\n".join(failures[:20])
+                    + ("\n..." if len(failures) > 20 else ""),
+                )
+
+        except Exception as ex:
+            QMessageBox.critical(self, "Hata", str(ex))
+
+    def on_reservation_export_selected(self) -> None:
+        recs = self._get_selected_reservation_records()
+        if not recs:
+            QMessageBox.information(self, "Bilgi", "Önce export etmek için satır seç.")
+            return
+        self._export_reservation_records(recs)
+
+    def on_reservation_export_filtered(self) -> None:
+        recs = list(getattr(self, "_res_records", []) or [])
+        if not recs:
+            QMessageBox.information(self, "Bilgi", "Liste boş. Önce filtrele / yenile.")
+            return
+        self._export_reservation_records(recs)
 
     def _build_spotlist_tab(self) -> None:
         tab = self.tab_widgets["SPOTLİST+"]

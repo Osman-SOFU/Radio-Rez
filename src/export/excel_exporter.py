@@ -329,6 +329,370 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     wb.save(out_path)
 
 
+def export_excel_span(
+    template_path: Path,
+    out_path: Path,
+    payload: dict[str, Any],
+    month_matrices: dict[tuple[int, int], dict[str, str]],
+    span_start: date,
+    span_end: date,
+    *,
+    max_days_per_sheet: int = 31,
+) -> Path:
+    """Tek dosyada, seçili tarih aralığına göre (gün/ay bazlı) rezervasyon Excel çıktısı üretir.
+
+    - UI span modunda grid tek tabloda görünür ama DB kayıtları ay ay bölünür.
+    - Bu fonksiyon ay ay dosya üretmek yerine, aralığı *tek Excel dosyasında* sayfalara böler.
+      (Bir sayfa en fazla 31 gün.)
+
+    month_matrices formatı: {(year,month): {"row,day": "KOD", ...}, ...}
+    """
+    if not template_path.exists():
+        raise FileNotFoundError(f"Template bulunamadı: {template_path}")
+
+    # normalize
+    if span_start and span_end and span_start > span_end:
+        span_start, span_end = span_end, span_start
+
+    # build full date list
+    dates: list[date] = []
+    cur = span_start
+    while cur <= span_end:
+        dates.append(cur)
+        cur = cur.fromordinal(cur.toordinal() + 1)
+
+    wb = openpyxl.load_workbook(template_path)
+    base_ws = wb["REZERVASYON ve PLANLAMA"]
+
+    # --- Span genelinde kullanılan kodlar / süre / tanımlar (A67/B67/D67 için) ---
+    # Not: Span modunda grid tek tablo olsa da ay ay matrise bölünerek geliyor.
+    # Excel şablonundaki formüller B67'ye bağlı olduğu için (saniye) burada doğru
+    # şekilde doldurmak kritik.
+
+    # code_defs: [{code, desc, duration_sec}, ...]
+    _code_defs = payload.get("code_defs") or []
+    code_map: dict[str, dict[str, Any]] = {}
+    for d in _code_defs:
+        try:
+            c = str(d.get("code") or "").strip().upper()
+            if not c:
+                continue
+            code_map[c] = {
+                "desc": str(d.get("desc") or "").strip(),
+                "duration_sec": float(d.get("duration_sec") or 0),
+            }
+        except Exception:
+            continue
+
+    # fallback: tekli alanlar
+    fb_code = str(payload.get("spot_code") or "").strip().upper()
+    if fb_code and fb_code not in code_map:
+        code_map[fb_code] = {
+            "desc": str(payload.get("code_definition") or "").strip(),
+            "duration_sec": float(payload.get("spot_duration_sec") or 0),
+        }
+
+    # Span içindeki gerçek kullanım (kod adetleri)
+    used_counts: dict[str, int] = {}
+    for dte in dates:
+        mm = month_matrices.get((dte.year, dte.month)) or {}
+        for row_idx in range(52):
+            v = mm.get(f"{row_idx},{dte.day}", "")
+            c = str(v or "").strip().upper()
+            if not c:
+                continue
+            used_counts[c] = used_counts.get(c, 0) + 1
+
+    used_codes_sorted = sorted(used_counts.keys())
+
+    # A67: kodlar
+    a67_codes = ",".join(used_codes_sorted) if used_codes_sorted else str(payload.get("spot_code") or "").strip()
+
+    # D67: tanımlar
+    d67_descs: list[str] = []
+    for c in used_codes_sorted:
+        desc = str((code_map.get(c) or {}).get("desc") or "").strip()
+        if desc:
+            d67_descs.append(desc)
+    d67_text = ",".join(d67_descs) if d67_descs else str(payload.get("code_definition") or "").strip()
+
+    # B67: tek kodsa süre, çokluysa ağırlıklı ortalama
+    b67_val: float | int = 0
+    if len(used_codes_sorted) == 1:
+        b67_val = float((code_map.get(used_codes_sorted[0]) or {}).get("duration_sec") or 0)
+    elif len(used_codes_sorted) > 1:
+        total = sum(used_counts.values())
+        if total > 0:
+            wsum = 0.0
+            for c in used_codes_sorted:
+                dur = float((code_map.get(c) or {}).get("duration_sec") or 0)
+                wsum += float(used_counts.get(c, 0)) * dur
+            b67_val = wsum / float(total)
+        else:
+            b67_val = 0
+    else:
+        # hiç hücre yoksa payload'tan
+        b67_val = float(payload.get("spot_duration_sec") or 0)
+
+    # Tam sayı ise int bas (Excel daha temiz)
+    try:
+        if abs(float(b67_val) - int(float(b67_val))) < 1e-9:
+            b67_val = int(float(b67_val))
+    except Exception:
+        pass
+
+    # AK77: prepared_by -> timestamp ekle
+    pb = str(payload.get("prepared_by") or "").strip()
+    if pb:
+        # Eğer kullanıcı sadece isim girdiyse, sonuna tarih-saat ekle.
+        # (UI confirm akışında zaten ekleniyor; span export UI'den direkt geliyor.)
+        if " - " not in pb or len(pb.split(" - ")) == 1:
+            pb = f"{pb} - {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    else:
+        pb = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    # Helper: apply header + fills for an arbitrary date chunk
+    def apply_span_headers(ws, dates_chunk: list[date]) -> None:
+        HEADER_ROW = 7
+        FIRST_DAY_COL = 3  # C
+        MAX_DAYS = 31
+        GRID_START_ROW = 8
+        GRID_ROWS = 52
+
+        # --- Şablondan weekday/weekend fill örneklerini otomatik yakala (mevcut mantık) ---
+        def fill_sig_from_cell(cell):
+            f = cell.fill
+            pt = getattr(f, "patternType", None)
+            fg = getattr(getattr(f, "fgColor", None), "rgb", None)
+            bg = getattr(getattr(f, "bgColor", None), "rgb", None)
+            return (pt, fg, bg)
+
+        def pick_fill(cells, sig):
+            for cell in cells:
+                if fill_sig_from_cell(cell) == sig:
+                    return copy(cell.fill)
+            return None
+
+        def analyze_grid_row(sample_row: int):
+            cells = []
+            for d in range(1, MAX_DAYS + 1):
+                c = FIRST_DAY_COL + (d - 1)
+                cells.append(ws.cell(sample_row, c))
+            sigs = [fill_sig_from_cell(cell) for cell in cells]
+            cnt = Counter(sigs).most_common()
+            weekday_sig = cnt[0][0] if cnt else None
+            weekend_sig = cnt[1][0] if len(cnt) > 1 else weekday_sig
+            weekday_fill = pick_fill(cells, weekday_sig)
+            weekend_fill = pick_fill(cells, weekend_sig) or weekday_fill
+            return weekday_fill, weekend_fill
+
+        # Header örnek fill'leri
+        header_cells = []
+        for d in range(1, MAX_DAYS + 1):
+            c = FIRST_DAY_COL + (d - 1)
+            header_cells.append(ws.cell(HEADER_ROW, c))
+
+        header_sigs = [fill_sig_from_cell(cell) for cell in header_cells]
+        h_cnt = Counter(header_sigs).most_common()
+        h_weekday_sig = h_cnt[0][0] if h_cnt else None
+        h_weekend_sig = h_cnt[1][0] if len(h_cnt) > 1 else h_weekday_sig
+
+        header_weekday_fill = pick_fill(header_cells, h_weekday_sig)
+        header_weekend_fill = pick_fill(header_cells, h_weekend_sig) or header_weekday_fill
+
+        # DT/ODT satır örnekleri
+        dt_row = GRID_START_ROW + 0
+        odt_row = GRID_START_ROW + 16
+        dt_weekday_fill, dt_weekend_fill = analyze_grid_row(dt_row)
+        odt_weekday_fill, odt_weekend_fill = analyze_grid_row(odt_row)
+        disabled_fill = odt_weekday_fill or dt_weekday_fill
+
+        # Önce tüm gün kolonlarını açık yap (önceki export gizlemiş olabilir)
+        for day in range(1, MAX_DAYS + 1):
+            col_letter = get_column_letter(FIRST_DAY_COL + (day - 1))
+            if col_letter in ws.column_dimensions:
+                ws.column_dimensions[col_letter].hidden = False
+
+        # Kolonlara tarihleri bas
+        for idx in range(1, MAX_DAYS + 1):
+            col = FIRST_DAY_COL + (idx - 1)
+            cell_h = ws.cell(HEADER_ROW, col)
+
+            if idx <= len(dates_chunk):
+                dte = dates_chunk[idx - 1]
+                dow = TR_DOW[dte.weekday()]
+                cell_h.value = f"{dow}\n{dte.day:02d}.{dte.month:02d}"
+                is_weekend = dow in ("Ct", "Pa")
+                hf = header_weekend_fill if is_weekend else header_weekday_fill
+                if hf is not None:
+                    cell_h.fill = hf
+
+                # grid fill
+                for row_idx in range(0, GRID_ROWS):
+                    rr = GRID_START_ROW + row_idx
+                    slot_type = classify_dt_odt(_row_idx_to_time(row_idx))
+                    if is_weekend:
+                        gf2 = dt_weekend_fill if slot_type == "DT" else odt_weekend_fill
+                    else:
+                        gf2 = dt_weekday_fill if slot_type == "DT" else odt_weekday_fill
+                    if gf2 is not None:
+                        ws.cell(rr, col).fill = gf2
+
+            else:
+                # chunk dışı kolon: gizle
+                cell_h.value = None
+                col_letter = get_column_letter(col)
+                ws.column_dimensions[col_letter].hidden = True
+                # grid'i de "disabled" tona çek
+                if disabled_fill is not None:
+                    for row_idx in range(0, GRID_ROWS):
+                        rr = GRID_START_ROW + row_idx
+                        ws.cell(rr, col).fill = disabled_fill
+
+    # chunk'lere böl
+    chunks: list[list[date]] = []
+    for i in range(0, len(dates), max_days_per_sheet):
+        chunks.append(dates[i : i + max_days_per_sheet])
+
+    period_text = f"{span_start.day:02d}.{span_start.month:02d}.{span_start.year} - {span_end.day:02d}.{span_end.month:02d}.{span_end.year}"
+
+    # İlk sheet: mevcut
+    sheets: list[Any] = [base_ws]
+    # Diğer sayfaları kopyala
+    for _ in range(1, len(chunks)):
+        ws2 = wb.copy_worksheet(base_ws)
+        sheets.append(ws2)
+
+    # Sayfa isimleri
+    for i, ws in enumerate(sheets, start=1):
+        if len(chunks) == 1:
+            ws.title = "REZERVASYON"
+        else:
+            c0 = chunks[i - 1][0]
+            c1 = chunks[i - 1][-1]
+            ws.title = f"{c0.day:02d}.{c0.month:02d}-{c1.day:02d}.{c1.month:02d}"
+
+    # Her sheet'i doldur
+    for si, ws in enumerate(sheets):
+        dates_chunk = chunks[si]
+
+        # --- Header labels + values (aynı) ---
+        ws["A1"].value = "Ajans:"
+        ws["C1"].value = str(payload.get("agency_name", "")).strip()
+
+        ws["A2"].value = "Reklam Veren:"
+        ws["C2"].value = str(payload.get("advertiser_name", "")).strip()
+
+        ws["A3"].value = "Ürün:"
+        ws["C3"].value = str(payload.get("product_name", "")).strip()
+
+        ws["A4"].value = "Plan Başlığı:"
+        ws["C4"].value = str(payload.get("plan_title", "")).strip()
+
+        ws["A5"].value = "Rezervasyon No:"
+        ws["C5"].value = str(payload.get("reservation_no", "")).strip()
+
+        hdr_font = copy(ws["A1"].font)
+        for addr in ("A4", "A5", "A6"):
+            ws[addr].font = hdr_font
+
+        ws["A6"].value = "Dönemi:"
+        ws["C6"].value = period_text
+
+        # Kanal adı
+        ch = str(payload.get("channel_name", "")).strip()
+        if ch:
+            ws["T2"].value = ch
+            # Şablonda T2 kanal adı fontu 13 olmalı (bazı akışlarda 11'e düşüyordu)
+            try:
+                ws["T2"].font = copy(ws["T2"].font)
+                ws["T2"].font = ws["T2"].font.copy(size=13)
+            except Exception:
+                pass
+
+        ws["U3"].value = "Rezervasyon Formu"
+
+        # Span tarih başlıkları + boyamalar
+        apply_span_headers(ws, dates_chunk)
+
+        # --- PLAN GRID: temizle + doldur ---
+        GRID_START_ROW = 8
+        GRID_START_COL = 3
+        GRID_ROWS = 52
+
+        # temizle: sadece chunk uzunluğu kadar kolon açık; ama şablon 31 kolon olduğu için 31'i temizleyelim
+        for r in range(GRID_START_ROW, GRID_START_ROW + GRID_ROWS):
+            for c in range(GRID_START_COL, GRID_START_COL + 31):
+                ws.cell(r, c).value = None
+
+        for row_idx in range(GRID_ROWS):
+            for di, dte in enumerate(dates_chunk):
+                mm = month_matrices.get((dte.year, dte.month)) or {}
+                code = mm.get(f"{row_idx},{dte.day}", "")
+                if not str(code).strip():
+                    continue
+                rr = GRID_START_ROW + row_idx
+                cc = GRID_START_COL + di
+                ws.cell(rr, cc).value = str(code)
+
+        # --- Birim fiyatı (AO sütunu) ---
+        try:
+            unit_price_col = column_index_from_string("AO")
+            dt_price = float(payload.get("channel_price_dt") or 0)
+            odt_price = float(payload.get("channel_price_odt") or 0)
+            for row_idx in range(GRID_ROWS):
+                rr = GRID_START_ROW + row_idx
+                slot_type = classify_dt_odt(_row_idx_to_time(row_idx))
+                ws.cell(rr, unit_price_col).value = dt_price if slot_type == "DT" else odt_price
+        except Exception:
+            pass
+
+        # --- Logo (her sheet için) ---
+        logo_path = template_path.parent / "RADIOSCOPE.PNG"
+        if not logo_path.exists():
+            logo_path = resource_path("assets/RADIOSCOPE.PNG")
+        try:
+            ws._images = []
+            if logo_path.exists():
+                img = Image(str(logo_path))
+                img.width = 128
+                img.height = 128
+                ws.add_image(img, "AO1")
+        except Exception:
+            pass
+
+        # --- Alt alanlar ---
+        # A67/B67/D67: Span genelindeki gerçek seçimlere göre doldur.
+        if a67_codes is not None:
+            ws["A67"].value = str(a67_codes).strip()
+
+        try:
+            ws["B67"].value = b67_val
+        except Exception:
+            pass
+
+        # toplam adet: sadece bu chunk içindeki dolu hücre sayısı
+        adet_total = 0
+        for row_idx in range(GRID_ROWS):
+            for dte in dates_chunk:
+                mm = month_matrices.get((dte.year, dte.month)) or {}
+                v = mm.get(f"{row_idx},{dte.day}", "")
+                if str(v).strip():
+                    adet_total += 1
+        ws["F67"].value = f"({int(adet_total)})"
+
+        ws["D67"].value = d67_text if str(d67_text).strip() else None
+
+        note = str(payload.get("note_text", "")).strip()
+        ws["A77"].value = "NOT:" if not note else f"NOT: {note}"
+
+        ws["AK77"].value = pb
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+    return out_path
+
+
 def export_plan_ozet_yearly(out_path, data: dict) -> None:
     """Plan Özet (Yıllık) çıktısını üretir.
 
