@@ -107,37 +107,38 @@ class MainWindow(QMainWindow):
             self.tab_widgets[name] = w
             self.tabs.addTab(w, name)
 
+        # --- State (must be initialized BEFORE any tab builder that reads it) ---
+        # Çoklu ay (tarih aralığı) için ay bazlı hücre cache'i
+        self._month_cells_cache: dict[tuple[int, int], dict] = {}
+        self._current_month_key: tuple[int, int] | None = None
+
+        # Çoklu kanal seçimi
+        self._selected_channel_names: list[str] = []
+
+        # Ana sayfa tarih aralığı (opsiyonel). Seçiliyse PlanningGrid gün kolonları aralığa göre gizlenir.
+        self._home_range_start: date | None = None
+        self._home_range_end: date | None = None
+
         # ANA SAYFA (rezervasyon girişi)
         self._build_home_tab()
 
         # REZERVASYONLAR (kayıtlı rezervasyonları gör/sil)
         self._build_reservations_tab()
 
-        # Bottom buttons
+        # Bottom buttons (tek akış: seçilen tarih aralığını DB'ye kaydet)
         bottom = QHBoxLayout()
         main.addLayout(bottom)
 
-        self.btn_confirm = QPushButton("Onayla")
-        bottom.addWidget(self.btn_confirm)
-
-        bottom.addStretch(1)
-
-        self.btn_test_export = QPushButton("Test Olarak İndir")
-        self.btn_test_export.setEnabled(False)
-        bottom.addWidget(self.btn_test_export)
-
-        self.btn_save_export = QPushButton("Kaydet ve Çıktı Al")
-        self.btn_save_export.setEnabled(False)
-        bottom.addWidget(self.btn_save_export)
+        self.btn_save = QPushButton("Kaydet")
+        bottom.addWidget(self.btn_save)
 
         # Wire
         self.btn_pick_folder.clicked.connect(self.pick_data_folder)
         self.search_edit.textChanged.connect(self.on_search_changed)
         self.list_advertisers.itemClicked.connect(self.on_advertiser_selected)
 
-        self.btn_confirm.clicked.connect(self.on_confirm)
-        self.btn_test_export.clicked.connect(self.on_test_export)
-        self.btn_save_export.clicked.connect(self.on_save_export)
+        # Yeni model: tek buton. Seçilen tarih aralığındaki tüm seçili kanalları DB'ye kaydeder.
+        self.btn_save.clicked.connect(self.on_save)
 
         # Bootstrap storage
         self.bootstrap_storage()
@@ -194,6 +195,31 @@ class MainWindow(QMainWindow):
         self.in_code_definition = QLineEdit()
         row_code_def.addWidget(self.in_code_definition, 6)
 
+        # Çoklu kod ekleme (kodları tanımla; grid'e K/A/B gibi harfleri kullanıcı yazar)
+        row_code_btns = QHBoxLayout()
+        layout.addLayout(row_code_btns)
+        self.btn_add_code = QPushButton("Kodu Ekle")
+        self.btn_remove_code = QPushButton("Seçili Kodu Sil")
+        self.btn_fill_selected = QPushButton("Seçili Hücrelere Yaz")
+        self.cb_active_code = QComboBox()
+        self.cb_active_code.setMinimumWidth(120)
+        row_code_btns.addWidget(self.btn_add_code)
+        row_code_btns.addWidget(self.btn_remove_code)
+        row_code_btns.addSpacing(12)
+        row_code_btns.addWidget(QLabel("Aktif Kod:"))
+        row_code_btns.addWidget(self.cb_active_code)
+        row_code_btns.addWidget(self.btn_fill_selected)
+        row_code_btns.addStretch(1)
+
+        self.tbl_codes = QTableWidget(0, 3)
+        self.tbl_codes.setHorizontalHeaderLabels(["Kod", "Kod Tanımı", "Süre (sn)"])
+        self.tbl_codes.verticalHeader().setVisible(False)
+        self.tbl_codes.setSelectionBehavior(QTableWidget.SelectRows)
+        self.tbl_codes.setSelectionMode(QTableWidget.SingleSelection)
+        self.tbl_codes.horizontalHeader().setStretchLastSection(True)
+        self.tbl_codes.setMaximumHeight(120)
+        layout.addWidget(self.tbl_codes)
+
 
         row0c = QHBoxLayout()
         layout.addLayout(row0c)
@@ -226,7 +252,30 @@ class MainWindow(QMainWindow):
         self.in_channel = QComboBox()
         self.in_channel.setMinimumWidth(200)
         row2.addWidget(self.in_channel)
+
+        self.btn_select_channels = QPushButton("Kanalları Seç")
+        row2.addWidget(self.btn_select_channels)
+        self.lbl_selected_channels = QLabel("")
+        self.lbl_selected_channels.setMinimumWidth(180)
+        row2.addWidget(self.lbl_selected_channels)
+
         row2.addStretch(1)
+
+        row2b = QHBoxLayout()
+        layout.addLayout(row2b)
+        row2b.addWidget(QLabel("Tarih Aralığı:"))
+        self.in_range_start = QDateEdit()
+        self.in_range_start.setCalendarPopup(True)
+        self.in_range_start.setFixedWidth(120)
+        self.in_range_end = QDateEdit()
+        self.in_range_end.setCalendarPopup(True)
+        self.in_range_end.setFixedWidth(120)
+        row2b.addWidget(self.in_range_start)
+        row2b.addWidget(QLabel("-"))
+        row2b.addWidget(self.in_range_end)
+        self.btn_apply_range = QPushButton("Aralığı Uygula")
+        row2b.addWidget(self.btn_apply_range)
+        row2b.addStretch(1)
         # --- Excel benzeri plan grid ---
         self.plan_grid = PlanningGrid()
         layout.addWidget(self.plan_grid, 1)
@@ -234,8 +283,24 @@ class MainWindow(QMainWindow):
         # Tarih değişince grid ay/gün vurgusunu güncelle
         self.in_date.dateChanged.connect(self.on_plan_date_changed)
 
+        # Kod ve kanal aksiyonları
+        self.btn_add_code.clicked.connect(self.on_add_code_def)
+        self.btn_remove_code.clicked.connect(self.on_remove_code_def)
+        self.btn_fill_selected.clicked.connect(self.on_fill_selected_cells_with_active_code)
+        self.cb_active_code.currentIndexChanged.connect(self.on_active_code_changed)
+        self.btn_select_channels.clicked.connect(self.on_select_channels)
+        self.btn_apply_range.clicked.connect(self.on_apply_date_range)
+
+        # tarih aralığı defaultu: mevcut ay
+        today = self.in_date.date()
+        first = QDate(today.year(), today.month(), 1)
+        last = QDate(today.year(), today.month(), today.daysInMonth())
+        self.in_range_start.setDate(first)
+        self.in_range_end.setDate(last)
+        self.on_apply_date_range()
+
         # ilk açılışta da set et
-        self.on_plan_date_changed(self.in_date.date())       
+        self.on_plan_date_changed(self.in_date.date())
 
         # formda yüklü olan kayıt (kayıtlı rezervasyonları görüntülerken işimize yarıyor)
         self._loaded_reservation_id: int | None = None
@@ -390,7 +455,436 @@ class MainWindow(QMainWindow):
 
     def on_plan_date_changed(self, qd: QDate) -> None:
         d = qd.toPython()
+
+        # Eğer grid tarih aralığı (span) modundaysa, ay değiştirmeden sadece seçili günü vurgula.
+        try:
+            if getattr(self.plan_grid, "is_span_mode", lambda: False)():
+                self.plan_grid.set_selected_date(d)
+                return
+        except Exception:
+            pass
+
+        new_key = (d.year, d.month)
+
+        # Aynı ay içinde gün değişiyorsa cache'e dokunma
+        if self._current_month_key is None:
+            self._current_month_key = new_key
+        elif new_key != self._current_month_key:
+            # Eski ayın matrix'ini cache'e yaz
+            try:
+                self._month_cells_cache[self._current_month_key] = self.plan_grid.get_matrix()
+            except Exception:
+                pass
+            self._current_month_key = new_key
+
         self.plan_grid.set_month(d.year, d.month, d.day)
+
+        # Yeni ay daha önce planlandıysa geri yükle
+        cached = self._month_cells_cache.get(new_key)
+        if cached:
+            try:
+                self.plan_grid.set_matrix(cached)
+            except Exception:
+                pass
+
+
+    # -------------------------
+    # Çoklu Kod Tanımları (ANA SAYFA)
+    # -------------------------
+    def _get_code_defs_from_ui(self) -> list[dict]:
+        """ANA SAYFA'daki kod tanımı tablosundan code_defs üret."""
+        out: list[dict] = []
+        seen: set[str] = set()
+
+        # Tablo
+        try:
+            for r in range(self.tbl_codes.rowCount()):
+                code = (self.tbl_codes.item(r, 0).text() if self.tbl_codes.item(r, 0) else "").strip().upper()
+                desc = (self.tbl_codes.item(r, 1).text() if self.tbl_codes.item(r, 1) else "").strip()
+                dur_txt = (self.tbl_codes.item(r, 2).text() if self.tbl_codes.item(r, 2) else "").strip()
+                if not code:
+                    continue
+                if code in seen:
+                    continue
+                seen.add(code)
+                try:
+                    dur = int(float(dur_txt)) if dur_txt else 0
+                except Exception:
+                    dur = 0
+                out.append({"code": code, "desc": desc, "duration_sec": dur})
+        except Exception:
+            pass
+
+        # Geri uyumluluk: tablo boşsa tekli inputları kullan
+        if not out:
+            code = (self.in_spot_code.text() or "").strip().upper()
+            desc = (self.in_code_definition.text() or "").strip()
+            dur = int(self.in_spot_duration.value() or 0)
+            if code or desc or dur:
+                if code:
+                    out.append({"code": code, "desc": desc, "duration_sec": dur})
+
+        return out
+
+    def _sync_active_code_combo(self) -> None:
+        """Aktif kod combobox'ını tabloyla senkron tut."""
+        try:
+            current = self.cb_active_code.currentText().strip().upper()
+        except Exception:
+            current = ""
+
+        codes = []
+        try:
+            for r in range(self.tbl_codes.rowCount()):
+                code = (self.tbl_codes.item(r, 0).text() if self.tbl_codes.item(r, 0) else "").strip().upper()
+                if code and code not in codes:
+                    codes.append(code)
+        except Exception:
+            pass
+
+        self.cb_active_code.blockSignals(True)
+        try:
+            self.cb_active_code.clear()
+            self.cb_active_code.addItem("", "")
+            for c in codes:
+                self.cb_active_code.addItem(c, c)
+            if current:
+                idx = self.cb_active_code.findText(current)
+                if idx >= 0:
+                    self.cb_active_code.setCurrentIndex(idx)
+        finally:
+            self.cb_active_code.blockSignals(False)
+
+    def on_add_code_def(self) -> None:
+        code = (self.in_spot_code.text() or "").strip().upper()
+        desc = (self.in_code_definition.text() or "").strip()
+        dur = int(self.in_spot_duration.value() or 0)
+
+        if not code:
+            QMessageBox.information(self, "Bilgi", "Kod zorunlu. (Örn: K, A, B)")
+            return
+
+        # Duplicate kontrol
+        for r in range(self.tbl_codes.rowCount()):
+            existing = (self.tbl_codes.item(r, 0).text() if self.tbl_codes.item(r, 0) else "").strip().upper()
+            if existing == code:
+                # Güncelle (desc/dur)
+                self.tbl_codes.setItem(r, 1, QTableWidgetItem(desc))
+                self.tbl_codes.setItem(r, 2, QTableWidgetItem(str(dur)))
+                self._sync_active_code_combo()
+                return
+
+        r = self.tbl_codes.rowCount()
+        self.tbl_codes.insertRow(r)
+        self.tbl_codes.setItem(r, 0, QTableWidgetItem(code))
+        self.tbl_codes.setItem(r, 1, QTableWidgetItem(desc))
+        self.tbl_codes.setItem(r, 2, QTableWidgetItem(str(dur)))
+        self._sync_active_code_combo()
+
+        # Kullanıcı hızlı ekleme yapabilsin
+        self.in_spot_code.clear()
+        self.in_code_definition.clear()
+        try:
+            self.in_spot_duration.setValue(0)
+        except Exception:
+            pass
+
+    def on_remove_code_def(self) -> None:
+        row = self.tbl_codes.currentRow()
+        if row < 0:
+            return
+        self.tbl_codes.removeRow(row)
+        self._sync_active_code_combo()
+
+    def on_active_code_changed(self) -> None:
+        # Manuel grid girişinde zorunlu değil; opsiyonel kullanım.
+        return
+
+    def on_fill_selected_cells_with_active_code(self) -> None:
+        """Opsiyonel: seçili hücrelere aktif kodu yazar (Excel 'doldur' gibi)."""
+        code = (self.cb_active_code.currentText() or "").strip().upper()
+        if not code:
+            return
+
+        # Day kolonları 2..N; satırlar 0..times
+        table = self.plan_grid.table
+        for it in table.selectedItems():
+            r = it.row()
+            c = it.column()
+            if c < 2:
+                continue
+            # read-only modda yazma
+            try:
+                if self.plan_grid._read_only:
+                    continue
+            except Exception:
+                pass
+            it.setText(code)
+
+
+    # -------------------------
+    # Çoklu Kanal Seçimi (ANA SAYFA)
+    # -------------------------
+    def _update_selected_channels_label(self) -> None:
+        names = [n for n in (self._selected_channel_names or []) if str(n).strip()]
+        if not names:
+            self.lbl_selected_channels.setText("")
+            return
+
+        # Hepsi seçili mi?
+        try:
+            all_names = [c["name"] for c in self.repo.list_channels(active_only=True)] if self.repo else []
+        except Exception:
+            all_names = []
+
+        if all_names and len(names) == len(all_names):
+            self.lbl_selected_channels.setText(f"Tümü ({len(names)})")
+            return
+
+        if len(names) <= 3:
+            self.lbl_selected_channels.setText(", ".join(names))
+        else:
+            self.lbl_selected_channels.setText(f"{names[0]}, {names[1]}, {names[2]} ... (+{len(names)-3})")
+
+    def on_select_channels(self) -> None:
+        if not self.repo:
+            QMessageBox.warning(self, "Hata", "DB hazır değil.")
+            return
+
+        from PySide6.QtWidgets import QDialog, QListWidget, QDialogButtonBox
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Kanalları Seç")
+        dlg.resize(420, 520)
+        v = QVBoxLayout(dlg)
+
+        lw = QListWidget(dlg)
+        lw.setSelectionMode(QAbstractItemView.MultiSelection)
+        v.addWidget(lw, 1)
+
+        # Kanalları yükle
+        channels = self.repo.list_channels(active_only=True)
+        names = [str(c["name"]) for c in channels]
+        for n in names:
+            lw.addItem(n)
+
+        # mevcut seçimleri işaretle
+        selected_set = {s.strip().lower() for s in (self._selected_channel_names or [])}
+        for i in range(lw.count()):
+            it = lw.item(i)
+            if it.text().strip().lower() in selected_set:
+                it.setSelected(True)
+
+        # Yardımcı butonlar: Tümü / Temizle
+        row = QHBoxLayout()
+        v.addLayout(row)
+        btn_all = QPushButton("Tümü")
+        btn_clear = QPushButton("Temizle")
+        row.addWidget(btn_all)
+        row.addWidget(btn_clear)
+        row.addStretch(1)
+
+        def _select_all():
+            for i in range(lw.count()):
+                lw.item(i).setSelected(True)
+
+        def _clear():
+            for i in range(lw.count()):
+                lw.item(i).setSelected(False)
+
+        btn_all.clicked.connect(_select_all)
+        btn_clear.clicked.connect(_clear)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        v.addWidget(bb)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        picked = [it.text().strip() for it in lw.selectedItems() if it.text().strip()]
+        self._selected_channel_names = picked
+        self._update_selected_channels_label()
+
+        # UI kolaylığı: combo'da ilk seçiliyi göster
+        if picked:
+            idx = self.in_channel.findText(picked[0])
+            if idx >= 0:
+                self.in_channel.setCurrentIndex(idx)
+
+
+    # -------------------------
+    # Tarih Aralığı (multi-month)
+    # -------------------------
+    def on_apply_date_range(self) -> None:
+        rs = self.in_range_start.date().toPython()
+        re = self.in_range_end.date().toPython()
+        if rs > re:
+            # swap
+            rs, re = re, rs
+            self.in_range_start.setDate(QDate(rs.year, rs.month, rs.day))
+            self.in_range_end.setDate(QDate(re.year, re.month, re.day))
+
+        # state'e yaz (PlanningGrid kolon gizleme bu state'i kullanır)
+        self._home_range_start = rs
+        self._home_range_end = re
+
+        # Aralık seçilince, tek tabloda tüm günler görünsün (ay kırılımı yok).
+        # Not: Onayla anında ay bazında kaydetmeye yine devam ediyoruz.
+        try:
+            sel = self.in_date.date().toPython()
+            if sel < rs or sel > re:
+                sel = rs
+                self.in_date.setDate(QDate(sel.year, sel.month, sel.day))
+
+            # Eski aylık cache'leri temizle; artık edit tek grid üzerinde.
+            self._month_cells_cache = {}
+            self._current_month_key = (rs.year, rs.month)
+
+            self.plan_grid.set_date_span(rs, re, selected_date=sel)
+        except Exception:
+            # Fallback: en azından eski davranış bozulmasın
+            try:
+                self.plan_grid.set_month(rs.year, rs.month, rs.day)
+            except Exception:
+                pass
+
+
+    def on_save(self) -> None:
+        """Tek buton akışı: seçili tarih aralığını DB'ye kaydet.
+
+        Notlar:
+        - Span modunda ekranda tek tabloda birden fazla ay görünebilir.
+        - DB kayıtları yine ay bazında bölünür (her ay + her kanal için ayrı kayıt),
+          böylece Plan Özet / filtreleme mantığı bozulmaz.
+        """
+
+        if not self.service:
+            QMessageBox.warning(self, "Hata", "Servis hazır değil (DB bağlantısı yok).")
+            return
+
+        if not getattr(self, "repo", None):
+            QMessageBox.warning(self, "Hata", "Repo hazır değil (DB bağlantısı yok).")
+            return
+
+        try:
+            # Spot saati kullanıcı girmiyor; SpotList+ zaten kuşak saatlerini kullanıyor.
+            spot_t = datetime.now().time().replace(microsecond=0)
+
+            # Ay bazında matrisleri al
+            if getattr(self.plan_grid, "is_span_mode", lambda: False)():
+                month_matrices = self.plan_grid.get_span_month_matrices()
+            else:
+                d0 = self.in_date.date().toPython()
+                month_matrices = {(d0.year, d0.month): self.plan_grid.get_matrix()}
+
+            # Kod tanımları
+            code_defs = self._get_code_defs_from_ui()
+
+            # Kanal seçimleri
+            selected_channels = list(self._selected_channel_names)
+            if not selected_channels:
+                # combobox tek kanal seçimi fallback
+                ch = self.in_channel.currentText().strip()
+                if ch:
+                    selected_channels = [ch]
+
+            if not selected_channels:
+                QMessageBox.warning(self, "Eksik", "En az 1 kanal seçmelisin.")
+                return
+
+            # Zorunlu başlık
+            plan_title = self.in_plan_title.text().strip()
+            if not plan_title:
+                QMessageBox.warning(self, "Eksik", "Plan başlığı boş olamaz.")
+                return
+
+            # Kanal id map'i (fiyat çekmek için)
+            channels = self.repo.list_channels(active_only=False)
+            ch_by_norm = {str(c.get("name") or "").strip().lower(): c for c in channels}
+
+            # Year bazlı fiyat haritaları cache'i
+            price_maps: dict[int, dict[tuple[int, int], tuple[float, float]]] = {}
+
+            # Her ay için her kanal kaydı
+            created = []
+            for (yy, mm), matrix in sorted(month_matrices.items()):
+                # PlanningGrid returns month matrices as dicts of {"r,day": "CODE", ...}.
+                # Some legacy flows may wrap them as {"cells": {...}, "row_times": [...]}.
+                if isinstance(matrix, dict) and "cells" in matrix:
+                    cells = matrix.get("cells") or {}
+                else:
+                    cells = matrix or {}
+
+                # If there is nothing to save for this month, skip it.
+                if not any(str(v).strip() for v in cells.values()):
+                    continue
+
+                if yy not in price_maps:
+                    try:
+                        price_maps[yy] = self.repo.get_channel_prices(yy)
+                    except Exception:
+                        price_maps[yy] = {}
+
+                plan_date = date(yy, mm, 1)
+
+                for ch_name in selected_channels:
+                    ch = ch_by_norm.get(ch_name.strip().lower())
+                    ch_id = int(ch.get("id")) if ch else None
+                    dt_price = 0.0
+                    odt_price = 0.0
+                    if ch_id is not None:
+                        dt_price, odt_price = price_maps[yy].get((ch_id, int(mm)), (0.0, 0.0))
+
+                    draft = ReservationDraft(
+                        advertiser_name=self.in_advertiser.text().strip(),
+                        plan_date=plan_date,
+                        spot_time=spot_t,
+                        channel_name=ch_name,
+                        channel_price_dt=float(dt_price),
+                        channel_price_odt=float(odt_price),
+                        agency_name=self.in_agency.text().strip(),
+                        product_name=self.in_product.text().strip(),
+                        plan_title=plan_title,
+                        spot_code=self.in_spot_code.text().strip(),
+                        spot_duration_sec=int(self.in_spot_duration.value()),
+                        code_definition=self.in_code_definition.text().strip(),
+                        note_text=self.in_note.text().strip(),
+                        prepared_by_name=self.in_prepared_by.text().strip(),
+                        code_defs=code_defs,
+                    )
+
+                    confirmed = self.service.confirm(draft, cells)
+                    # DB'ye yaz
+                    dbrec = self.repo.create_reservation(
+                        advertiser_name=str(confirmed.payload.get("advertiser_name") or "").strip(),
+                        payload=confirmed.payload,
+                        confirmed=True,
+                    )
+                    created.append(dbrec)
+
+            if not created:
+                QMessageBox.information(self, "Bilgi", "Kaydedilecek bir hücre bulunamadı.")
+                return
+
+            # UI refresh
+            self.refresh_reservations_tab()
+            # Plan özet sekmesi fonksiyonu projede refresh_plan_ozet() olarak geçiyor.
+            self.refresh_plan_ozet()
+            self.refresh_kod_tanimi()  # alias: refresh_code_def_tab
+
+            QMessageBox.information(
+                self,
+                "Kaydedildi",
+                f"DB'ye {len(created)} kayıt eklendi.\n"
+                f"(Kanal x Ay kırılımı)\n\n"
+                f"İpucu: Rezervasyonlar sekmesinden filtreleyebilirsin.",
+            )
+
+        except Exception as ex:
+            QMessageBox.critical(self, "Hata", str(ex))
+
 
     def on_confirm(self) -> None:
         if not self.service:
@@ -401,43 +895,109 @@ class MainWindow(QMainWindow):
             # Spot saati kullanıcı girmiyor; Excel zaten çıktıda zaman damgasını basıyor.
             spot_t = datetime.now().time().replace(microsecond=0)
 
-            # Kanal + plan tarihine göre fiyatlar
-            plan_d = self.in_date.date().toPython()
-            ch_name = self.in_channel.currentText().strip()
-            ch_id = self.in_channel.currentData()
-            dt_price = 0.0
-            odt_price = 0.0
-            if ch_id is not None:
-                try:
-                    price_map = self.repo.get_channel_prices(plan_d.year)
-                    dt_price, odt_price = price_map.get((int(ch_id), int(plan_d.month)), (0.0, 0.0))
-                except Exception:
-                    dt_price, odt_price = (0.0, 0.0)
+            # Grid içeriğini ay bazında matrise çevir.
+            # Span modunda tek tabloda birden fazla ay görünür; burada ay ay ayrıştırıyoruz.
+            try:
+                if getattr(self.plan_grid, "is_span_mode", lambda: False)():
+                    self._month_cells_cache = self.plan_grid.get_span_month_matrices()
+                else:
+                    d0 = self.in_date.date().toPython()
+                    self._month_cells_cache = {(d0.year, d0.month): self.plan_grid.get_matrix()}
+                    self._current_month_key = (d0.year, d0.month)
+            except Exception:
+                # Worst-case: boş cache ile devam et
+                self._month_cells_cache = {}
 
-            draft = ReservationDraft(
-                advertiser_name=self.in_advertiser.text(),
-                plan_date=plan_d,
-                spot_time=spot_t,
-                channel_name=ch_name,
-                channel_price_dt=float(dt_price),
-                channel_price_odt=float(odt_price),
-                agency_name=self.in_agency.text(),
-                product_name=self.in_product.text(),
-                plan_title=self.in_plan_title.text(),
-                spot_code=self.in_spot_code.text(),
-                spot_duration_sec=int(self.in_spot_duration.value()),
-                code_definition=self.in_code_definition.text(),
-                note_text=self.in_note.text(),
-                prepared_by_name=self.in_prepared_by.text(),
-            )
+            # Kod tanımları
+            code_defs = self._get_code_defs_from_ui()
 
-            # ✅ Grid verisi buradan alınacak
-            plan_cells = self.plan_grid.get_matrix()
+            # Kanal seçimleri
+            selected_channels = list(self._selected_channel_names)
+            if not selected_channels:
+                selected_channels = [self.in_channel.currentText().strip()]
 
-            self.current_confirmed = self.service.confirm(draft, plan_cells)
+            # Kanal adından id mapping
+            channels = self.repo.list_channels()
+            ch_by_norm = {str(c.get("name", "")).strip().lower(): c for c in channels}
 
-            self.btn_test_export.setEnabled(True)
-            self.btn_save_export.setEnabled(True)
+            # Tarih aralığı (ay bazında)
+            rs = self.in_range_start.date().toPython()
+            re = self.in_range_end.date().toPython()
+            if rs > re:
+                rs, re = re, rs
+
+            def month_iter(a: date, b: date) -> list[tuple[int, int]]:
+                out: list[tuple[int, int]] = []
+                yy, mm = a.year, a.month
+                end = (b.year, b.month)
+                while (yy, mm) <= end:
+                    out.append((yy, mm))
+                    mm += 1
+                    if mm == 13:
+                        mm = 1
+                        yy += 1
+                return out
+
+            months_in_range = set(month_iter(rs, re))
+
+            # Year bazlı fiyat haritaları cache'i
+            price_maps: dict[int, dict[tuple[int, int], tuple[float, float]]] = {}
+
+            created: list = []
+            for (yy, mm), cells in list(self._month_cells_cache.items()):
+                if (yy, mm) not in months_in_range:
+                    continue
+
+                # Bu ayda hiç dolu hücre yoksa atla
+                if not any(str(v).strip() for v in (cells or {}).values()):
+                    continue
+
+                if yy not in price_maps:
+                    try:
+                        price_maps[yy] = self.repo.get_channel_prices(yy)
+                    except Exception:
+                        price_maps[yy] = {}
+
+                for ch_name in selected_channels:
+                    ch = ch_by_norm.get(ch_name.strip().lower())
+                    ch_id = int(ch.get("id")) if ch else None
+                    dt_price = 0.0
+                    odt_price = 0.0
+                    if ch_id is not None:
+                        dt_price, odt_price = price_maps[yy].get((ch_id, int(mm)), (0.0, 0.0))
+
+                    draft = ReservationDraft(
+                        advertiser_name=self.in_advertiser.text(),
+                        plan_date=date(yy, mm, 1),
+                        spot_time=spot_t,
+                        channel_name=ch_name,
+                        channel_price_dt=float(dt_price),
+                        channel_price_odt=float(odt_price),
+                        agency_name=self.in_agency.text(),
+                        product_name=self.in_product.text(),
+                        plan_title=self.in_plan_title.text(),
+                        spot_code=self.in_spot_code.text(),
+                        spot_duration_sec=int(self.in_spot_duration.value()),
+                        code_definition=self.in_code_definition.text(),
+                        note_text=self.in_note.text(),
+                        prepared_by_name=self.in_prepared_by.text(),
+                        code_defs=code_defs,
+                    )
+
+                    created.append(self.service.confirm(draft, cells))
+
+            if not created:
+                QMessageBox.information(self, "Bilgi", "Seçili tarih aralığında kaydedilecek plan bulunamadı.")
+                return
+
+            # Son kaydı aktif kabul edip butonları enable et
+            self.current_confirmed = created[-1]
+            # Legacy buttons removed (MVP simplification): Onayla/Test/Çıktı.
+            # Keep this block harmless in case the method is re-used later.
+            if hasattr(self, "btn_test_export"):
+                self.btn_test_export.setEnabled(True)
+            if hasattr(self, "btn_save_export"):
+                self.btn_save_export.setEnabled(True)
 
             QMessageBox.information(self, "OK", "Onaylandı. Artık test/kayıt çıktısı alabilirsin.")
         except Exception as e:
@@ -1195,11 +1755,14 @@ class MainWindow(QMainWindow):
 
         top.addWidget(QLabel("Ay:"))
         self.po_month = QComboBox()
+        # "TÜMÜ" seçeneği: seçili plan başlığının yıl içindeki tüm aylarını tek ekranda (yıllık) özetler.
         self.po_month.addItems([
+            "TÜMÜ",
             "OCAK", "ŞUBAT", "MART", "NİSAN", "MAYIS", "HAZİRAN",
             "TEMMUZ", "AĞUSTOS", "EYLÜL", "EKİM", "KASIM", "ARALIK"
         ])
-        self.po_month.setCurrentIndex(date.today().month - 1)
+        # Varsayılan: içinde bulunulan ay
+        self.po_month.setCurrentIndex(date.today().month)  # +1 offset (0: TÜMÜ)
         top.addWidget(self.po_month)
 
         self.btn_po_refresh = QPushButton("Yenile")
@@ -1282,7 +1845,8 @@ class MainWindow(QMainWindow):
             self.po_year.blockSignals(True)
             self.po_month.blockSignals(True)
             self.po_year.setValue(d.year)
-            self.po_month.setCurrentIndex(d.month - 1)
+            # 0: TÜMÜ olduğu için ay index'i +1 offset
+            self.po_month.setCurrentIndex(d.month)
         except Exception:
             pass
         finally:
@@ -1334,10 +1898,15 @@ class MainWindow(QMainWindow):
             return
 
         yy = int(self.po_year.value())
-        mm = int(self.po_month.currentIndex()) + 1
+        idx = int(self.po_month.currentIndex())
+        # 0: TÜMÜ (yıllık). Diğerleri 1..12 ay numarası olacak şekilde.
+        mm = 0 if idx == 0 else idx
 
         try:
-            data = self.service.get_plan_ozet_data(pt, yy, mm)
+            if mm == 0:
+                data = self.service.get_plan_ozet_yearly_data(pt, yy)
+            else:
+                data = self.service.get_plan_ozet_data(pt, yy, mm)
             header = data.get("header") or {}
             rows = data.get("rows") or []
             days = int(data.get("days") or 0)
@@ -1360,14 +1929,24 @@ class MainWindow(QMainWindow):
 
             # Kolonlar
             base_headers = ["KANAL", "YAYIN GRUBU", "DT/ODT", "DİNLENME ORANI"]
-            day_headers = [str(i) for i in range(1, days + 1)]
-            tail_headers = [
-                f"{month_name} Adet" if month_name else "Ay Adet",
-                f"{month_name} Saniye" if month_name else "Ay Saniye",
-                "Birim sn. (TL)",
-                "Toplam Bütçe Net TL",
-            ]
-            headers = base_headers + day_headers + tail_headers
+            if mm == 0:
+                # Yıllık görünüm: gün bazlı kolonlar yok
+                tail_headers = [
+                    "Yıl Adet",
+                    "Yıl Saniye",
+                    "Birim sn. (TL)",
+                    "Toplam Bütçe Net TL",
+                ]
+                headers = base_headers + tail_headers
+            else:
+                day_headers = [str(i) for i in range(1, days + 1)]
+                tail_headers = [
+                    f"{month_name} Adet" if month_name else "Ay Adet",
+                    f"{month_name} Saniye" if month_name else "Ay Saniye",
+                    "Birim sn. (TL)",
+                    "Toplam Bütçe Net TL",
+                ]
+                headers = base_headers + day_headers + tail_headers
 
             self.po_table.blockSignals(True)
             self.po_table.clear()
@@ -1421,7 +2000,10 @@ class MainWindow(QMainWindow):
 
                 # Ay toplamları
                 base = 4 + days
-                tail = [rr.get("month_adet"), rr.get("month_saniye"), rr.get("unit_price"), rr.get("budget")]
+                if mm == 0:
+                    tail = [rr.get("year_adet"), rr.get("year_saniye"), rr.get("unit_price"), rr.get("budget")]
+                else:
+                    tail = [rr.get("month_adet"), rr.get("month_saniye"), rr.get("unit_price"), rr.get("budget")]
                 for j, v in enumerate(tail):
                     it = QTableWidgetItem(_fmt(v))
                     it.setTextAlignment(Qt.AlignCenter)
@@ -1453,7 +2035,10 @@ class MainWindow(QMainWindow):
                 self.po_table.setItem(t_row, 4 + di, it)
 
             base = 4 + days
-            tail = [totals.get("month_adet"), totals.get("month_saniye"), "", totals.get("budget")]
+            if mm == 0:
+                tail = [totals.get("year_adet"), totals.get("year_saniye"), "", totals.get("budget")]
+            else:
+                tail = [totals.get("month_adet"), totals.get("month_saniye"), "", totals.get("budget")]
             for j, v in enumerate(tail):
                 it = QTableWidgetItem(_fmt(v))
                 it.setFont(bold)
@@ -1478,9 +2063,13 @@ class MainWindow(QMainWindow):
             return
 
         yy = int(self.po_year.value())
-        mm = int(self.po_month.currentIndex()) + 1
+        idx = int(self.po_month.currentIndex())
+        mm = 0 if idx == 0 else idx
 
-        default_name = f"PLAN_OZET_{pt}_{yy}_{mm:02d}.xlsx"
+        if mm == 0:
+            default_name = f"PLAN_OZET_{pt}_{yy}_YILLIK.xlsx"
+        else:
+            default_name = f"PLAN_OZET_{pt}_{yy}_{mm:02d}.xlsx"
         out_dir = self.app_settings.data_dir / "exports"
         out_dir.mkdir(parents=True, exist_ok=True)
         default_path = str((out_dir / default_name).resolve())
@@ -1495,7 +2084,10 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self.service.export_plan_ozet_excel(path, pt, yy, mm)
+            if mm == 0:
+                self.service.export_plan_ozet_yearly_excel(path, pt, yy)
+            else:
+                self.service.export_plan_ozet_excel(path, pt, yy, mm)
             QMessageBox.information(self, "OK", f"Excel çıktısı oluşturuldu:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
@@ -1553,6 +2145,14 @@ class MainWindow(QMainWindow):
         self.btn_kod_refresh.clicked.connect(self.refresh_kod_tanimi)
         self.btn_kod_delete.clicked.connect(self.delete_selected_kod)
         self.btn_kod_export.clicked.connect(self.export_kod_tanimi_excel)
+
+    # Backward-compatible aliases (old method names used in earlier UI wiring)
+    def refresh_plan_summary_tab(self) -> None:
+        self.refresh_plan_ozet()
+
+    def refresh_code_def_tab(self) -> None:
+        self.refresh_kod_tanimi()
+
 
     def refresh_kod_tanimi(self) -> None:
         if not self.service:

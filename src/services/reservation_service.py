@@ -48,7 +48,9 @@ class ReservationService:
             fixed[kk] = "" if v is None else str(v)
         return fixed
 
-    def confirm(self, draft: ReservationDraft, plan_cells: dict) -> ConfirmedReservation:
+    def confirm(self, draft: ReservationDraft, plan_cells: dict | None = None) -> ConfirmedReservation:
+        if plan_cells is None:
+            plan_cells = {}  # UI normalde plan_cells gönderir; yoksa boş kabul et
         adv = (draft.advertiser_name or "").strip()
         pt = (draft.plan_title or "").strip()
 
@@ -71,14 +73,93 @@ class ReservationService:
         cells = self.sanitize_plan_cells(plan_cells)
         adet_total = sum(1 for v in cells.values() if str(v).strip())
 
+        # Çoklu kod desteği
+        raw_code_defs = draft.code_defs or []
+        code_defs: list[dict[str, Any]] = []
+        seen_codes: set[str] = set()
+        for rr in raw_code_defs:
+            try:
+                code = str(rr.get("code") or "").strip().upper()
+                if not code:
+                    continue
+                if code in seen_codes:
+                    continue
+                seen_codes.add(code)
+                desc = str(rr.get("desc") or "").strip()
+                dur = int(rr.get("duration_sec") or 0)
+                code_defs.append({"code": code, "desc": desc, "duration_sec": dur})
+            except Exception:
+                continue
+
+        # Geri uyumluluk: tekli alanlardan code_defs üret
+        if not code_defs and (draft.spot_code or draft.code_definition or draft.spot_duration_sec):
+            code = str(draft.spot_code or "").strip().upper()
+            if code:
+                code_defs.append({
+                    "code": code,
+                    "desc": str(draft.code_definition or "").strip(),
+                    "duration_sec": int(draft.spot_duration_sec or 0),
+                })
+
+        # Hücrelerde kullanılan kodlar
+        used_codes = []
+        for v in cells.values():
+            vv = str(v or "").strip()
+            if not vv:
+                continue
+            used_codes.append(vv.upper())
+        used_codes_set = sorted(set(used_codes))
+
+        # Çoklu kodlarda süreyi hesaplamak için adet dağılımı
+        code_counts: dict[str, int] = {}
+        for c in used_codes:
+            code_counts[c] = code_counts.get(c, 0) + 1
+
+        def _lookup_def(c: str) -> dict[str, Any] | None:
+            cc = (c or "").strip().upper()
+            for d in code_defs:
+                if str(d.get("code") or "").strip().upper() == cc:
+                    return d
+            return None
+
+        # Header alanları için tekli gösterim (Excel export vs.)
+        if len(used_codes_set) == 1:
+            one = used_codes_set[0]
+            dd = _lookup_def(one) or {}
+            disp_code = one
+            disp_desc = str(dd.get("desc") or "")
+            disp_dur = int(dd.get("duration_sec") or 0)
+        elif len(used_codes_set) > 1:
+            # Çoklu kod: süreyi ağırlıklı ortalama olarak hesapla.
+            # (Rezervasyon listesinde ve özet ekranlarında anlamlı bir değer
+            # görmek için.)
+            disp_code = "ÇOKLU"
+            disp_desc = ""
+            total = sum(code_counts.get(c, 0) for c in used_codes_set)
+            if total > 0:
+                wsum = 0.0
+                for c in used_codes_set:
+                    dd = _lookup_def(c) or {}
+                    dur = float(dd.get("duration_sec") or 0)
+                    wsum += float(code_counts.get(c, 0)) * dur
+                disp_dur = round(wsum / float(total), 2)
+            else:
+                disp_dur = 0
+        else:
+            # hiç seçim yoksa, draft'taki değerleri göster
+            disp_code = str(draft.spot_code or "").strip()
+            disp_desc = str(draft.code_definition or "").strip()
+            disp_dur = int(draft.spot_duration_sec or 0)
+
         payload: dict[str, Any] = {
             "agency_name": draft.agency_name.strip(),
             "advertiser_name": adv,
             "product_name": draft.product_name.strip(),
             "plan_title": pt,
-            "spot_code": draft.spot_code.strip(),
-            "spot_duration_sec": int(draft.spot_duration_sec or 0),
-            "code_definition": draft.code_definition.strip(),
+            "spot_code": str(disp_code or "").strip(),
+            "spot_duration_sec": int(disp_dur or 0),
+            "code_definition": str(disp_desc or "").strip(),
+            "code_defs": code_defs,
             "note_text": draft.note_text.strip(),
             "prepared_by": prepared_by,
 
@@ -140,37 +221,60 @@ class ReservationService:
         recs = self.repo.list_confirmed_reservations_by_plan_title(plan_title)
 
         grouped: dict[str, dict] = {}
-        total = 0
+        total_spots = 0
 
         for r in recs:
-            code = (r.payload.get("spot_code") or "").strip()
-            if not code:
-                continue
+            p = r.payload or {}
+            cells: dict[str, str] = p.get("plan_cells") or {}
 
-            total += 1
-            if code not in grouped:
-                grouped[code] = {
-                    "code": code,
-                    "code_desc": (r.payload.get("code_definition") or "").strip(),
-                    "length_sn": int(r.payload.get("spot_duration_sec") or 0),
-                    "count": 0,
+            # kod haritası
+            code_defs = p.get("code_defs") or []
+            code_map = {
+                str(d.get("code") or "").strip().upper(): {
+                    "desc": str(d.get("desc") or "").strip(),
+                    "dur": int(d.get("duration_sec") or 0),
                 }
+                for d in code_defs
+                if str(d.get("code") or "").strip()
+            }
+            # geri uyumluluk
+            if not code_map:
+                sc = str(p.get("spot_code") or "").strip().upper()
+                if sc:
+                    code_map[sc] = {
+                        "desc": str(p.get("code_definition") or "").strip(),
+                        "dur": int(p.get("spot_duration_sec") or 0),
+                    }
 
-            grouped[code]["count"] += 1
+            for _k, v in cells.items():
+                code = str(v or "").strip().upper()
+                if not code:
+                    continue
+                total_spots += 1
 
-            # aynı koda yeni tanım/süre girildiyse "son kayıt kazansın"
-            cd = (r.payload.get("code_definition") or "").strip()
-            if cd:
-                grouped[code]["code_desc"] = cd
+                if code not in grouped:
+                    dd = code_map.get(code) or {}
+                    grouped[code] = {
+                        "code": code,
+                        "code_desc": str(dd.get("desc") or ""),
+                        "length_sn": int(dd.get("dur") or 0),
+                        "count": 0,
+                    }
 
-            if r.payload.get("spot_duration_sec") is not None:
-                grouped[code]["length_sn"] = int(r.payload.get("spot_duration_sec") or 0)
+                grouped[code]["count"] += 1
+
+                # güncelleyici (son görülen açıklama/süre kazansın)
+                dd = code_map.get(code) or {}
+                if dd.get("desc"):
+                    grouped[code]["code_desc"] = str(dd.get("desc") or "")
+                if dd.get("dur") is not None:
+                    grouped[code]["length_sn"] = int(dd.get("dur") or 0)
 
         rows = list(grouped.values())
         rows.sort(key=lambda x: x["code"])
 
         for row in rows:
-            row["distribution"] = (row["count"] / total) if total > 0 else 0.0
+            row["distribution"] = (row["count"] / total_spots) if total_spots > 0 else 0.0
 
         return rows
 
@@ -179,7 +283,9 @@ class ReservationService:
         return sum(r["length_sn"] * r["distribution"] for r in rows) if rows else 0.0
 
     def delete_kod_for_plan_title(self, plan_title: str, code: str) -> int:
-        return self.repo.delete_reservations_by_plan_title_and_spot_code(plan_title, code)
+        # Kod silme: ilgili plan başlığındaki tüm rezervasyon payload'larından kodu kaldırır,
+        # kodu kullanan hücreleri boşaltır.
+        return self.repo.remove_code_from_plan_title(plan_title, code)
 
     def export_kod_tanimi_excel(self, out_path, plan_title: str) -> None:
         from src.export.excel_exporter import export_kod_tanimi
@@ -218,8 +324,19 @@ class ReservationService:
                 continue
 
             channel_name = str(p.get("channel_name") or "").strip()
-            spot_code = str(p.get("spot_code") or "").strip()
-            duration = int(p.get("spot_duration_sec") or 0)
+
+            # kod haritası
+            code_defs = p.get("code_defs") or []
+            code_map = {
+                str(d.get("code") or "").strip().upper(): int(d.get("duration_sec") or 0)
+                for d in code_defs
+                if str(d.get("code") or "").strip()
+            }
+            # geri uyumluluk
+            if not code_map:
+                sc = str(p.get("spot_code") or "").strip().upper()
+                if sc:
+                    code_map[sc] = int(p.get("spot_duration_sec") or 0)
             price_dt = float(p.get("channel_price_dt") or 0.0)
             price_odt = float(p.get("channel_price_odt") or 0.0)
 
@@ -248,6 +365,9 @@ class ReservationService:
                 t0 = self._row_idx_to_time(row_idx)
                 dt_odt = classify_dt_odt(t0)
                 unit = price_dt if dt_odt == "DT" else price_odt
+
+                cell_code = str(v or "").strip().upper()
+                duration = int(code_map.get(cell_code, 0))
                 budget = float(unit) * float(duration)
 
                 pub = int(status_map.get((r.id, day, row_idx), 0))
@@ -263,7 +383,7 @@ class ReservationService:
                         "adet": 1,
                         "baslangic": t0.strftime("%H:%M"),
                         "sure": duration,
-                        "spot_kodu": spot_code,
+                        "spot_kodu": cell_code,
                         "dt_odt": dt_odt,
                         "birim_saniye": unit,
                         "butce_net": budget,
@@ -425,13 +545,32 @@ class ReservationService:
             if nm in ch_by_norm and ch_by_norm[nm] not in display_channels:
                 display_channels.append(ch_by_norm[nm])
 
-        # sayaç: (norm_channel, dt_odt, day) -> adet
+        # sayaçlar: (norm_channel, dt_odt, day) -> adet / saniye / bütçe
         counts: dict[tuple[str, str, int], int] = {}
+        seconds: dict[tuple[str, str, int], float] = {}
+        budgets: dict[tuple[str, str, int], float] = {}
         for r in month_recs:
             p = r.payload or {}
             channel_name = self._norm_name(str(p.get("channel_name") or ""))
             if not channel_name:
                 continue
+
+            # kanal id (fiyat için)
+            ch_obj = ch_by_norm.get(channel_name)
+            ch_id_for_price = int(ch_obj["id"]) if ch_obj and ch_obj.get("id") is not None else None
+
+            # kod haritası (cell içeriğine göre süre)
+            code_defs = p.get("code_defs") or []
+            code_map = {
+                str(d.get("code") or "").strip().upper(): float(d.get("duration_sec") or 0)
+                for d in code_defs
+                if str(d.get("code") or "").strip()
+            }
+            if not code_map:
+                sc = str(p.get("spot_code") or "").strip().upper()
+                if sc:
+                    code_map[sc] = float(p.get("spot_duration_sec") or 0)
+
             cells: dict[str, str] = p.get("plan_cells") or {}
             for k, v in cells.items():
                 if not str(v or "").strip():
@@ -449,6 +588,16 @@ class ReservationService:
                 key = (channel_name, dt_odt, day)
                 counts[key] = int(counts.get(key, 0)) + 1
 
+                cell_code = str(v or "").strip().upper()
+                dur = float(code_map.get(cell_code, 0.0))
+                seconds[key] = float(seconds.get(key, 0.0)) + dur
+
+                # bütçe
+                if ch_id_for_price is not None:
+                    dtp, odtp = price_map.get((int(ch_id_for_price), mm), (0.0, 0.0))
+                    unit_price = float(dtp) if dt_odt == "DT" else float(odtp)
+                    budgets[key] = float(budgets.get(key, 0.0)) + (dur * unit_price)
+
         rows_out: list[dict[str, Any]] = []
 
         def _price_for(ch_id: int, dtodt: str) -> float | None:
@@ -464,14 +613,19 @@ class ReservationService:
             dinlenme = access_map.get(ch_norm, "NA")
             for dtodt in ("DT", "ODT"):
                 day_vals = [int(counts.get((ch_norm, dtodt, d), 0)) for d in range(1, days_in_month + 1)]
+                day_secs = [float(seconds.get((ch_norm, dtodt, d), 0.0)) for d in range(1, days_in_month + 1)]
+                day_bud = [float(budgets.get((ch_norm, dtodt, d), 0.0)) for d in range(1, days_in_month + 1)]
+
                 month_adet = int(sum(day_vals))
+                month_saniye = float(sum(day_secs))
+                month_budget = float(sum(day_bud))
 
                 # Excel görünümü: 0'ları boş göster
                 day_vals_display = ["" if v == 0 else v for v in day_vals]
 
-                month_saniye = float(month_adet) * float(spot_len) if (month_adet and spot_len) else 0.0
                 unit_price = _price_for(ch_id, dtodt)
-                total_budget = (float(month_saniye) * float(unit_price)) if (unit_price and month_saniye) else 0.0
+                # unit_price boşsa bütçeyi 0 göster (fiyat tanımı yok)
+                total_budget = month_budget if unit_price else 0.0
 
                 rows_out.append(
                     {
@@ -535,3 +689,178 @@ class ReservationService:
         from src.export.excel_exporter import export_plan_ozet
         data = self.get_plan_ozet_data(plan_title, int(year), int(month))
         export_plan_ozet(out_path, data)
+
+    def get_plan_ozet_yearly_data(self, plan_title: str, year: int) -> dict[str, Any]:
+        """Plan başlığı için seçilen yılın tamamını (Ocak-Aralık) tek bir özet olarak döndürür.
+
+        Not: Aylık ekrandaki gün bazlı kolonlar, yıllık görünümde anlamlı olmadığı için
+        days=0 olacak şekilde sadece toplamlar birleştirilir.
+        """
+        yy = int(year)
+
+        def _merge_value(acc: set, val: str) -> None:
+            if val is None:
+                return
+            s = str(val).strip()
+            if not s:
+                return
+            # "ÇOKLU" gibi placeholder'ları değer setine dahil etme
+            if s.upper() == "ÇOKLU":
+                return
+            acc.add(s)
+
+        agency_set: set[str] = set()
+        adv_set: set[str] = set()
+        product_set: set[str] = set()
+        spot_len_set: set[str] = set()
+        resno_set: set[str] = set()
+
+        rows_map: dict[tuple[str, str], dict[str, Any]] = {}
+
+        for mm in range(1, 13):
+            data_m = self.get_plan_ozet_data(plan_title, yy, mm)
+            hdr = data_m.get("header", {}) or {}
+            _merge_value(agency_set, hdr.get("agency", ""))
+            _merge_value(adv_set, hdr.get("advertiser", ""))
+            _merge_value(product_set, hdr.get("product", ""))
+            _merge_value(spot_len_set, str(hdr.get("spot_len", "") or "").strip())
+
+            # Rezervasyon no çoklu görünümü satır satır geliyor; normalize ederek topla
+            rn = str(hdr.get("reservation_no", "") or "").strip()
+            if rn:
+                for line in rn.splitlines():
+                    line = line.strip()
+                    if not line or line.upper() == "ÇOKLU":
+                        continue
+                    resno_set.add(line)
+
+            for rr in data_m.get("rows", []) or []:
+                key = (str(rr.get("channel", "")), str(rr.get("dt_odt", "")))
+                if key not in rows_map:
+                    rows_map[key] = {
+                        "channel": key[0],
+                        "publish_group": "",
+                        "dt_odt": key[1],
+                        "dinlenme_orani": rr.get("dinlenme_orani", ""),
+                        "month_adet": 0,
+                        "month_saniye": 0.0,
+                        "unit_price_values": set(),
+                        "budget": 0.0,
+                    }
+                agg = rows_map[key]
+
+                # dinlenme oranı ilk dolu değeri al; farklılık varsa "ÇOKLU" göster
+                cur_do = str(agg.get("dinlenme_orani", "") or "").strip()
+                new_do = str(rr.get("dinlenme_orani", "") or "").strip()
+                if not cur_do and new_do:
+                    agg["dinlenme_orani"] = new_do
+                elif cur_do and new_do and cur_do != new_do:
+                    agg["dinlenme_orani"] = "ÇOKLU"
+
+                def _to_int(v):
+                    try:
+                        return int(v)
+                    except Exception:
+                        return 0
+
+                def _to_float(v):
+                    try:
+                        return float(v)
+                    except Exception:
+                        return 0.0
+
+                if rr.get("month_adet") not in ("", None):
+                    agg["month_adet"] += _to_int(rr.get("month_adet"))
+                if rr.get("month_saniye") not in ("", None):
+                    agg["month_saniye"] += _to_float(rr.get("month_saniye"))
+                if rr.get("budget") not in ("", None):
+                    agg["budget"] += _to_float(rr.get("budget"))
+
+                up = rr.get("unit_price")
+                if up not in ("", None):
+                    agg["unit_price_values"].add(str(up))
+
+        # Normalize header values
+        def _uniq_or_coklu(values: set[str]) -> str:
+            if not values:
+                return ""
+            if len(values) == 1:
+                return next(iter(values))
+            return "ÇOKLU"
+
+        reservation_no_display = ""
+        if resno_set:
+            # Çokluysa başa "ÇOKLU" yaz, altına numaraları koy
+            res_lines = sorted(resno_set)
+            if len(res_lines) == 1:
+                reservation_no_display = res_lines[0]
+            else:
+                reservation_no_display = "ÇOKLU\n" + "\n".join(res_lines)
+
+        header = {
+            "agency": _uniq_or_coklu(agency_set),
+            "advertiser": _uniq_or_coklu(adv_set),
+            "product": _uniq_or_coklu(product_set),
+            "plan_title": plan_title,
+            "reservation_no": reservation_no_display,
+            "period": f"{yy} (YILLIK)",
+            "month_name": "YIL",
+            "spot_len": _uniq_or_coklu(spot_len_set),
+        }
+
+        # finalize rows
+        rows_out: list[dict[str, Any]] = []
+        for key, agg in sorted(rows_map.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+            upv = agg.pop("unit_price_values", set())
+            unit_price = "" if not upv else (next(iter(upv)) if len(upv) == 1 else "ÇOKLU")
+            month_adet = agg.get("month_adet", 0)
+            month_saniye = agg.get("month_saniye", 0.0)
+            budget = agg.get("budget", 0.0)
+
+            rows_out.append(
+                {
+                    "channel": agg.get("channel", ""),
+                    "publish_group": "",
+                    "dt_odt": agg.get("dt_odt", ""),
+                    "dinlenme_orani": agg.get("dinlenme_orani", ""),
+                    "days": [],
+                    "month_adet": "" if month_adet == 0 else month_adet,
+                    "month_saniye": "" if month_saniye == 0 else month_saniye,
+                    "unit_price": unit_price,
+                    "budget": "" if budget == 0 else budget,
+                }
+            )
+
+        # totals
+        total_month_adet = 0
+        total_month_saniye = 0.0
+        total_budget = 0.0
+        for rr in rows_out:
+            if rr.get("month_adet") not in ("", None):
+                total_month_adet += int(rr["month_adet"])
+            if rr.get("month_saniye") not in ("", None):
+                total_month_saniye += float(rr["month_saniye"])
+            if rr.get("budget") not in ("", None):
+                total_budget += float(rr["budget"])
+
+        totals = {
+            "days": [],
+            "month_adet": "" if total_month_adet == 0 else total_month_adet,
+            "month_saniye": "" if total_month_saniye == 0 else total_month_saniye,
+            "budget": "" if total_budget == 0 else total_budget,
+        }
+
+        return {
+            "header": header,
+            "year": yy,
+            "month": 0,
+            "days": 0,
+            "rows": rows_out,
+            "totals": totals,
+        }
+
+    def export_plan_ozet_yearly_excel(self, out_path, plan_title: str, year: int) -> None:
+        """Plan Özet (YILLIK) çıktısı üretir."""
+        from src.export.excel_exporter import export_plan_ozet_yearly
+        data = self.get_plan_ozet_yearly_data(plan_title, int(year))
+        export_plan_ozet_yearly(out_path, data)

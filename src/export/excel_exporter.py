@@ -327,6 +327,92 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
+
+
+def export_plan_ozet_yearly(out_path, data: dict) -> None:
+    """Plan Özet (Yıllık) çıktısını üretir.
+
+    Aylık Plan Özet şablonu gün (1..31) sütunları üzerine kurulu olduğu için
+    yıllık görünümde basitleştirilmiş bir tablo üretir:
+    Kanal / DT-ODT / Yıl Adet / Yıl Saniye / Birim Sn / Toplam Bütçe.
+    """
+    from pathlib import Path
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+
+    out_path = Path(out_path)
+    header = data.get("header", {}) or {}
+    rows = data.get("rows", []) or []
+    totals = data.get("totals", {}) or {}
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Plan Özet (Yıllık)"
+
+    # Üst bilgi
+    info = [
+        ("Ajans", header.get("agency", "")),
+        ("Reklamveren", header.get("advertiser", "")),
+        ("Ürün", header.get("product", "")),
+        ("Plan Başlığı", header.get("plan_title", "")),
+        ("Rezervasyon No", header.get("reservation_no", "")),
+        ("Dönemi", header.get("period", "")),
+        ("Spot Süresi - Sn", header.get("spot_len", 0)),
+    ]
+    ws["A1"].value = "PLAN ÖZET (YILLIK)"
+    ws["A1"].font = Font(bold=True, size=14)
+    r = 3
+    for k, v in info:
+        ws.cell(r, 1).value = k
+        ws.cell(r, 1).font = Font(bold=True)
+        ws.cell(r, 2).value = v
+        ws.cell(r, 2).alignment = Alignment(wrap_text=True, vertical="top")
+        r += 1
+
+    r += 1
+    header_row = r
+    cols = [
+        "KANAL",
+        "YAYIN GRUBU",
+        "DT/ODT",
+        "DİNLENME ORANI",
+        "Yıl Adet",
+        "Yıl Saniye",
+        "Birim sn. (TL)",
+        "Toplam Bütçe Net TL",
+    ]
+    for ci, name in enumerate(cols, start=1):
+        c = ws.cell(header_row, ci)
+        c.value = name
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal="center")
+
+    r = header_row + 1
+    for rr in rows:
+        ws.cell(r, 1).value = rr.get("channel")
+        ws.cell(r, 2).value = rr.get("publish_group")
+        ws.cell(r, 3).value = rr.get("dt_odt")
+        ws.cell(r, 4).value = rr.get("dinlenme_orani")
+        ws.cell(r, 5).value = rr.get("year_adet", 0)
+        ws.cell(r, 6).value = rr.get("year_saniye", 0)
+        ws.cell(r, 7).value = rr.get("unit_price")
+        ws.cell(r, 8).value = rr.get("budget", 0)
+        r += 1
+
+    # Toplam satırı
+    ws.cell(r, 1).value = "Toplam"
+    ws.cell(r, 1).font = Font(bold=True)
+    ws.cell(r, 5).value = totals.get("year_adet", 0)
+    ws.cell(r, 6).value = totals.get("year_saniye", 0)
+    ws.cell(r, 8).value = totals.get("budget", 0)
+
+    # Basit kolon genişlikleri
+    widths = [26, 14, 10, 16, 10, 12, 14, 18]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[chr(64+i)].width = w
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
     return out_path
 
 def export_kod_tanimi(out_path, advertiser_name: str, rows: list[dict]) -> None:

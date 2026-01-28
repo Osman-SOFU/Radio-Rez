@@ -240,6 +240,55 @@ class Repository:
         ]
         self.delete_reservations_by_ids(ids)
         return len(ids)
+
+    def update_reservation_payload(self, reservation_id: int, payload: dict) -> None:
+        """Tek bir reservation kaydının payload_json alanını günceller."""
+        self.conn.execute(
+            "UPDATE reservations SET payload_json=? WHERE id=?",
+            (json.dumps(payload, ensure_ascii=False), int(reservation_id)),
+        )
+        self.conn.commit()
+
+    def remove_code_from_plan_title(self, plan_title: str, spot_code: str) -> int:
+        """Belirli plan başlığındaki tüm rezervasyonlardan spot_code tanımını ve hücrelerini siler.
+
+        - code_defs içinden kaldırır
+        - plan_cells içinde ilgili kodu geçen hücreleri boşaltır
+        - display alanlarını (spot_code, spot_duration_sec, code_definition) yeniden hesaplamaz
+          (bu alanlar UI tarafında zaten 'ÇOKLU' kullanılabiliyor)
+        """
+        spot_code = (spot_code or "").strip().upper()
+        if not spot_code:
+            return 0
+
+        recs = self.list_confirmed_reservations_by_plan_title(plan_title, limit=50000)
+        changed = 0
+        for r in recs:
+            p = dict(r.payload or {})
+            cells = dict(p.get("plan_cells") or {})
+            had_any = False
+
+            # hücreleri temizle
+            for k, v in list(cells.items()):
+                vv = str(v or "").strip().upper()
+                if vv == spot_code:
+                    cells[k] = ""
+                    had_any = True
+
+            # code_defs filtrele
+            code_defs = p.get("code_defs")
+            if isinstance(code_defs, list):
+                new_defs = [d for d in code_defs if str(d.get("code") or "").strip().upper() != spot_code]
+                if len(new_defs) != len(code_defs):
+                    p["code_defs"] = new_defs
+                    had_any = True
+
+            if had_any:
+                p["plan_cells"] = cells
+                self.update_reservation_payload(r.id, p)
+                changed += 1
+
+        return changed
     def get_or_create_access_set(self, year: int, label: str, periods: str = "", targets: str = "") -> int:
         label = (label or "").strip()
         if not label:

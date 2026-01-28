@@ -20,9 +20,12 @@ class ReservationDraft:
     agency_name: str = ""
     product_name: str = ""
     plan_title: str = ""
+    # Tekli kod alanları (geri uyumluluk). Çoklu kodlarda "ÇOKLU" yazılabilir.
     spot_code: str = ""
     spot_duration_sec: int = 0
     code_definition: str = ""
+    # Çoklu kod tanımları: [{"code":"K","desc":"...","duration_sec":30}, ...]
+    code_defs: list[dict[str, Any]] | None = None
     note_text: str = ""
     prepared_by_name: str = ""
 
