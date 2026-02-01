@@ -5,6 +5,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+import re
 
 @dataclass
 class ReservationRecord:
@@ -289,29 +290,76 @@ class Repository:
                 changed += 1
 
         return changed
-    def get_or_create_access_set(self, year: int, label: str, periods: str = "", targets: str = "") -> int:
+
+    # ------------------------------
+    # Erişim Örneği (Saatlik)
+    # ------------------------------
+    @staticmethod
+    def _norm_hour_label(label: str) -> str:
+        """Saat etiketini tek formata indirger.
+
+        - Sondaki parantezli sayımı atar: '08:00-09:00(1)' -> '08:00-09:00'
+        - Tire etrafındaki boşlukları temizler: '08:00 - 09:00' -> '08:00-09:00'
+        - Saatleri iki haneli yapar: '8:00-9:00' -> '08:00-09:00'
+        """
+        s = (label or "").strip()
+        # sonda '(...)' varsa at
+        s = re.sub(r"\([^\)]*\)\s*$", "", s).strip()
+        # unicode tireleri standart '-' yap
+        s = s.replace("–", "-").replace("—", "-")
+        # tire etrafındaki boşlukları temizle
+        s = re.sub(r"\s*-\s*", "-", s)
+
+        m = re.match(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$", s)
+        if m:
+            h1, m1, h2, m2 = (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+            return f"{h1:02d}:{m1:02d}-{h2:02d}:{m2:02d}"
+
+        return s
+
+    def get_or_create_access_set(
+        self,
+        year: int,
+        label: str,
+        periods: str,
+        targets: str,
+        hours: list[str] | None = None,
+    ) -> int:
+        year = int(year)
         label = (label or "").strip()
         if not label:
             label = f"{year}"
 
         cur = self.conn.execute(
-            "SELECT id FROM access_example_sets WHERE year=? AND label=?",
+            "SELECT id, hours_json FROM access_example_sets WHERE year=? AND label=?",
             (year, label),
         )
         row = cur.fetchone()
         if row:
-            return int(row["id"])
+            set_id = int(row["id"])
+            # hours_json boşsa ve yeni saat listesi geldiyse güncelle
+            if hours is not None:
+                try:
+                    existing = json.loads(row["hours_json"] or "[]")
+                except Exception:
+                    existing = []
+                if not existing:
+                    self.conn.execute(
+                        "UPDATE access_example_sets SET hours_json=? WHERE id=?",
+                        (json.dumps(hours, ensure_ascii=False), set_id),
+                    )
+            return set_id
 
         self.conn.execute(
-            "INSERT INTO access_example_sets(year,label,periods,targets) VALUES(?,?,?,?)",
-            (year, label, periods or "", targets or ""),
+            "INSERT INTO access_example_sets(year,label,periods,targets,hours_json) VALUES(?,?,?,?,?)",
+            (year, label, periods or "", targets or "", json.dumps(hours or [], ensure_ascii=False)),
         )
         return int(self.conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
 
     def load_access_set(self, set_id: int) -> tuple[dict, list[dict]]:
         meta = self.conn.execute(
             "SELECT * FROM access_example_sets WHERE id=?",
-            (set_id,),
+            (int(set_id),),
         ).fetchone()
         if not meta:
             raise ValueError("Erişim seti bulunamadı.")
@@ -322,51 +370,129 @@ class Repository:
             WHERE set_id=?
             ORDER BY sort_order ASC, id ASC
             """,
-            (set_id,),
+            (int(set_id),),
         ).fetchall()
 
-        return dict(meta), [dict(r) for r in rows]
+        meta_dict = dict(meta)
+        # hours_json -> list
+        hours: list[str] = []
+        try:
+            hours = json.loads(meta_dict.get("hours_json") or "[]") or []
+        except Exception:
+            hours = []
+
+        out_rows: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            # values_json -> dict
+            vals = {}
+            try:
+                vals = json.loads(d.get("values_json") or "{}") or {}
+            except Exception:
+                vals = {}
+
+            d["values"] = vals
+            out_rows.append(d)
+
+            # Eğer meta'da hours yoksa, ilk satırdan türet
+            if not hours and vals:
+                hours = list(vals.keys())
+
+        meta_dict["hours"] = hours
+        return meta_dict, out_rows
 
     def get_access_rows(self, set_id: int) -> list[dict]:
-        """Erişim örneği (Access Example) satırlarını döndürür.
-
-        PLAN ÖZET sayfası dinlenme oranı (AvRch%) bilgisini buradan okur.
+        """Erişim örneği satırlarını döndürür.
+        Yeni modelde her satır: {channel: str, values: {hour_label: number}}.
         """
         _meta, rows = self.load_access_set(int(set_id))
-        return rows
+        out: list[dict] = []
+        for r in rows:
+            out.append(
+                {
+                    "channel": r.get("channel"),
+                    "values": r.get("values") or {},
+                }
+            )
+        return out
 
-
-    def save_access_set(self, set_id: int, periods: str, targets: str, rows: list[dict]) -> None:
+    def save_access_set(
+        self,
+        set_id: int,
+        periods: str,
+        targets: str,
+        hours: list[str],
+        rows: list[dict],
+    ) -> None:
         # Eğer zaten açık transaction varsa tekrar BEGIN deme (SQLite patlıyor)
         if not self.conn.in_transaction:
             self.conn.execute("BEGIN")
         try:
             self.conn.execute(
-                "UPDATE access_example_sets SET periods=?, targets=?, created_at=CURRENT_TIMESTAMP WHERE id=?",
-                (periods or "", targets or "", set_id),
+                "UPDATE access_example_sets SET periods=?, targets=?, hours_json=?, created_at=CURRENT_TIMESTAMP WHERE id=?",
+                (periods or "", targets or "", json.dumps(hours or [], ensure_ascii=False), int(set_id)),
             )
-            self.conn.execute("DELETE FROM access_example_rows WHERE set_id=?", (set_id,))
+            self.conn.execute("DELETE FROM access_example_rows WHERE set_id=?", (int(set_id),))
 
             for i, r in enumerate(rows):
+                ch = (r.get("channel") or "").strip()
+                if not ch:
+                    continue
+                vals = r.get("values") or {}
                 self.conn.execute(
                     """
-                    INSERT INTO access_example_rows(set_id, channel, universe, avrch000, avrch_pct, sort_order)
-                    VALUES(?,?,?,?,?,?)
+                    INSERT INTO access_example_rows(set_id, channel, values_json, sort_order)
+                    VALUES(?,?,?,?)
                     """,
-                    (
-                        set_id,
-                        (r.get("channel") or "").strip(),
-                        r.get("universe"),
-                        r.get("avrch000"),
-                        r.get("avrch_pct"),
-                        i,
-                    ),
+                    (int(set_id), ch, json.dumps(vals, ensure_ascii=False), i),
                 )
 
             self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise
+
+    def get_access_channel_avg_map(self, set_id: int) -> dict[str, float]:
+        """normalize(channel)->avg (saatlik değerlerin ortalaması)"""
+        _meta, rows = self.load_access_set(int(set_id))
+        out: dict[str, float] = {}
+        for r in rows:
+            ch = str(r.get("channel") or "").strip()
+            if not ch:
+                continue
+            vals = r.get("values") or {}
+            nums = []
+            for v in vals.values():
+                if v is None:
+                    continue
+                try:
+                    nums.append(float(str(v).replace(",", ".")))
+                except Exception:
+                    continue
+            if nums:
+                out[ch.upper()] = sum(nums) / len(nums)
+        return out
+
+    def get_access_channel_hour_map(self, set_id: int, channel_name: str) -> dict[str, float]:
+        """Verilen kanal için normalize(hour)->value döndürür."""
+        _meta, rows = self.load_access_set(int(set_id))
+        ch_norm = (channel_name or "").strip().upper()
+        for r in rows:
+            ch = (str(r.get("channel") or "")).strip().upper()
+            if ch == ch_norm:
+                vals = r.get("values") or {}
+                out: dict[str, float] = {}
+                for k, v in vals.items():
+                    kk = self._norm_hour_label(str(k))
+                    try:
+                        out[kk] = float(str(v).replace(",", "."))
+                    except Exception:
+                        # boş/bozuk hücre
+                        continue
+                return out
+        return {}
+
+
 
 
     def get_latest_access_set_id(self) -> int | None:

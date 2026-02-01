@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS access_example_sets (
   label TEXT NOT NULL,        -- Örn: "Ekim 2025"
   periods TEXT,               -- Örn: "Periods (Regions|...)"
   targets TEXT,               -- Örn: "12+(1)"
+  hours_json TEXT NOT NULL DEFAULT '[]', -- Saatlik kolon başlıkları (JSON array)
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(year, label)
 );
@@ -62,9 +63,12 @@ CREATE TABLE IF NOT EXISTS access_example_rows (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   set_id INTEGER NOT NULL,
   channel TEXT NOT NULL,
+  -- Legacy kolonlar (eski AvRch yapısı). Yeni ekranda kullanılmıyor ama DB uyumu için duruyor.
   universe INTEGER,
   avrch000 INTEGER,
   avrch_pct REAL,
+  -- Yeni saatlik değerler (JSON dict: {"07:00-08:00": 9.92, ...})
+  values_json TEXT NOT NULL DEFAULT '{}',
   sort_order INTEGER NOT NULL,
   FOREIGN KEY(set_id) REFERENCES access_example_sets(id) ON DELETE CASCADE
 );
@@ -219,6 +223,21 @@ def migrate_and_seed(conn: sqlite3.Connection) -> None:
     )
     _backfill_plan_title_from_payload(conn)
 
+
+    # Erişim örneği (yeni saatlik yapı) için ek kolonlar
+    _ensure_column(
+        conn,
+        "access_example_sets",
+        "ALTER TABLE access_example_sets ADD COLUMN hours_json TEXT NOT NULL DEFAULT '[]'",
+        "hours_json",
+    )
+    _ensure_column(
+        conn,
+        "access_example_rows",
+        "ALTER TABLE access_example_rows ADD COLUMN values_json TEXT NOT NULL DEFAULT '{}'",
+        "values_json",
+    )
+
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_reservations_plan_title ON reservations(plan_title)"
     )
@@ -256,49 +275,3 @@ def migrate_and_seed(conn: sqlite3.Connection) -> None:
         conn.execute("INSERT INTO meta(key, value) VALUES(?, ?)", ("reservation_seq", "1000"))
 
     conn.commit()
-
-def access_save_db(self) -> None:
-    if not self.repo:
-        QMessageBox.critical(self, "Hata", "Repo yok. DB bağlantısı kurulmamış.")
-        return
-
-    dates = (self.access_dates.text() or "").strip()
-    targets = (self.access_targets.text() or "").strip()
-
-    year = self._parse_year_from_dates(dates)
-    label = dates if dates else f"{year}"
-
-    # aynı Dates>> için tekrar kaydedersen UPDATE gibi davranacak (satırları silip yeniden yazar)
-    set_id = self.repo.get_or_create_access_set(year=year, label=label, periods="", targets=targets)
-    self._access_set_id = set_id
-
-    def _to_int(txt: str):
-        t = (txt or "").strip()
-        return int(t) if t else None
-
-    def _to_float(txt: str):
-        t = (txt or "").strip()
-        if not t:
-            return None
-        return float(t.replace(",", "."))
-
-    rows_out: list[dict] = []
-    for r in range(self.access_table.rowCount()):
-        ch_item = self.access_table.item(r, 0)
-        ch = ch_item.text().strip() if ch_item else ""
-        if not ch:
-            continue
-
-        u = _to_int(self.access_table.item(r, 1).text() if self.access_table.item(r, 1) else "")
-        a0 = _to_int(self.access_table.item(r, 2).text() if self.access_table.item(r, 2) else "")
-        ap = _to_float(self.access_table.item(r, 3).text() if self.access_table.item(r, 3) else "")
-
-        # AvRch% boşsa hesapla (opsiyonel ama hayat kurtarır)
-        if ap is None and u and a0 is not None and u != 0:
-            ap = round((a0 / u) * 100, 2)
-
-        rows_out.append({"channel": ch, "universe": u, "avrch000": a0, "avrch_pct": ap})
-
-    self.repo.save_access_set(set_id=set_id, periods="", targets=targets, rows=rows_out)
-
-    QMessageBox.information(self, "OK", "Erişim örneği DB'ye kaydedildi. Uygulama yeniden açılınca aynen gelecektir.")

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
+
+import re
 
 import openpyxl
+from openpyxl.styles import Alignment
 from openpyxl.drawing.image import Image
 
 from src.util.paths import resource_path
@@ -28,11 +31,37 @@ def _row_idx_to_time(row_idx: int) -> time:
     mins = 7 * 60 + int(row_idx) * 15
     return time(mins // 60, mins % 60)
 
+
+def _norm_hour_label(label: str) -> str:
+    """Saat etiketini tek formata indirger.
+
+    Repository tarafındaki normalize mantığı ile aynı olmalı; aksi halde
+    '08:00 - 09:00' gibi başlıklarda eşleşme kaçıyor.
+    """
+    s = (label or "").strip()
+    s = s.replace("–", "-").replace("—", "-")
+    # sonda '(...)' varsa at
+    import re
+
+    s = re.sub(r"\([^\)]*\)\s*$", "", s).strip()
+    s = re.sub(r"\s*-\s*", "-", s)
+    m = re.match(r"^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$", s)
+    if m:
+        h1, m1, h2, m2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        return f"{h1:02d}:{m1:02d}-{h2:02d}:{m2:02d}"
+    return s
+
 def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -> Path:
     if not template_path.exists():
         raise FileNotFoundError(f"Template bulunamadı: {template_path}")
 
     wb = openpyxl.load_workbook(template_path)
+    # Excel açılınca formüller yeniden hesaplasın
+    try:
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+    except Exception:
+        pass
     ws = wb["REZERVASYON ve PLANLAMA"]
 
     # --- Header labels + values ---
@@ -84,7 +113,7 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     if year and month:
         days_in_month = calendar.monthrange(year, month)[1]
         HEADER_ROW = 7          # C7..AG7
-        FIRST_DAY_COL = 3       # C
+        FIRST_DAY_COL = 4       # D
         MAX_DAYS = 31
 
         GRID_START_ROW = 8
@@ -211,10 +240,10 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     # Kanal adı (Excel'de T2)
     ch = str(payload.get("channel_name", "")).strip()
     if ch:
-        ws["T2"].value = ch
+        ws["U2"].value = ch
 
     # Sabit başlık
-    ws["U3"].value = "Rezervasyon Formu"
+    ws["V3"].value = "Rezervasyon Formu"
 
     # --- PLAN GRID: temizle + doldur ---
     plan_cells = payload.get("plan_cells") or {}
@@ -223,7 +252,7 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     # Satırlar: 07:00-20:00, 15 dk => 52 satır (8..59)
     # Kolonlar: gün 1..31 => C..AG (3..33)
     GRID_START_ROW = 8
-    GRID_START_COL = 3   # C
+    GRID_START_COL = 4   # D
     GRID_ROWS = 52
     GRID_DAYS_MAX = 31
 
@@ -257,10 +286,24 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
             # bozuk key gelirse export'u patlatmayalım
             continue
 
+    # --- Dinlenme Oranı (Kuşak yanında, yeni sütun B) ---
+    # access_hour_map: {"07:00-08:00": 9.92, ...} (normalize edilmiş saat etiketleri)
+    try:
+        access_hour_map = payload.get("access_hour_map") or {}
+        dinlenme_col = 2  # B
+        for row_idx in range(GRID_ROWS):
+            rr = GRID_START_ROW + row_idx
+            tt = _row_idx_to_time(row_idx)
+            hour_label = _norm_hour_label(f"{tt.hour:02d}:00-{(tt.hour+1):02d}:00")
+            v = access_hour_map.get(hour_label)
+            ws.cell(rr, dinlenme_col).value = "NA" if v is None else v
+    except Exception:
+        pass
+
     # --- Birim fiyatı (AO sütunu) ---
     # DT/ODT fiyatları: seçilen kanalın, plan tarihinin AY/YIL'ına göre.
     try:
-        unit_price_col = column_index_from_string("AO")
+        unit_price_col = column_index_from_string("AP")
         dt_price = float(payload.get("channel_price_dt") or 0)
         odt_price = float(payload.get("channel_price_odt") or 0)
 
@@ -286,7 +329,7 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
         img.width = 128
         img.height = 128
 
-        ws.add_image(img, "AO1")
+        ws.add_image(img, "AP1")
 
     except Exception as e:
         print("[DEBUG] logo add FAILED:", repr(e))
@@ -303,7 +346,7 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
         dur_val = payload.get("spot_duration", None)
     if dur_val is not None:
         try:
-            ws["B67"].value = int(dur_val)
+            ws["C67"].value = int(dur_val)
         except Exception:
             pass
 
@@ -329,7 +372,7 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     wb.save(out_path)
 
 
-def export_excel_span(
+def _export_excel_span_legacy(
     template_path: Path,
     out_path: Path,
     payload: dict[str, Any],
@@ -362,6 +405,12 @@ def export_excel_span(
         cur = cur.fromordinal(cur.toordinal() + 1)
 
     wb = openpyxl.load_workbook(template_path)
+    # Excel açılınca formüller yeniden hesaplasın
+    try:
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+    except Exception:
+        pass
     base_ws = wb["REZERVASYON ve PLANLAMA"]
 
     # --- Span genelinde kullanılan kodlar / süre / tanımlar (A67/B67/D67 için) ---
@@ -454,7 +503,7 @@ def export_excel_span(
     # Helper: apply header + fills for an arbitrary date chunk
     def apply_span_headers(ws, dates_chunk: list[date]) -> None:
         HEADER_ROW = 7
-        FIRST_DAY_COL = 3  # C
+        FIRST_DAY_COL = 4  # D
         MAX_DAYS = 31
         GRID_START_ROW = 8
         GRID_ROWS = 52
@@ -602,22 +651,22 @@ def export_excel_span(
         # Kanal adı
         ch = str(payload.get("channel_name", "")).strip()
         if ch:
-            ws["T2"].value = ch
+            ws["U2"].value = ch
             # Şablonda T2 kanal adı fontu 13 olmalı (bazı akışlarda 11'e düşüyordu)
             try:
-                ws["T2"].font = copy(ws["T2"].font)
-                ws["T2"].font = ws["T2"].font.copy(size=13)
+                ws["U2"].font = copy(ws["U2"].font)
+                ws["U2"].font = ws["U2"].font.copy(size=13)
             except Exception:
                 pass
 
-        ws["U3"].value = "Rezervasyon Formu"
+        ws["V3"].value = "Rezervasyon Formu"
 
         # Span tarih başlıkları + boyamalar
         apply_span_headers(ws, dates_chunk)
 
         # --- PLAN GRID: temizle + doldur ---
         GRID_START_ROW = 8
-        GRID_START_COL = 3
+        GRID_START_COL = 4  # D (C is Dolar Kuru)
         GRID_ROWS = 52
 
         # temizle: sadece chunk uzunluğu kadar kolon açık; ama şablon 31 kolon olduğu için 31'i temizleyelim
@@ -635,9 +684,26 @@ def export_excel_span(
                 cc = GRID_START_COL + di
                 ws.cell(rr, cc).value = str(code)
 
-        # --- Birim fiyatı (AO sütunu) ---
+        # --- Dinlenme Oranı (Kuşak yanında, yeni sütun B) ---
+        # access_hour_map: {"07:00-08:00": 9.92, ...} (normalize edilmiş saat etiketleri)
         try:
-            unit_price_col = column_index_from_string("AO")
+            access_hour_map = payload.get("access_hour_map") or {}
+            dinlenme_col = 2  # B
+            dolar_col = 3  # C
+            dolar_kuru = payload.get('dolar_kuru', payload.get('dolar', 2))
+            for row_idx in range(GRID_ROWS):
+                rr = GRID_START_ROW + row_idx
+                tt = _row_idx_to_time(row_idx)
+                hour_label = _norm_hour_label(f"{tt.hour:02d}:00-{(tt.hour+1):02d}:00")
+                v = access_hour_map.get(hour_label)
+                ws.cell(rr, dinlenme_col).value = "NA" if v is None else v
+                ws.cell(rr, dolar_col).value = dolar_kuru
+        except Exception:
+            pass
+
+        # --- Birim fiyatı (AP sütunu) ---
+        try:
+            unit_price_col = column_index_from_string("AP")
             dt_price = float(payload.get("channel_price_dt") or 0)
             odt_price = float(payload.get("channel_price_odt") or 0)
             for row_idx in range(GRID_ROWS):
@@ -657,7 +723,7 @@ def export_excel_span(
                 img = Image(str(logo_path))
                 img.width = 128
                 img.height = 128
-                ws.add_image(img, "AO1")
+                ws.add_image(img, "AP1")
         except Exception:
             pass
 
@@ -667,7 +733,7 @@ def export_excel_span(
             ws["A67"].value = str(a67_codes).strip()
 
         try:
-            ws["B67"].value = b67_val
+            ws["C67"].value = b67_val
         except Exception:
             pass
 
@@ -693,91 +759,387 @@ def export_excel_span(
     return out_path
 
 
-def export_plan_ozet_yearly(out_path, data: dict) -> None:
-    """Plan Özet (Yıllık) çıktısını üretir.
 
-    Aylık Plan Özet şablonu gün (1..31) sütunları üzerine kurulu olduğu için
-    yıllık görünümde basitleştirilmiş bir tablo üretir:
-    Kanal / DT-ODT / Yıl Adet / Yıl Saniye / Birim Sn / Toplam Bütçe.
+
+
+def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_matrices: dict, span_start: date, span_end: date) -> None:
     """
-    from pathlib import Path
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment
+    Export a reservation form workbook for an arbitrary date span.
 
+    New template (v2) rules (based on user's reference workbook):
+      - Column A: Kuşak (already in template)
+      - Column B: Dinlenme Oranı (hourly access ratio; repeated for 15-min slots)
+      - Column C: Dolar Kuru
+      - Day grid starts at column D and spans max 31 days (D..AH)
+      - Totals columns are fixed (AI..AR) and rely on formulas in the template.
+
+    Notes:
+      - We NEVER insert/delete columns. We only write into the existing template cells.
+      - Template images are kept for the first sheet; for copied sheets we re-add the logo.
+    """
+    template_path = Path(template_path)
+
+    # If caller gave the old template, but we have the new one shipped with the app, prefer it.
+    # (This prevents "column shift" bugs when Dinlenme Oranı is required.)
+    try:
+        shipped_v2 = Path(__file__).resolve().parents[2] / "assets" / "reservation_template.xlsx"
+        if shipped_v2.exists():
+            template_path = shipped_v2
+    except Exception:
+        pass
+
+    # NOTE: use the already-imported openpyxl module. Some earlier patches
+    # accidentally used load_workbook without importing it, which crashes
+    # the export path at runtime.
+    wb = openpyxl.load_workbook(template_path)
+
+    # Pick template sheet
+    if "TEMPLATE" in wb.sheetnames:
+        ws_tmpl = wb["TEMPLATE"]
+    else:
+        ws_tmpl = wb[wb.sheetnames[0]]
+        ws_tmpl.title = "TEMPLATE"
+
+    # Detect v2 template by header row
+    is_v2 = (ws_tmpl["A7"].value == "Kuşak" and str(ws_tmpl["B7"].value).strip().lower().startswith("dinlenme"))
+
+    if not is_v2:
+        # Fallback to legacy exporter (kept for backward compatibility)
+        _export_excel_span_legacy(template_path=template_path, out_path=out_path, payload=payload, month_matrices=month_matrices, span_start=span_start, span_end=span_end)
+        return
+
+    # Keep only the template sheet in workbook (clean output)
+    for sn in list(wb.sheetnames):
+        if sn != ws_tmpl.title:
+            del wb[sn]
+
+    # Extract logo from template xlsx (copy_worksheet doesn't copy images)
+    logo_bytes = None
+    logo_anchor = "AP1"
+    logo_w = logo_h = None
+    try:
+        if getattr(ws_tmpl, "_images", None):
+            img0 = ws_tmpl._images[0]
+            logo_w = getattr(img0, "width", None)
+            logo_h = getattr(img0, "height", None)
+            try:
+                col0 = img0.anchor._from.col  # 0-based
+                row0 = img0.anchor._from.row  # 0-based
+                logo_anchor = f"{get_column_letter(col0+1)}{row0+1}"
+            except Exception:
+                pass
+
+        import zipfile
+        with zipfile.ZipFile(template_path, "r") as zf:
+            media = sorted([n for n in zf.namelist() if n.startswith("xl/media/") and n.lower().endswith((".png", ".jpg", ".jpeg"))])
+            if media:
+                logo_bytes = zf.read(media[0])
+    except Exception:
+        logo_bytes = None
+
+    def _add_logo(ws):
+        if not logo_bytes:
+            return
+        try:
+            from io import BytesIO
+            img = Image(BytesIO(logo_bytes))
+            if logo_w and logo_h:
+                img.width = logo_w
+                img.height = logo_h
+            ws.add_image(img, logo_anchor)
+        except Exception:
+            # No hard fail: export should still work without logo.
+            pass
+
+    # Build list of dates inclusive, chunked by 31 days (D..AH)
+    all_dates = []
+    d0 = span_start
+    while d0 <= span_end:
+        all_dates.append(d0)
+        d0 += timedelta(days=1)
+
+    chunks = [all_dates[i:i+31] for i in range(0, len(all_dates), 31)]
+
+    # Normalize access_hour_map keys once
+    access_hour_map = payload.get("access_hour_map") or {}
+    norm_access = {}
+    for k, v in access_hour_map.items():
+        if not k:
+            continue
+        kk = str(k).replace(" ", "")
+        # Normalize "07:00-08:00" / "7-8" etc to "07:00-08:00"
+        m = re.match(r"^(\d{1,2})(?::\d{2})?-(\d{1,2})(?::\d{2})?$", kk)
+        if m:
+            h1 = int(m.group(1)); h2 = int(m.group(2))
+            kk = f"{h1:02d}:00-{h2:02d}:00"
+        norm_access[kk] = v
+
+    def _dow_tr(dt_: date) -> str:
+        return ["Pt", "Sa", "Ça", "Pe", "Cu", "Ct", "Pa"][dt_.weekday()]
+
+    def _fill_header_and_grid(ws, dates_chunk):
+        # Clear header and grid first
+        for idx in range(31):
+            col = 4 + idx  # D=4
+            ws.cell(row=7, column=col).value = None
+            for r in range(8, 60):  # 8..59
+                ws.cell(row=r, column=col).value = None
+
+        # Write headers
+        for idx, dt_ in enumerate(dates_chunk):
+            col = 4 + idx
+            hcell = ws.cell(row=7, column=col)
+            hcell.value = f"{_dow_tr(dt_)}\n{dt_:%d.%m}"
+            # keep style; ensure wrap
+            try:
+                hcell.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+            except Exception:
+                pass
+
+    # export_excel_span() içinde, payload hazırken:
+    meta = {
+        "agency": (payload.get("agency_name") or payload.get("agency") or ""),
+        "advertiser": (payload.get("advertiser_name") or payload.get("advertiser") or ""),
+        "product": (payload.get("product_name") or payload.get("product") or ""),
+        "plan_title": (payload.get("plan_title") or ""),
+        "reservation_no": (payload.get("reservation_no") or ""),
+        "channel": (payload.get("channel_name") or payload.get("channel") or ""),
+        "note": (payload.get("note_text") or payload.get("note") or ""),
+    }
+
+    def _fill_meta(ws, ch_start, ch_end, meta):
+        """Template üzerindeki sabit hücreleri doldurur; kolon/row eklemez."""
+        ws["B1"] = meta.get("agency", "")
+        ws["B2"] = meta.get("advertiser", "")
+        ws["B3"] = meta.get("product", "")
+        ws["B4"] = meta.get("plan_title", "")
+        ws["B5"] = meta.get("reservation_no", "")
+        # Dönem (örnek dosyada B6)
+        ws["B6"] = f"{ch_start:%d.%m.%Y} - {ch_end:%d.%m.%Y}"
+        # Kanal adı template'te üst başlıkta (örnek dosyada U2)
+        ch = meta.get("channel")
+        if ch:
+            ws["U2"] = ch
+        # Not alanı (örnek dosyada A77)
+        note = meta.get("note")
+        if note is not None:
+            note_str = str(note).strip()
+            if note_str:
+                if note_str.lower().startswith("not"):
+                    ws["A77"] = note_str
+                else:
+                    ws["A77"] = f"NOT: {note_str}"        
+
+    def _fill_rates(ws):
+        usd = payload.get("dolar_kuru", payload.get("dolar", payload.get("usd_rate", 2)))
+        if usd is None:
+            usd = 2  # default as per your examples
+        for r in range(8, 60):
+            ws[f"C{r}"].value = usd
+
+        # Dinlenme oranı per slot (hourly repeated)
+        for idx in range(0, 52):  # 52 quarter-hour rows
+            excel_row = 8 + idx
+            hour = 7 + (idx // 4)  # 07:00 starts at row 8
+            key = f"{hour:02d}:00-{hour+1:02d}:00"
+            val = norm_access.get(key, "NA")
+            ws[f"B{excel_row}"].value = val
+
+    def _fill_codes(ws, dates_chunk):
+        for row_idx in range(0, 52):  # planning grid rows
+            excel_row = 8 + row_idx
+            for col_idx, dt_ in enumerate(dates_chunk):
+                # get code from month_matrices
+                mm = month_matrices.get((dt_.year, dt_.month), {}) or {}
+                code = mm.get(f"{row_idx},{dt_.day}", "")
+                ws.cell(row=excel_row, column=4 + col_idx).value = code
+
+    # Build output workbook sheets
+    # First chunk uses TEMPLATE sheet; others are copies (and we re-add logo)
+    for ci, chunk in enumerate(chunks):
+        ch_start, ch_end = chunk[0], chunk[-1]
+        title = f"{ch_start:%d.%m}-{ch_end:%d.%m}"
+
+        if ci == 0:
+            ws = ws_tmpl
+        else:
+            ws = wb.copy_worksheet(ws_tmpl)
+            _add_logo(ws)
+
+        ws.title = title
+
+        _fill_meta(ws, ch_start, ch_end, meta)
+        _fill_header_and_grid(ws, chunk)
+        _fill_rates(ws)
+        _fill_codes(ws, chunk)
+
+    # Save
     out_path = Path(out_path)
-    header = data.get("header", {}) or {}
-    rows = data.get("rows", []) or []
-    totals = data.get("totals", {}) or {}
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Plan Özet (Yıllık)"
-
-    # Üst bilgi
-    info = [
-        ("Ajans", header.get("agency", "")),
-        ("Reklamveren", header.get("advertiser", "")),
-        ("Ürün", header.get("product", "")),
-        ("Plan Başlığı", header.get("plan_title", "")),
-        ("Rezervasyon No", header.get("reservation_no", "")),
-        ("Dönemi", header.get("period", "")),
-        ("Spot Süresi - Sn", header.get("spot_len", 0)),
-    ]
-    ws["A1"].value = "PLAN ÖZET (YILLIK)"
-    ws["A1"].font = Font(bold=True, size=14)
-    r = 3
-    for k, v in info:
-        ws.cell(r, 1).value = k
-        ws.cell(r, 1).font = Font(bold=True)
-        ws.cell(r, 2).value = v
-        ws.cell(r, 2).alignment = Alignment(wrap_text=True, vertical="top")
-        r += 1
-
-    r += 1
-    header_row = r
-    cols = [
-        "KANAL",
-        "YAYIN GRUBU",
-        "DT/ODT",
-        "DİNLENME ORANI",
-        "Yıl Adet",
-        "Yıl Saniye",
-        "Birim sn. (TL)",
-        "Toplam Bütçe Net TL",
-    ]
-    for ci, name in enumerate(cols, start=1):
-        c = ws.cell(header_row, ci)
-        c.value = name
-        c.font = Font(bold=True)
-        c.alignment = Alignment(horizontal="center")
-
-    r = header_row + 1
-    for rr in rows:
-        ws.cell(r, 1).value = rr.get("channel")
-        ws.cell(r, 2).value = rr.get("publish_group")
-        ws.cell(r, 3).value = rr.get("dt_odt")
-        ws.cell(r, 4).value = rr.get("dinlenme_orani")
-        ws.cell(r, 5).value = rr.get("year_adet", 0)
-        ws.cell(r, 6).value = rr.get("year_saniye", 0)
-        ws.cell(r, 7).value = rr.get("unit_price")
-        ws.cell(r, 8).value = rr.get("budget", 0)
-        r += 1
-
-    # Toplam satırı
-    ws.cell(r, 1).value = "Toplam"
-    ws.cell(r, 1).font = Font(bold=True)
-    ws.cell(r, 5).value = totals.get("year_adet", 0)
-    ws.cell(r, 6).value = totals.get("year_saniye", 0)
-    ws.cell(r, 8).value = totals.get("budget", 0)
-
-    # Basit kolon genişlikleri
-    widths = [26, 14, 10, 16, 10, 12, 14, 18]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[chr(64+i)].width = w
-
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
-    return out_path
+
+def export_plan_ozet_yearly(out_path, data: dict) -> None:
+    """
+    Yıllık Plan Özet Excel çıktısı:
+    - 1 adet TOPLAM sheet (12 ay sütunu + yıl toplamı)
+    - 12 adet ay sheet (aylık plan özet formatı)
+
+    data beklenen format:
+    {
+      "template_path": "...",
+      "year": 2026,
+      "total": {"header": {...}, "rows": [...], "month_labels": [...]},
+      "months": [ {"header": {...}, "rows":[...], "month": 3}, ... ]  # 12 eleman
+    }
+    """
+    out_path = Path(out_path)
+
+    template_path = data.get("template_path")
+    if not template_path:
+        template_path = Path(__file__).resolve().parents[2] / "assets" / "PLAN_OZET_TEMPLATE.xlsx"
+    template_path = Path(template_path)
+
+    wb = openpyxl.load_workbook(template_path)
+    ws_template = wb.active  # şablonda tek sheet var
+
+    def _fill_plan_ozet_sheet(ws, header: dict, rows: list[dict], day_labels: list[str], period_text: str):
+        # Sabit hücreler
+        ws["C2"].value = header.get("agency", "")
+        ws["C3"].value = header.get("advertiser", "")
+        ws["C4"].value = header.get("product", "")
+        ws["C5"].value = header.get("plan_title", "")
+        ws["C6"].value = header.get("reservation_no", "")
+        ws["C7"].value = period_text
+        ws["C8"].value = header.get("spot_len", 0)
+
+        start_row = 11
+
+        col_channel = 2     # B
+        col_group = 3       # C
+        col_dtodt = 4       # D
+        col_ratio = 5       # E
+        day_start_col = 6   # F
+        col_month_adet = 37 # AK
+        col_month_sn = 38   # AL
+        col_unit_price = 39 # AM
+        col_budget = 40     # AN
+
+        # Header row (gün/ay)
+        header_row = 10
+        for i in range(31):
+            ws.cell(header_row, day_start_col + i).value = None
+        for i, lbl in enumerate(day_labels[:31]):
+            ws.cell(header_row, day_start_col + i).value = lbl
+
+        # Eski veriyi temizle (500 satır yeter)
+        for rr in range(start_row, start_row + 500):
+            for cc in range(col_channel, col_budget + 1):
+                ws.cell(rr, cc).value = None
+
+        r = start_row
+        for row in rows:
+            ws.cell(r, col_channel).value = row.get("channel", "")
+            ws.cell(r, col_group).value = row.get("group", "")
+            ws.cell(r, col_dtodt).value = row.get("dt_odt", "")
+            ws.cell(r, col_ratio).value = row.get("ratio", "NA")
+
+            days = row.get("days", []) or []
+            for i in range(31):
+                val = days[i] if i < len(days) else None
+                ws.cell(r, day_start_col + i).value = val if val not in ("", None) else None
+
+            unit = row.get("unit_price", 0)
+            try:
+                ws.cell(r, col_unit_price).value = float(unit)
+            except Exception:
+                ws.cell(r, col_unit_price).value = 0.0
+
+            # Formüller (Excel açılınca hesaplanır)
+            ws.cell(r, col_month_adet).value = f"=SUM(F{r}:AJ{r})"
+            ws.cell(r, col_month_sn).value = f"=AK{r}*$C$8"
+            ws.cell(r, col_budget).value = f"=AL{r}*AM{r}"
+
+            r += 1
+
+        last_data_row = r - 1
+        total_row = last_data_row + 1
+        ws.cell(total_row, col_channel).value = "Toplam"
+
+        if last_data_row >= start_row:
+            for i in range(31):
+                c = day_start_col + i
+                col_letter = get_column_letter(c)
+                ws.cell(total_row, c).value = f"=SUM({col_letter}{start_row}:{col_letter}{last_data_row})"
+
+            ws.cell(total_row, col_month_adet).value = f"=SUM(AK{start_row}:AK{last_data_row})"
+            ws.cell(total_row, col_month_sn).value = f"=SUM(AL{start_row}:AL{last_data_row})"
+            ws.cell(total_row, col_budget).value = f"=SUM(AN{start_row}:AN{last_data_row})"
+        else:
+            ws.cell(total_row, col_month_adet).value = 0
+            ws.cell(total_row, col_month_sn).value = 0
+            ws.cell(total_row, col_budget).value = 0
+
+    # TOPLAM sheet
+    total_block = data.get("total") or {}
+    total_header = total_block.get("header") or {}
+    total_rows = total_block.get("rows") or []
+    month_labels = total_block.get("month_labels") or [
+        "OCAK","ŞUBAT","MART","NİSAN","MAYIS","HAZİRAN","TEMMUZ","AĞUSTOS","EYLÜL","EKİM","KASIM","ARALIK"
+    ]
+
+    ws_total = wb.copy_worksheet(ws_template)
+    ws_total.title = "TOPLAM"
+
+    year = total_header.get("year") or data.get("year") or ""
+    _fill_plan_ozet_sheet(
+        ws_total,
+        header={
+            "agency": total_header.get("agency", ""),
+            "advertiser": total_header.get("advertiser", ""),
+            "product": total_header.get("product", ""),
+            "plan_title": total_header.get("plan_title", ""),
+            "reservation_no": "",
+            "spot_len": total_header.get("spot_len", 0),
+        },
+        rows=total_rows,
+        day_labels=month_labels,
+        period_text=f"{year} (TOPLAM)"
+    )
+
+    # 12 ay sheet
+    months = data.get("months") or []
+    month_names = ["OCAK","ŞUBAT","MART","NİSAN","MAYIS","HAZİRAN","TEMMUZ","AĞUSTOS","EYLÜL","EKİM","KASIM","ARALIK"]
+
+    for i in range(12):
+        mdata = months[i] if i < len(months) else {"header": total_header, "rows": [], "month": i + 1}
+        header = mdata.get("header") or {}
+        rows = mdata.get("rows") or []
+        month_no = int(mdata.get("month") or (i + 1))
+
+        ws_m = wb.copy_worksheet(ws_template)
+        ws_m.title = f"{month_no:02d}-{month_names[i]}"
+
+        day_labels = [str(d) for d in range(1, 32)]
+        period_txt = header.get("period") or f"{month_names[i]} {header.get('year', year)}"
+        _fill_plan_ozet_sheet(
+            ws_m,
+            header={
+                "agency": header.get("agency", ""),
+                "advertiser": header.get("advertiser", ""),
+                "product": header.get("product", ""),
+                "plan_title": header.get("plan_title", ""),
+                "reservation_no": "",
+                "spot_len": header.get("spot_len", total_header.get("spot_len", 0)),
+            },
+            rows=rows,
+            day_labels=day_labels,
+            period_text=period_txt
+        )
+
+    wb.remove(ws_template)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+
 
 def export_kod_tanimi(out_path, advertiser_name: str, rows: list[dict]) -> None:
     """

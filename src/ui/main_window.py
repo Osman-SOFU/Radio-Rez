@@ -954,6 +954,16 @@ class MainWindow(QMainWindow):
                             "channel_price_odt": float(odt_price),
                         }
 
+                        # Dinlenme Oranı: erişim örneğinden kanal bazlı saatlik map
+                        # (yoksa exporter zaten NA basar)
+                        try:
+                            payload_span["access_hour_map"] = self.service._get_access_hour_map_for_channel(
+                                channel_name=ch_name,
+                                year=rs.year,
+                            )
+                        except Exception:
+                            payload_span["access_hour_map"] = {}
+
                         fname = f"{_safe_name(plan_title)}__{_safe_name(ch_name)}__{rs:%Y%m%d}-{re:%Y%m%d}.xlsx"
                         out_path = out_dir / fname
                         export_excel_span(
@@ -1133,11 +1143,11 @@ class MainWindow(QMainWindow):
             p2 = resource_path(str(p).replace('\\', '/'))
             return p2
 
-        # default: assets/template.xlsx
-        p = Path("assets") / "template.xlsx"
+        # default: assets/reservation_template.xlsx
+        p = Path("assets") / "reservation_template.xlsx"
         if p.exists():
             return p
-        return resource_path("assets/template.xlsx")
+        return resource_path("assets/reservation_template.xlsx")
 
 
     def on_test_export(self) -> None:
@@ -2700,15 +2710,20 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         layout.addLayout(top)
 
+        top.addWidget(QLabel("Periods >>"))
+        self.access_periods = QLineEdit()
+        self.access_periods.setPlaceholderText("Örn: Periods (Regions|Total Day|All|Total|Total)")
+        top.addWidget(self.access_periods, 3)
+
         top.addWidget(QLabel("Dates >>"))
         self.access_dates = QLineEdit()
-        self.access_dates.setPlaceholderText("Örn: Ekim 2025")
+        self.access_dates.setPlaceholderText("Örn: Aralık 2025")
         top.addWidget(self.access_dates, 2)
 
         top.addWidget(QLabel("Targets >>"))
         self.access_targets = QLineEdit()
-        self.access_targets.setPlaceholderText("Örn: 12+(1)")
-        top.addWidget(self.access_targets, 1)
+        self.access_targets.setPlaceholderText("Örn: 35-54ABC1C2")
+        top.addWidget(self.access_targets, 2)
 
         self.btn_access_save = QPushButton("Kaydet")
         top.addWidget(self.btn_access_save)
@@ -2725,16 +2740,25 @@ class MainWindow(QMainWindow):
         btns.addStretch(1)
 
         self.access_table = QTableWidget()
-        self.access_table.setColumnCount(4)
-        self.access_table.setHorizontalHeaderLabels(["Channels", "Universe", "AvRch(000)", "AvRch%"])
         self.access_table.setAlternatingRowColors(True)
         self.access_table.verticalHeader().setVisible(False)
 
-        hdr = self.access_table.horizontalHeader()
-        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        # Varsayılan saat kolonları (Excel örneğiyle aynı)
+        self._access_hours = ['07:00-08:00',
+                            '08:00-09:00',
+                            '09:00-10:00',
+                            '10:00-11:00',
+                            '11:00-12:00',
+                            '12:00-13:00',
+                            '13:00-14:00',
+                            '14:00-15:00',
+                            '15:00-16:00',
+                            '16:00-17:00',
+                            '17:00-18:00',
+                            '18:00-19:00',
+                            '19:00-20:00']
+
+        self._set_access_table_hours(self._access_hours)
 
         self.access_table.setStyleSheet("""
             QHeaderView::section { background-color: #F28C28; color: white; font-weight: bold; padding: 6px; }
@@ -2750,53 +2774,13 @@ class MainWindow(QMainWindow):
         self.btn_access_add.clicked.connect(self.access_add_row)
         self.btn_access_del.clicked.connect(self.access_delete_selected_row)
         self.btn_access_paste.clicked.connect(self.access_paste_from_clipboard)
-        self.btn_access_save.clicked.connect(self.access_save)
-        self.access_load_latest_db()
+        self.btn_access_save.clicked.connect(self.access_save_db)
 
-
-
-    def access_open_or_create(self) -> None:
-        if not self.repo:
-            return
-
-        year = int(self.access_year.value())
-        label = str(year)
-        label = (self.access_label.text() or "").strip() or f"{year}"
-        periods = self.access_periods.text() or ""
-        targets = self.access_targets.text() or ""
-
-        set_id = self.repo.get_or_create_access_set(year, label, periods=periods, targets=targets)
-        self._access_set_id = set_id
-
-        meta, rows = self.repo.load_access_set(set_id)
-
-        self.access_label.setText(meta.get("label") or "")
-        self.access_periods.setText(meta.get("periods") or "")
-        self.access_targets.setText(meta.get("targets") or "")
-
-        self.access_table.setRowCount(max(len(rows), 10))
-
-        for i, r in enumerate(rows):
-            self._set_access_cell(i, 0, r.get("channel"), align_left=True)
-            self._set_access_cell(i, 1, r.get("universe"), center=True)
-            self._set_access_cell(i, 2, r.get("avrch000"), center=True)
-            self._set_access_cell(i, 3, r.get("avrch_pct"), center=True)
-
-        # kalan boş satırlar
-        for rr in range(len(rows), self.access_table.rowCount()):
-            self._set_access_cell(rr, 0, "", align_left=True)
-            self._set_access_cell(rr, 1, "", center=True)
-            self._set_access_cell(rr, 2, "", center=True)
-            self._set_access_cell(rr, 3, "", center=True)
-
-    def _set_access_cell(self, r: int, c: int, value, center: bool = False, align_left: bool = False) -> None:
-        txt = "" if value is None else str(value)
-        it = QTableWidgetItem(txt)
-        if center:
-            it.setTextAlignment(Qt.AlignCenter)
-        elif align_left:
-            it.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.access_table.setItem(r, c, it)
+        # Uygulama açılışında (repo hazırsa) en son kaydı otomatik yükle
+        try:
+            self.access_load_latest_db()
+        except Exception:
+            pass
 
     def access_add_row(self) -> None:
         r = self.access_table.rowCount()
@@ -2806,59 +2790,66 @@ class MainWindow(QMainWindow):
         row = self.access_table.currentRow()
         if row >= 0:
             self.access_table.removeRow(row)
-
-
     def access_save(self) -> None:
         if not self.repo:
             QMessageBox.critical(self, "Hata", "Repo yok. Veri klasörü/DB bağlantısı kurulmamış.")
             return
 
+        periods = (self.access_periods.text() or "").strip()
         dates = (self.access_dates.text() or "").strip()
         targets = (self.access_targets.text() or "").strip()
-        periods = ""  # UI'da periods alanı yok -> DB'ye boş yaz
 
         year = self._parse_year_from_dates(dates)
         label = dates if dates else f"{year}"
 
         # İlk kayıt: set yoksa otomatik oluştur
-        if not self._access_set_id:
+        if not getattr(self, "_access_set_id", None):
             self._access_set_id = self.repo.get_or_create_access_set(
-                year=year, label=label, periods=periods, targets=targets
+                year=year, label=label, periods=periods, targets=targets, hours=self._access_hours
             )
 
-        def _to_int(col: int):
-            t = self.access_table.item(r, col).text().strip() if self.access_table.item(r, col) else ""
-            return int(t) if t else None
-
-        def _to_float(col: int):
-            t = self.access_table.item(r, col).text().strip() if self.access_table.item(r, col) else ""
-            return float(t.replace(",", ".")) if t else None
+        def _to_float(item: QTableWidgetItem | None):
+            t = (item.text() or "").strip() if item else ""
+            if not t:
+                return None
+            try:
+                return float(t.replace(",", "."))
+            except Exception:
+                return None
 
         rows: list[dict] = []
         for r in range(self.access_table.rowCount()):
-            ch = (self.access_table.item(r, 0).text().strip() if self.access_table.item(r, 0) else "")
+            ch_item = self.access_table.item(r, 0)
+            ch = (ch_item.text().strip() if ch_item else "")
             if not ch:
                 continue
 
-            universe = _to_int(1)
-            avrch000 = _to_int(2)
-            avpct = _to_float(3)
+            values: dict = { }
+            for i, hour in enumerate(self._access_hours, start=1):
+                v = _to_float(self.access_table.item(r, i))
+                # boş hücreleri yazmaya gerek yok (DB şişmesin)
+                if v is None:
+                    continue
+                values[str(hour)] = v
 
-            # AvRch% boşsa hesapla
-            if avpct is None and universe and avrch000 is not None and universe != 0:
-                avpct = round((avrch000 / universe) * 100, 2)
+            rows.append({"channel": ch, "values": values})
 
-            rows.append({"channel": ch, "universe": universe, "avrch000": avrch000, "avrch_pct": avpct})
-
-        self.repo.save_access_set(self._access_set_id, periods=periods, targets=targets, rows=rows)
+        self.repo.save_access_set(
+            int(self._access_set_id),
+            periods=periods,
+            targets=targets,
+            hours=self._access_hours,
+            rows=rows,
+        )
         QMessageBox.information(self, "OK", "Erişim örneği DB'ye kaydedildi. Uygulama yeniden açılınca aynen gelecektir.")
 
-    
     def access_save_db(self) -> None:
         self.access_save()
 
-
     def access_paste_from_clipboard(self) -> None:
+        """Excel'den kopyalanan saatlik erişim tablosunu yapıştırır.
+        Beklenen format: ilk kolon kanal adı, sonraki kolonlar saatlik değerler.
+        """
         try:
             text = (QApplication.clipboard().text() or "").strip()
             if not text:
@@ -2867,58 +2858,45 @@ class MainWindow(QMainWindow):
 
             lines = [ln for ln in text.splitlines() if ln.strip()]
             if not lines:
-                QMessageBox.warning(self, "Uyarı", "Panodaki format okunamadı.")
+                QMessageBox.warning(self, "Uyarı", "Panoda geçerli satır yok.")
                 return
 
-            # Header satırı gelirse atla
-            first = lines[0].lower()
-            if "channels" in first and ("universe" in first or "avrch" in first):
-                lines = lines[1:]
-
-            def norm_num(s: str) -> str:
-                s = (s or "").strip()
-                # 52,47 -> 52.47
-                s = s.replace(",", ".")
-                return s
-
-            # Nereden başlayalım? Seçim yoksa 0
+            # başlangıç satırı: seçili satır varsa oradan, yoksa 0
             start_row = self.access_table.currentRow()
             if start_row < 0:
                 start_row = 0
 
-            need_rows = start_row + len(lines)
-            if self.access_table.rowCount() < need_rows:
-                self.access_table.setRowCount(need_rows)
+            r = start_row
+            for ln in lines:
+                cols = ln.split("\t")
+                if not cols:
+                    continue
 
-            self.access_table.blockSignals(True)
+                first = (cols[0] or "").strip()
+                if not first:
+                    continue
 
-            for i, ln in enumerate(lines):
-                parts = ln.split("\t")
-                # Excel bazen sonda tab bırakır
-                parts = [p.strip() for p in parts]
+                # Header satırıysa atla
+                if first.lower() in ("channels", "channel", "kanal", "kanallar"):
+                    continue
 
-                # Beklenen 4 kolon; fazlası gelirse ilk 4'ü al
-                while len(parts) < 4:
-                    parts.append("")
-                parts = parts[:4]
+                if r >= self.access_table.rowCount():
+                    self.access_table.insertRow(r)
 
-                r = start_row + i
-                ch, uni, av0, avp = parts
+                # Kanal adı
+                self.access_table.setItem(r, 0, QTableWidgetItem(first))
 
-                self.access_table.setItem(r, 0, QTableWidgetItem(ch))
-                self.access_table.setItem(r, 1, QTableWidgetItem(norm_num(uni)))
-                self.access_table.setItem(r, 2, QTableWidgetItem(norm_num(av0)))
-                self.access_table.setItem(r, 3, QTableWidgetItem(norm_num(avp)))
-
-                # hizalama
-                for c in (1, 2, 3):
-                    it = self.access_table.item(r, c)
+                # Saatlik değerler
+                for i in range(1, 1 + len(self._access_hours)):
+                    val = cols[i].strip() if i < len(cols) else ""
+                    it = QTableWidgetItem(val)
                     it.setTextAlignment(Qt.AlignCenter)
+                    self.access_table.setItem(r, i, it)
 
-            self.access_table.blockSignals(False)
+                r += 1
 
         except Exception as e:
-            QMessageBox.critical(self, "Hata", f"Yapıştırma sırasında hata: {e}")
+            QMessageBox.critical(self, "Hata", f"Yapıştırma başarısız: {e}")
 
     def norm_num(s: str) -> str:
         s = (s or "").strip()
@@ -3024,6 +3002,25 @@ class MainWindow(QMainWindow):
         m = re.search(r"(19\d{2}|20\d{2})", dates or "")
         return int(m.group(1)) if m else datetime.now().year
 
+    def _set_access_table_hours(self, hours: list[str]) -> None:
+        """Erişim tablosu kolonlarını (Channels + saatlik kolonlar) yeniden kurar."""
+        hours = hours or []
+        self._access_hours = hours
+
+        headers = ["Channels"] + list(hours)
+
+        self.access_table.clear()
+        self.access_table.setColumnCount(len(headers))
+        self.access_table.setHorizontalHeaderLabels(headers)
+        self.access_table.setRowCount(max(self.access_table.rowCount(), 30))
+        self.access_table.setAlternatingRowColors(True)
+        self.access_table.verticalHeader().setVisible(False)
+
+        hdr = self.access_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, len(headers)):
+            hdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+
     def access_load_latest_db(self) -> None:
         if not self.repo:
             return
@@ -3031,27 +3028,49 @@ class MainWindow(QMainWindow):
         latest_id = self.repo.get_latest_access_set_id()
         if not latest_id:
             # ilk kullanım: boş şablon
+            self.access_periods.setText("Periods (Regions|Total Day|All|Total|Total)")
             self.access_dates.setText(QDate.currentDate().toString("MMMM yyyy"))
             self.access_targets.setText("")
-            self.access_table.setRowCount(30)
             self._access_set_id = None
+
+            # default kolonlar + boş satırlar
+            self._set_access_table_hours(getattr(self, "_access_hours", None) or self._access_hours)
+            self.access_table.setRowCount(30)
             return
 
-        meta, rows = self.repo.load_access_set(latest_id)
-        self._access_set_id = latest_id
+        meta, rows = self.repo.load_access_set(int(latest_id))
+        self._access_set_id = int(latest_id)
 
-        # label = Dates >> gibi kullanacağız
-        self.access_dates.setText(meta.get("label") or "")
-        self.access_targets.setText(meta.get("targets") or "")
+        self.access_periods.setText(str(meta.get("periods") or ""))
+        self.access_dates.setText(str(meta.get("label") or ""))
+        self.access_targets.setText(str(meta.get("targets") or ""))
+
+        hours = meta.get("hours") or getattr(self, "_access_hours", None) or []
+        if hours:
+            self._set_access_table_hours(hours)
 
         self.access_table.setRowCount(max(len(rows), 30))
 
+        def _norm_hour(s: str) -> str:
+            return re.sub(r"\([^\)]*\)\s*$", "", (s or "").strip())
+
         for i, r in enumerate(rows):
             self.access_table.setItem(i, 0, QTableWidgetItem(str(r.get("channel", ""))))
-            self.access_table.setItem(i, 1, QTableWidgetItem("" if r.get("universe") is None else str(r.get("universe"))))
-            self.access_table.setItem(i, 2, QTableWidgetItem("" if r.get("avrch000") is None else str(r.get("avrch000"))))
-            self.access_table.setItem(i, 3, QTableWidgetItem("" if r.get("avrch_pct") is None else str(r.get("avrch_pct"))))
-            for c in (1, 2, 3):
-                it = self.access_table.item(i, c)
-                if it:
-                    it.setTextAlignment(Qt.AlignCenter)
+
+            vals = r.get("values") or {}
+            # normalize map for fallback
+            norm_map = {}
+            for k, v in vals.items():
+                norm_map[_norm_hour(str(k))] = v
+
+            for col_idx, hour in enumerate(self._access_hours, start=1):
+                v = None
+                if str(hour) in vals:
+                    v = vals.get(str(hour))
+                else:
+                    v = norm_map.get(_norm_hour(str(hour)))
+
+                it = QTableWidgetItem("" if v is None else str(v))
+                it.setTextAlignment(Qt.AlignCenter)
+                self.access_table.setItem(i, col_idx, it)
+

@@ -174,6 +174,9 @@ class ReservationService:
             "channel_price_dt": float(draft.channel_price_dt or 0.0),
             "channel_price_odt": float(draft.channel_price_odt or 0.0),
 
+            # Erişim örneği: saatlik dinlenme oranları (kanal bazlı)
+            "access_hour_map": self._get_access_hour_map_for_channel(draft.channel_name, draft.plan_date.year),
+
             "plan_cells": cells,
             "adet_total": adet_total,
             
@@ -438,6 +441,19 @@ class ReservationService:
     def _norm_name(s: str) -> str:
         return " ".join((s or "").strip().lower().split())
 
+
+    def _get_access_hour_map_for_channel(self, channel_name: str, year: int) -> dict:
+        """Seçili kanal için saatlik erişim değerlerini döndürür (normalize edilmiş saat etiketleri ile)."""
+        if not self.repo:
+            return {}
+        try:
+            set_id = self.repo.get_latest_access_set_id_for_year(int(year)) or self.repo.get_latest_access_set_id()
+            if not set_id:
+                return {}
+            return self.repo.get_access_channel_hour_map(int(set_id), (channel_name or "").strip())
+        except Exception:
+            return {}
+
     @staticmethod
     def _sort_reservation_no(no: str) -> tuple:
         """Rezervasyon no'yu mümkünse (Yıl, Hafta, Seq) şeklinde sıralar."""
@@ -511,17 +527,32 @@ class ReservationService:
         # Spot süresi: kod tanımı sayfasındaki ort. uzunluk
         spot_len = float(self.get_kod_tanimi_avg_len(pt) or 0.0)
 
-        # Dinlenme oranı (AvRch%) - erişim örneğinden
+        # Dinlenme oranı - Erişim örneğindeki saatlik değerlerin kanal bazlı ortalaması
         access_set_id = self.repo.get_latest_access_set_id_for_year(yy) or self.repo.get_latest_access_set_id()
         access_map: dict[str, str] = {}
         if access_set_id is not None:
-            rows = self.repo.get_access_rows(access_set_id)
-            for rr in rows:
-                ch = self._norm_name(str(rr.get("channel") or ""))
-                if not ch:
-                    continue
-                v = rr.get("avrch_pct")
-                access_map[ch] = "NA" if v is None else str(v)
+            try:
+                rows = self.repo.get_access_rows(int(access_set_id))
+                for rr in rows:
+                    ch = self._norm_name(str(rr.get("channel") or ""))
+                    if not ch:
+                        continue
+                    vals = rr.get("values") or {}
+                    nums = []
+                    for v in vals.values():
+                        if v is None or str(v).strip() == "":
+                            continue
+                        try:
+                            nums.append(float(str(v).replace(",", ".")))
+                        except Exception:
+                            continue
+                    if nums:
+                        # ortalama (2 hane)
+                        access_map[ch] = str(round(sum(nums) / len(nums), 2))
+                    else:
+                        access_map[ch] = "NA"
+            except Exception:
+                access_map = {}
 
         # Birim sn. fiyatları: fiyat ve kanal tanımı tablosundan (yıl/ay)
         # repo.get_channel_prices(year) -> {(channel_id, month): (dt, odt)}
@@ -860,7 +891,88 @@ class ReservationService:
         }
 
     def export_plan_ozet_yearly_excel(self, out_path, plan_title: str, year: int) -> None:
-        """Plan Özet (YILLIK) çıktısı üretir."""
+        """Plan Özet (YILLIK) çıktısı üretir.
+
+        Çıktı formatı:
+        - TOPLAM sheet: 12 ay sütunu + yıl toplamı
+        - 12 ay sheet: her ay için klasik Plan Özet şablonu
+        """
+        from pathlib import Path
         from src.export.excel_exporter import export_plan_ozet_yearly
-        data = self.get_plan_ozet_yearly_data(plan_title, int(year))
-        export_plan_ozet_yearly(out_path, data)
+
+        # 12 ayın verisini ayrı ayrı çek
+        months_data = []
+        for m in range(1, 13):
+            month_data = self.get_plan_ozet_data(plan_title=plan_title, year=year, month=m)
+            # month index bilgisi (exporter sheet adı için)
+            month_data["month"] = m
+            months_data.append(month_data)
+
+        # TOPLAM sheet için aylık toplamları topla
+        # channel bazlı: [ocak..aralık]
+        channel_map = {}
+        for m_idx, md in enumerate(months_data, start=1):
+            for row in md.get("rows", []) or []:
+                key = row.get("channel")
+                if not key:
+                    continue
+                if key not in channel_map:
+                    channel_map[key] = {
+                        "channel": key,
+                        "group": row.get("group", ""),
+                        "dt_odt": row.get("dt_odt", ""),
+                        "ratio": row.get("ratio", "NA"),
+                        "unit_price": row.get("unit_price", 0),
+                        "months": [0] * 12,
+                    }
+                # bu ayın toplam adeti = günlerin toplamı
+                days = row.get("days", []) or []
+                try:
+                    month_total = sum(float(x) for x in days if x not in (None, ""))
+                except Exception:
+                    month_total = 0
+                channel_map[key]["months"][m_idx - 1] += month_total
+                # unit_price boşsa güncelle
+                if not channel_map[key].get("unit_price") and row.get("unit_price"):
+                    channel_map[key]["unit_price"] = row.get("unit_price")
+                # ratio NA ise ve row'da değer varsa güncelle
+                if (channel_map[key].get("ratio") in (None, "", "NA")) and row.get("ratio") not in (None, "", "NA"):
+                    channel_map[key]["ratio"] = row.get("ratio")
+
+        total_rows = []
+        for ch, rec in sorted(channel_map.items(), key=lambda x: x[0].lower()):
+            total_rows.append({
+                "channel": rec["channel"],
+                "group": rec.get("group", ""),
+                "dt_odt": rec.get("dt_odt", ""),
+                "ratio": rec.get("ratio", "NA"),
+                "days": rec.get("months", [0] * 12),
+                "unit_price": rec.get("unit_price", 0),
+            })
+
+        # Header bilgilerini ilk ayın header'ından al (boşsa da sorun değil)
+        header0 = (months_data[0].get("header") or {}) if months_data else {}
+        total_header = {
+            "agency": header0.get("agency", ""),
+            "advertiser": header0.get("advertiser", ""),
+            "product": header0.get("product", ""),
+            "plan_title": header0.get("plan_title", plan_title),
+            "spot_len": header0.get("spot_len", 0),
+            "year": year,
+        }
+
+        template_path = Path(__file__).resolve().parents[2] / "assets" / "PLAN_OZET_TEMPLATE.xlsx"
+
+        export_plan_ozet_yearly(
+            out_path,
+            {
+                "template_path": str(template_path),
+                "year": year,
+                "total": {
+                    "header": total_header,
+                    "rows": total_rows,
+                    "month_labels": ["OCAK","ŞUBAT","MART","NİSAN","MAYIS","HAZİRAN","TEMMUZ","AĞUSTOS","EYLÜL","EKİM","KASIM","ARALIK"],
+                },
+                "months": months_data,
+            },
+        )
