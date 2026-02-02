@@ -362,6 +362,20 @@ class ReservationService:
         rows = self.get_kod_tanimi_rows(plan_title)
         return sum(r["length_sn"] * r["distribution"] for r in rows) if rows else 0.0
 
+    def get_kod_tanimi_len_display(self, plan_title: str) -> str:
+        """Kod tanımı süreleri tek değer ise onu, birden fazlaysa "ÇOKLU" döndürür.
+
+        Not: Plan özet çıktılarında ortalama süre yazmak yanıltıcı olabildiği için
+        (her kodun süresi farklı olabilir) bu değer sadece bilgilendirme amaçlıdır.
+        """
+        rows = self.get_kod_tanimi_rows(plan_title)
+        lens = sorted({int(r.get("length_sn") or 0) for r in rows if int(r.get("length_sn") or 0) > 0})
+        if not lens:
+            return ""
+        if len(lens) == 1:
+            return str(lens[0])
+        return "ÇOKLU"
+
     def delete_kod_for_plan_title(self, plan_title: str, code: str) -> int:
         # Kod silme: ilgili plan başlığındaki tüm rezervasyon payload'larından kodu kaldırır,
         # kodu kullanan hücreleri boşaltır.
@@ -625,8 +639,8 @@ class ReservationService:
             # "ÇOKLU" + sıralı rezervasyon noları
             reservation_no_display = "ÇOKLU\n" + "\n".join(res_nos_sorted)
 
-        # Spot süresi: kod tanımı sayfasındaki ort. uzunluk
-        spot_len = float(self.get_kod_tanimi_avg_len(pt) or 0.0)
+        # Spot süresi: ortalama yerine tek/çoklu (bilgilendirme)
+        spot_len = self.get_kod_tanimi_len_display(pt)
 
         # Dinlenme oranı - Erişim örneğindeki saatlik değerlerin kanal bazlı ortalaması
         access_set_id = self.repo.get_latest_access_set_id_for_year(yy) or self.repo.get_latest_access_set_id()
@@ -920,11 +934,15 @@ class ReservationService:
                 return uniq[0]
             return "ÇOKLU"
 
+        # Header bilgileri: aralık içinde hiç kayıt yoksa bile (ör. yanlış ay seçildi)
+        # üst bilgi boş görünmesin diye plan başlığının tüm rezervasyonlarından derle.
+        hdr_recs = rel_recs if rel_recs else recs
+
         agencies = []
         advertisers = []
         products = []
         resnos = []
-        for r in rel_recs:
+        for r in hdr_recs:
             p = r.payload or {}
             agencies.append(str(p.get("agency_name") or p.get("agency") or ""))
             advertisers.append(str(p.get("advertiser_name") or p.get("advertiser") or ""))
@@ -949,8 +967,8 @@ class ReservationService:
         else:
             reservation_no_display = "ÇOKLU\n" + "\n".join(res_nos_sorted)
 
-        # Spot süresi: kod tanımı sayfasındaki ort. uzunluk
-        spot_len = float(self.get_kod_tanimi_avg_len(pt) or 0.0)
+        # Spot süresi: ortalama yerine tek/çoklu (bilgilendirme)
+        spot_len = self.get_kod_tanimi_len_display(pt)
 
         # Dinlenme oranı (kanal bazlı ortalama) - 2026 varsa 2026 setini tercih et
         years_in_range = sorted(list({yy for (yy, _mm) in months}))

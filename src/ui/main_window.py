@@ -2197,8 +2197,15 @@ class MainWindow(QMainWindow):
             # tabloyu temizle
             self.po_table.setRowCount(0)
             self.po_table.setColumnCount(0)
-            if hasattr(self, "po_period"):
-                self.po_period.setText("")
+
+            # üst bilgileri de temizle
+            if hasattr(self, "po_agency"): self.po_agency.setText("")
+            if hasattr(self, "po_advertiser"): self.po_advertiser.setText("")
+            if hasattr(self, "po_product"): self.po_product.setText("")
+            if hasattr(self, "po_plan_title"): self.po_plan_title.setText(pt or "")
+            if hasattr(self, "po_resno"): self.po_resno.setPlainText("")
+            if hasattr(self, "po_period"): self.po_period.setText("")
+            if hasattr(self, "po_spot_len"): self.po_spot_len.setText("")
             return
 
         try:
@@ -2213,8 +2220,22 @@ class MainWindow(QMainWindow):
         dates = data.get("dates") or []
         months = data.get("months") or []
 
+        # Üst bilgiler
+        if hasattr(self, "po_agency"):
+            self.po_agency.setText(str(header.get("agency", "") or ""))
+        if hasattr(self, "po_advertiser"):
+            self.po_advertiser.setText(str(header.get("advertiser", "") or ""))
+        if hasattr(self, "po_product"):
+            self.po_product.setText(str(header.get("product", "") or ""))
+        if hasattr(self, "po_plan_title"):
+            # header boş gelse bile seçili plan başlığını gösterelim
+            self.po_plan_title.setText(str(header.get("plan_title", "") or pt or ""))
+        if hasattr(self, "po_resno"):
+            self.po_resno.setPlainText(str(header.get("reservation_no", "") or ""))
         if hasattr(self, "po_period"):
             self.po_period.setText(str(header.get("period", "") or ""))
+        if hasattr(self, "po_spot_len"):
+            self.po_spot_len.setText(str(header.get("spot_len", "") or ""))
 
         # Gün başlıkları: Pş / Çr dahil
         TR_DOW_UI = ["Pt", "Sa", "Çr", "Pş", "Cu", "Ct", "Pa"]

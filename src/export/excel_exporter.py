@@ -1620,11 +1620,19 @@ def export_plan_ozet(out_path, data: dict) -> None:
     ws["C6"].value = str(header.get("reservation_no", "") or "")
     ws["C7"].value = str(header.get("period", "") or "")
 
-    spot_len = header.get("spot_len", 0) or 0
+    # Spot süresi: ortalama yerine tek/çoklu bilgilendirme (boş/ÇOKLU olabilir)
+    spot_len = header.get("spot_len", "")
+    # numeric ise sayı olarak yazalım, değilse metin
     try:
-        ws["C8"].value = float(spot_len)
+        if spot_len is None or str(spot_len).strip() == "":
+            ws["C8"].value = ""
+        elif isinstance(spot_len, (int, float)):
+            ws["C8"].value = float(spot_len)
+        else:
+            s = str(spot_len).strip()
+            ws["C8"].value = float(s) if s.replace(".", "", 1).isdigit() else s
     except Exception:
-        ws["C8"].value = 0
+        ws["C8"].value = str(spot_len or "")
 
     month_name = str(header.get("month_name", "") or "").strip().upper()
 
@@ -1705,17 +1713,26 @@ def export_plan_ozet(out_path, data: dict) -> None:
             else:
                 ws.cell(r, c).value = None
 
-        # Birim sn
-        unit = rr.get("unit_price", 0) or 0
-        try:
-            ws.cell(r, col_unit_price).value = float(unit)
-        except Exception:
-            ws.cell(r, col_unit_price).value = 0.0
+        # Ay toplamları: saniye hesabı ortalama süre ile çarpılmamalı.
+        # Service katmanı, hücrelerdeki koda göre saniye/bütçe hesaplayıp buraya gönderir.
+        m_adet = rr.get("month_adet", "")
+        m_sn = rr.get("month_saniye", "")
+        ws.cell(r, col_month_adet).value = None if m_adet in ("", None) else int(m_adet)
+        ws.cell(r, col_month_sn).value = None if m_sn in ("", None) else float(m_sn)
 
-        # Formüller (Excel açılınca hesaplanacak)
-        ws.cell(r, col_month_adet).value = f"=SUM(F{r}:AJ{r})"
-        ws.cell(r, col_month_sn).value = f"=AK{r}*$C$8"
-        ws.cell(r, col_budget).value = f"=AL{r}*AM{r}"
+        # Birim sn (TL): sayıysa yaz, değilse ("ÇOKLU" vb.) metin yaz.
+        unit = rr.get("unit_price", "")
+        if unit in ("", None):
+            ws.cell(r, col_unit_price).value = ""
+        else:
+            try:
+                ws.cell(r, col_unit_price).value = float(unit)
+            except Exception:
+                ws.cell(r, col_unit_price).value = str(unit)
+
+        # Bütçe: #VALUE! riskini önlemek için doğrudan değer bas.
+        bud = rr.get("budget", "")
+        ws.cell(r, col_budget).value = None if bud in ("", None) else float(bud)
 
     # --- Toplam satırı ---
     ws.cell(total_row, col_channel).value = "Toplam"
@@ -1770,11 +1787,18 @@ def export_plan_ozet_range(out_path, data: dict) -> None:
     ws["C6"].value = str(header.get("reservation_no", "") or "")
     ws["C7"].value = str(header.get("period", "") or "")
 
-    spot_len = header.get("spot_len", 0) or 0
+    # Spot süresi: ortalama yerine tek/çoklu bilgilendirme (boş/ÇOKLU olabilir)
+    spot_len = header.get("spot_len", "")
     try:
-        ws["C8"].value = float(spot_len)
+        if spot_len is None or str(spot_len).strip() == "":
+            ws["C8"].value = ""
+        elif isinstance(spot_len, (int, float)):
+            ws["C8"].value = float(spot_len)
+        else:
+            s = str(spot_len).strip()
+            ws["C8"].value = float(s) if s.replace(".", "", 1).isdigit() else s
     except Exception:
-        ws["C8"].value = 0
+        ws["C8"].value = str(spot_len or "")
 
     header_row = 10
     start_row = 11
