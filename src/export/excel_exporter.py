@@ -3,9 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 from datetime import datetime, time, timedelta
-
 import re
-
 import openpyxl
 from openpyxl.styles import Alignment
 from openpyxl.drawing.image import Image
@@ -21,7 +19,26 @@ from openpyxl import Workbook
 
 from src.domain.time_rules import classify_dt_odt
 
-TR_DOW = ["Pt", "Sa", "Ça", "Pş", "Cu", "Ct", "Pa"]  # Monday=0
+TR_DOW = ["Pt", "Sa", "Çr", "Pş", "Cu", "Ct", "Pa"]  # Monday=0
+
+
+def _pick_worksheet(wb: Workbook, preferred: str, *, contains_any: list[str] | None = None):
+    """Template sayfa adı değişse bile çalışmak için esnek seçim.
+
+    - preferred mevcutsa onu döner.
+    - değilse contains_any (case-insensitive) anahtar kelimelerinden birini içeren ilk sayfayı döner.
+    - en sonda ilk sayfayı döner.
+    """
+    if preferred in wb.sheetnames:
+        return wb[preferred]
+    if contains_any:
+        keys = [k.lower() for k in contains_any if k]
+        for n in wb.sheetnames:
+            nl = (n or "").lower()
+            if any(k in nl for k in keys):
+                return wb[n]
+    # fallback: ilk sayfa
+    return wb[wb.sheetnames[0]]
 
 
 def _row_idx_to_time(row_idx: int) -> time:
@@ -62,7 +79,11 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
         wb.calculation.fullCalcOnLoad = True
     except Exception:
         pass
-    ws = wb["REZERVASYON ve PLANLAMA"]
+    ws = _pick_worksheet(
+        wb,
+        "REZERVASYON ve PLANLAMA",
+        contains_any=["rezervasyon", "planlama"],
+    )
 
     # --- Header labels + values ---
     ws["A1"].value = "Ajans:"
@@ -411,7 +432,11 @@ def _export_excel_span_legacy(
         wb.calculation.fullCalcOnLoad = True
     except Exception:
         pass
-    base_ws = wb["REZERVASYON ve PLANLAMA"]
+    base_ws = _pick_worksheet(
+        wb,
+        "REZERVASYON ve PLANLAMA",
+        contains_any=["rezervasyon", "planlama"],
+    )
 
     # --- Span genelinde kullanılan kodlar / süre / tanımlar (A67/B67/D67 için) ---
     # Not: Span modunda grid tek tablo olsa da ay ay matrise bölünerek geliyor.
@@ -851,14 +876,23 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
             # No hard fail: export should still work without logo.
             pass
 
-    # Build list of dates inclusive, chunked by 31 days (D..AH)
-    all_dates = []
-    d0 = span_start
-    while d0 <= span_end:
-        all_dates.append(d0)
-        d0 += timedelta(days=1)
+    # Build list of dates inclusive, chunked by calendar months (for workbook sheets)
+    # Example: 2026-03-09..2026-04-13 => [09.03-31.03] + [01.04-13.04]
+    chunks: list[list[date]] = []
+    cur = span_start
+    while cur <= span_end:
+        last_dom = calendar.monthrange(cur.year, cur.month)[1]
+        month_end = date(cur.year, cur.month, last_dom)
+        seg_end = month_end if month_end <= span_end else span_end
 
-    chunks = [all_dates[i:i+31] for i in range(0, len(all_dates), 31)]
+        chunk: list[date] = []
+        d0 = cur
+        while d0 <= seg_end:
+            chunk.append(d0)
+            d0 += timedelta(days=1)
+
+        chunks.append(chunk)
+        cur = seg_end + timedelta(days=1)
 
     # Normalize access_hour_map keys once
     access_hour_map = payload.get("access_hour_map") or {}
@@ -896,42 +930,36 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
             except Exception:
                 pass
 
-    # export_excel_span() içinde, payload hazırken:
-    meta = {
-        "agency": (payload.get("agency_name") or payload.get("agency") or ""),
-        "advertiser": (payload.get("advertiser_name") or payload.get("advertiser") or ""),
-        "product": (payload.get("product_name") or payload.get("product") or ""),
-        "plan_title": (payload.get("plan_title") or ""),
-        "reservation_no": (payload.get("reservation_no") or ""),
-        "channel": (payload.get("channel_name") or payload.get("channel") or ""),
-        "note": (payload.get("note_text") or payload.get("note") or ""),
-    }
+    def _get(payload, *keys, default=""):
+        for k in keys:
+            v = payload.get(k)
+            if v is not None and str(v).strip() != "":
+                return v
+        return default
 
-    def _fill_meta(ws, ch_start, ch_end, meta):
-        """Template üzerindeki sabit hücreleri doldurur; kolon/row eklemez."""
-        ws["B1"] = meta.get("agency", "")
-        ws["B2"] = meta.get("advertiser", "")
-        ws["B3"] = meta.get("product", "")
-        ws["B4"] = meta.get("plan_title", "")
-        ws["B5"] = meta.get("reservation_no", "")
-        # Dönem (örnek dosyada B6)
-        ws["B6"] = f"{ch_start:%d.%m.%Y} - {ch_end:%d.%m.%Y}"
-        # Kanal adı template'te üst başlıkta (örnek dosyada U2)
-        ch = meta.get("channel")
+    def _fill_meta(ws, span_start, span_end):
+        ws["B1"] = _get(payload, "agency_name", "agency")
+        ws["B2"] = _get(payload, "advertiser_name", "advertiser")
+        ws["B3"] = _get(payload, "product_name", "product")
+        ws["B4"] = _get(payload, "plan_title")
+        ws["B5"] = _get(payload, "reservation_no")
+
+        period_txt = f"{span_start:%d.%m.%Y} - {span_end:%d.%m.%Y}"
+        ws["D6"] = period_txt
+        ws["B6"] = period_txt  # geri uyumluluk
+
+        ch = _get(payload, "channel_name", "channel")
         if ch:
             ws["U2"] = ch
-        # Not alanı (örnek dosyada A77)
-        note = meta.get("note")
-        if note is not None:
+
+        note = _get(payload, "note_text", "note")
+        if note:
             note_str = str(note).strip()
-            if note_str:
-                if note_str.lower().startswith("not"):
-                    ws["A77"] = note_str
-                else:
-                    ws["A77"] = f"NOT: {note_str}"        
+            ws["A77"] = note_str if note_str.lower().startswith("not") else f"NOT: {note_str}"
+
 
     def _fill_rates(ws):
-        usd = payload.get("dolar_kuru", payload.get("dolar", payload.get("usd_rate", 2)))
+        usd = payload.get("usd_rate")
         if usd is None:
             usd = 2  # default as per your examples
         for r in range(8, 60):
@@ -968,7 +996,7 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
 
         ws.title = title
 
-        _fill_meta(ws, ch_start, ch_end, meta)
+        _fill_meta(ws, ch_start, ch_end)
         _fill_header_and_grid(ws, chunk)
         _fill_rates(ws)
         _fill_codes(ws, chunk)
@@ -996,7 +1024,7 @@ def export_plan_ozet_yearly(out_path, data: dict) -> None:
 
     template_path = data.get("template_path")
     if not template_path:
-        template_path = Path(__file__).resolve().parents[2] / "assets" / "PLAN_OZET_TEMPLATE.xlsx"
+        template_path = Path(__file__).resolve().parents[2] / "assets" / "plan_ozet_template.xlsx"
     template_path = Path(template_path)
 
     wb = openpyxl.load_workbook(template_path)
@@ -1525,6 +1553,272 @@ def export_plan_ozet(out_path, data: dict) -> None:
         ws.cell(total_row, col_month_sn).value = 0
         ws.cell(total_row, col_unit_price).value = None
         ws.cell(total_row, col_budget).value = 0
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out_path)
+
+def export_plan_ozet_range(out_path, data: dict) -> None:
+    """PLAN ÖZET excel çıktısı (tarih aralığı bazlı, dinamik gün kolonları + ay kolonları)."""
+    from copy import copy
+    out_path = Path(out_path)
+
+    template_path = resource_path("assets/plan_ozet_template.xlsx")
+    if not template_path.exists():
+        raise FileNotFoundError(f"Plan özet şablonu bulunamadı: {template_path}")
+
+    wb = openpyxl.load_workbook(template_path)
+    ws = wb["PLAN ÖZET"] if "PLAN ÖZET" in wb.sheetnames else wb.active
+
+    header = data.get("header") or {}
+    rows = data.get("rows") or []
+    dates = data.get("dates") or []
+    months = data.get("months") or []
+
+    # --- Üst bilgiler ---
+    ws["C2"].value = str(header.get("agency", "") or "")
+    ws["C3"].value = str(header.get("advertiser", "") or "")
+    ws["C4"].value = str(header.get("product", "") or "")
+    ws["C5"].value = str(header.get("plan_title", "") or "")
+    ws["C6"].value = str(header.get("reservation_no", "") or "")
+    ws["C7"].value = str(header.get("period", "") or "")
+
+    spot_len = header.get("spot_len", 0) or 0
+    try:
+        ws["C8"].value = float(spot_len)
+    except Exception:
+        ws["C8"].value = 0
+
+    header_row = 10
+    start_row = 11
+    day_start_col = 6  # F
+
+    def _find_col(value: str) -> int | None:
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(header_row, c).value
+            if isinstance(v, str) and v.strip() == value:
+                return c
+        return None
+
+    # ay kolonlarının başladığı yer (ilk '* Adet' kolonu)
+    month_start_col = None
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(header_row, c).value
+        if isinstance(v, str) and v.strip().endswith("Adet"):
+            month_start_col = c
+            break
+
+    unit_col = _find_col("Birim sn. (TL)")
+    budget_col = _find_col("Toplam Bütçe\nNet TL") or _find_col("Toplam Bütçe")
+
+    if month_start_col is None or unit_col is None or budget_col is None:
+        raise RuntimeError("plan_ozet_template.xlsx başlıkları beklenen formatta değil.")
+
+    def _copy_col_style(src_c: int, dst_c: int, min_r: int, max_r: int) -> None:
+        for r in range(min_r, max_r + 1):
+            s = ws.cell(r, src_c)
+            d = ws.cell(r, dst_c)
+            d._style = copy(s._style)
+            d.number_format = s.number_format
+            d.font = copy(s.font)
+            d.border = copy(s.border)
+            d.fill = copy(s.fill)
+            d.alignment = copy(s.alignment)
+            d.protection = copy(s.protection)
+            d.comment = None
+
+    def _copy_row_style(src_r: int, dst_r: int, min_c: int, max_c: int) -> None:
+        ws.row_dimensions[dst_r].height = ws.row_dimensions[src_r].height
+        for c in range(min_c, max_c + 1):
+            s = ws.cell(src_r, c)
+            d = ws.cell(dst_r, c)
+            d._style = copy(s._style)
+            d.number_format = s.number_format
+            d.font = copy(s.font)
+            d.border = copy(s.border)
+            d.fill = copy(s.fill)
+            d.alignment = copy(s.alignment)
+            d.protection = copy(s.protection)
+            d.comment = None
+
+    # --- Gün kolonlarını aralığa göre ayarla ---
+    need_days = int(len(dates))
+    template_days = int(month_start_col - day_start_col)
+
+    if need_days > template_days:
+        add = need_days - template_days
+        ws.insert_cols(month_start_col, amount=add)
+        # eklenen kolonların stili: son gün kolonu
+        src_c = month_start_col - 1
+        for i in range(add):
+            dst_c = month_start_col + i
+            _copy_col_style(src_c, dst_c, header_row, ws.max_row)
+    elif need_days < template_days:
+        remove = template_days - need_days
+        ws.delete_cols(month_start_col - remove, amount=remove)
+
+    # kolonlar kaydı, yeniden bul
+    month_start_col = None
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(header_row, c).value
+        if isinstance(v, str) and v.strip().endswith("Adet"):
+            month_start_col = c
+            break
+    unit_col = _find_col("Birim sn. (TL)")
+    budget_col = _find_col("Toplam Bütçe\nNet TL") or _find_col("Toplam Bütçe")
+
+    # --- Ay kolonlarını aralığa göre ayarla (her ay: Adet+Saniye) ---
+    need_month_cols = int(len(months) * 2)
+    template_month_cols = int(unit_col - month_start_col)
+
+    if need_month_cols > template_month_cols:
+        add = need_month_cols - template_month_cols
+        ws.insert_cols(unit_col, amount=add)
+        # stil: mevcut son ay kolonu
+        src_c = unit_col - 1
+        for i in range(add):
+            dst_c = unit_col + i
+            _copy_col_style(src_c, dst_c, header_row, ws.max_row)
+    elif need_month_cols < template_month_cols:
+        remove = template_month_cols - need_month_cols
+        ws.delete_cols(unit_col - remove, amount=remove)
+
+    # yeniden bul (unit/budget shift)
+    month_start_col = None
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(header_row, c).value
+        if isinstance(v, str) and v.strip().endswith("Adet"):
+            month_start_col = c
+            break
+    unit_col = _find_col("Birim sn. (TL)")
+    budget_col = _find_col("Toplam Bütçe\nNet TL") or _find_col("Toplam Bütçe")
+
+    max_write_col = int(budget_col)
+
+    # --- Başlıkları yaz ---
+    # gün başlıkları: Pt\n09.03
+    for i, dd in enumerate(dates):
+        dow = TR_DOW[int(dd.weekday())]
+        ws.cell(header_row, day_start_col + i).value = f"{dow}\n{dd:%d.%m}"
+        ws.cell(header_row, day_start_col + i).alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+
+    # fazla kolonlar varsa temizle (artık yok ama güvenlik)
+    for c in range(day_start_col + need_days, month_start_col):
+        ws.cell(header_row, c).value = None
+
+    # ay başlıkları
+    for i, (yy, mm) in enumerate(months):
+        mname = ["OCAK","ŞUBAT","MART","NİSAN","MAYIS","HAZİRAN","TEMMUZ","AĞUSTOS","EYLÜL","EKİM","KASIM","ARALIK"][int(mm)-1]
+        ws.cell(header_row, month_start_col + 2*i).value = f"{mname} Adet"
+        ws.cell(header_row, month_start_col + 2*i + 1).value = f"{mname} Saniye"
+
+    # --- Satır sayısını ayarla (Toplam satırını sabit tut) ---
+    total_row = None
+    for r in range(start_row, ws.max_row + 1):
+        v = ws.cell(r, 2).value
+        if isinstance(v, str) and v.strip().lower() == "toplam":
+            total_row = r
+            break
+    if total_row is None:
+        total_row = ws.max_row + 1
+
+    current_capacity = total_row - start_row
+    n_rows = len(rows)
+
+    if n_rows > current_capacity:
+        add = n_rows - current_capacity
+        ws.insert_rows(total_row, amount=add)
+        for i in range(add):
+            dst_r = total_row + i
+            src_r = start_row if ((dst_r - start_row) % 2 == 0) else (start_row + 1)
+            _copy_row_style(src_r, dst_r, 2, max_write_col)
+    elif n_rows < current_capacity:
+        remove = current_capacity - n_rows
+        ws.delete_rows(start_row + n_rows, amount=remove)
+
+    total_row = start_row + n_rows
+    last_data_row = total_row - 1
+
+    # --- Yaz ---
+    col_channel = 2
+    col_group = 3
+    col_dtodt = 4
+    col_ratio = 5
+
+    for i, rr in enumerate(rows):
+        r = start_row + i
+        ws.cell(r, col_channel).value = str(rr.get("channel", "") or "")
+        ws.cell(r, col_group).value = str(rr.get("publish_group", "") or "")
+        ws.cell(r, col_dtodt).value = str(rr.get("dt_odt", "") or "")
+        ws.cell(r, col_ratio).value = str(rr.get("dinlenme_orani", "NA") or "NA")
+
+        dvals = rr.get("days") or []
+        for j in range(need_days):
+            v = dvals[j] if j < len(dvals) else ""
+            if v in ("", None):
+                ws.cell(r, day_start_col + j).value = None
+            else:
+                try:
+                    ws.cell(r, day_start_col + j).value = int(v)
+                except Exception:
+                    ws.cell(r, day_start_col + j).value = None
+
+        mcols = rr.get("month_cols") or []
+        for j in range(need_month_cols):
+            v = mcols[j] if j < len(mcols) else ""
+            c = month_start_col + j
+            if v in ("", None):
+                ws.cell(r, c).value = None
+            else:
+                try:
+                    ws.cell(r, c).value = int(v) if (j % 2 == 0) else float(v)
+                except Exception:
+                    ws.cell(r, c).value = v
+
+        # unit price
+        unit = rr.get("unit_price", "")
+        if unit in ("", None):
+            ws.cell(r, unit_col).value = None
+        elif isinstance(unit, str):
+            ws.cell(r, unit_col).value = unit
+        else:
+            try:
+                ws.cell(r, unit_col).value = float(unit)
+            except Exception:
+                ws.cell(r, unit_col).value = unit
+
+        bud = rr.get("budget", "")
+        if bud in ("", None):
+            ws.cell(r, budget_col).value = None
+        else:
+            try:
+                ws.cell(r, budget_col).value = float(bud)
+            except Exception:
+                ws.cell(r, budget_col).value = bud
+
+    # --- Toplam satırı ---
+    ws.cell(total_row, col_channel).value = "Toplam"
+    ws.cell(total_row, col_group).value = None
+    ws.cell(total_row, col_dtodt).value = None
+    ws.cell(total_row, col_ratio).value = None
+
+    totals = data.get("totals") or {}
+    tdays = totals.get("days") or []
+    for j in range(need_days):
+        v = tdays[j] if j < len(tdays) else ""
+        ws.cell(total_row, day_start_col + j).value = (None if v in ("", None) else int(v))
+
+    tm = totals.get("month_cols") or []
+    for j in range(need_month_cols):
+        v = tm[j] if j < len(tm) else ""
+        c = month_start_col + j
+        if v in ("", None):
+            ws.cell(total_row, c).value = None
+        else:
+            ws.cell(total_row, c).value = int(v) if (j % 2 == 0) else float(v)
+
+    ws.cell(total_row, unit_col).value = None
+    tb = totals.get("budget", "")
+    ws.cell(total_row, budget_col).value = None if tb in ("", None) else float(tb)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)

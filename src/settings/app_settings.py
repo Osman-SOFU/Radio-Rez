@@ -27,12 +27,12 @@ class SettingsService:
         self._qs.setValue("data_dir", str(p))
 
     def get_template_path(self) -> Path:
-        # Şablonu app ile birlikte assets/template.xlsx olarak taşıyoruz.
+        # Şablonu app ile birlikte assets/reservation_template.xlsx olarak taşıyoruz.
         # İleride istersen kullanıcı seçtirebilirsin.
         v = str(self._qs.value("template_path", "")).strip()
         if v:
             return Path(v)
-        return resource_path("assets/template.xlsx")
+        return resource_path("assets/reservation_template.xlsx")
 
     def set_template_path(self, p: Path) -> None:
         self._qs.setValue("template_path", str(p))

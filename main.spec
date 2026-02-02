@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\main.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets\\template.xlsx', 'assets'), ('assets\\RADIOSCOPE.PNG', 'assets')],
+    datas=[('assets\\reservation_template.xlsx', 'assets'), ('assets\\RADIOSCOPE.PNG', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

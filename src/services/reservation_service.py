@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 import calendar
 import re
 from pathlib import Path
@@ -47,6 +47,82 @@ class ReservationService:
                 kk = str(k)
             fixed[kk] = "" if v is None else str(v)
         return fixed
+
+
+    def _parse_iso_date(self, s: Any) -> date | None:
+        try:
+            if s is None:
+                return None
+            return datetime.fromisoformat(str(s)).date()
+        except Exception:
+            return None
+
+    def _is_span_payload(self, p: dict[str, Any]) -> bool:
+        return bool(p.get("is_span")) or bool(p.get("span_start")) or bool(p.get("span_end")) or bool(p.get("span_month_matrices"))
+
+    def _get_span_month_matrices(self, p: dict[str, Any]) -> dict[tuple[int, int], dict[str, str]]:
+        """DB payload'ındaki span_month_matrices'i güvenli şekilde (yy,mm)->cells formatına çevir."""
+        smm = p.get("span_month_matrices") or {}
+        out: dict[tuple[int, int], dict[str, str]] = {}
+        if not isinstance(smm, dict):
+            return out
+        for k, cells in smm.items():
+            try:
+                if isinstance(k, (tuple, list)) and len(k) == 2:
+                    yy, mm = int(k[0]), int(k[1])
+                else:
+                    ks = str(k).strip()
+                    if not ks:
+                        continue
+                    if "-" in ks:
+                        a, b = ks.split("-", 1)
+                        yy, mm = int(a), int(b)
+                    elif "," in ks:
+                        a, b = ks.split(",", 1)
+                        yy, mm = int(a), int(b)
+                    else:
+                        continue
+                out[(yy, mm)] = self.sanitize_plan_cells(cells or {})
+            except Exception:
+                continue
+        return out
+
+    def _iter_cells(self, payload: dict[str, Any]):
+        """Yield (yy,mm,row_idx,day,code,is_span) over all non-empty cells in payload."""
+        p = payload or {}
+        is_span = self._is_span_payload(p)
+
+        if is_span:
+            mats = self._get_span_month_matrices(p)
+            for (yy, mm), cells in mats.items():
+                for k, v in (cells or {}).items():
+                    code = str(v or "").strip().upper()
+                    if not code:
+                        continue
+                    try:
+                        row_s, day_s = str(k).split(",", 1)
+                        row_idx = int(row_s)
+                        day = int(day_s)
+                    except Exception:
+                        continue
+                    yield int(yy), int(mm), int(row_idx), int(day), code, True
+        else:
+            d = self._parse_iso_date(p.get("plan_date"))
+            if not d:
+                return
+            yy, mm = int(d.year), int(d.month)
+            cells = self.sanitize_plan_cells(p.get("plan_cells") or {})
+            for k, v in (cells or {}).items():
+                code = str(v or "").strip().upper()
+                if not code:
+                    continue
+                try:
+                    row_s, day_s = str(k).split(",", 1)
+                    row_idx = int(row_s)
+                    day = int(day_s)
+                except Exception:
+                    continue
+                yield int(yy), int(mm), int(row_idx), int(day), code, False
 
     def confirm(self, draft: ReservationDraft, plan_cells: dict | None = None) -> ConfirmedReservation:
         if plan_cells is None:
@@ -228,7 +304,6 @@ class ReservationService:
 
         for r in recs:
             p = r.payload or {}
-            cells: dict[str, str] = p.get("plan_cells") or {}
 
             # kod haritası
             code_defs = p.get("code_defs") or []
@@ -249,8 +324,7 @@ class ReservationService:
                         "dur": int(p.get("spot_duration_sec") or 0),
                     }
 
-            for _k, v in cells.items():
-                code = str(v or "").strip().upper()
+            for _yy, _mm, _row_idx, _day, code, _is_span in self._iter_cells(p):
                 if not code:
                     continue
                 total_spots += 1
@@ -302,7 +376,8 @@ class ReservationService:
     def get_spotlist_rows(self, plan_title: str) -> list[dict[str, Any]]:
         """Seçili plan başlığı için SPOTLİST+ satırlarını üretir.
 
-        Her satır, confirmed reservation payload'ındaki plan_cells içindeki dolu hücrelerden türetilir.
+        Tek ay kayıtları + span (tarih aralığı) kayıtları desteklenir.
+        Span kayıtlarında 'day' alanı çakışmayı engellemek için YYYYMMDD (int) tutulur.
         """
         pt = (plan_title or "").strip()
         if not pt:
@@ -314,17 +389,20 @@ class ReservationService:
 
         status_map = self.repo.get_spotlist_status_map([r.id for r in recs])
 
+        # fiyatlar (yıl/ay bazlı) - span kayıtlarında aylara göre değişebileceği için repo'dan okunur
+        ch_id_map: dict[str, int] = {}
+        try:
+            for ch in self.repo.list_channels(active_only=False):
+                nm = str(ch.get("name") or "").strip().lower()
+                if nm:
+                    ch_id_map[nm] = int(ch.get("id") or 0)
+        except Exception:
+            pass
+        price_cache: dict[int, dict[tuple[int, int], tuple[float, float]]] = {}
+
         rows: list[dict[str, Any]] = []
         for r in recs:
             p = r.payload or {}
-
-            # plan ay/yıl
-            try:
-                y, m, _d = str(p.get("plan_date") or "").split("-")
-                yy = int(y)
-                mm = int(m)
-            except Exception:
-                continue
 
             channel_name = str(p.get("channel_name") or "").strip()
 
@@ -340,45 +418,42 @@ class ReservationService:
                 sc = str(p.get("spot_code") or "").strip().upper()
                 if sc:
                     code_map[sc] = int(p.get("spot_duration_sec") or 0)
+
             price_dt = float(p.get("channel_price_dt") or 0.0)
             price_odt = float(p.get("channel_price_odt") or 0.0)
 
-            cells: dict[str, str] = p.get("plan_cells") or {}
-            for k, v in cells.items():
-                if not str(v or "").strip():
-                    continue
-                try:
-                    if isinstance(k, str):
-                        row_idx_s, day_s = k.split(",")
-                        row_idx = int(row_idx_s)
-                        day = int(day_s)
-                    else:
-                        row_idx, day = k
-                        row_idx = int(row_idx)
-                        day = int(day)
-                except Exception:
-                    continue
-
+            for yy, mm, row_idx, day, cell_code, is_span in self._iter_cells(p):
                 # gerçek tarih + saat
                 try:
-                    dt = date(yy, mm, day)
+                    dt = date(int(yy), int(mm), int(day))
                 except Exception:
                     continue
 
-                t0 = self._row_idx_to_time(row_idx)
+                t0 = self._row_idx_to_time(int(row_idx))
                 dt_odt = classify_dt_odt(t0)
-                unit = price_dt if dt_odt == "DT" else price_odt
+                # span kayıtlarında fiyat ay bazlı değişebilir: repo fiyatını tercih et
+                ch_id = ch_id_map.get(channel_name.strip().lower())
+                if ch_id and int(yy) not in price_cache:
+                    try:
+                        price_cache[int(yy)] = self.repo.get_channel_prices(int(yy))
+                    except Exception:
+                        price_cache[int(yy)] = {}
+                dt_p, odt_p = (price_dt, price_odt)
+                if ch_id:
+                    dt_p, odt_p = price_cache.get(int(yy), {}).get((int(ch_id), int(mm)), (price_dt, price_odt))
+                unit = float(dt_p) if dt_odt == "DT" else float(odt_p)
 
-                cell_code = str(v or "").strip().upper()
-                duration = int(code_map.get(cell_code, 0))
+                duration = int(code_map.get(str(cell_code).strip().upper(), 0))
                 budget = float(unit) * float(duration)
 
-                pub = int(status_map.get((r.id, day, row_idx), 0))
+                day_key = int(dt.strftime("%Y%m%d")) if is_span else int(day)
+                pub = int(status_map.get((int(r.id), int(day_key), int(row_idx)), 0) or 0)
+
                 rows.append(
                     {
-                        "reservation_id": r.id,
-                        "day": day,
-                        "row_idx": row_idx,
+                        "reservation_id": int(r.id),
+                        "day": int(day_key),
+                        "row_idx": int(row_idx),
                         "datetime": datetime(dt.year, dt.month, dt.day, t0.hour, t0.minute),
                         "tarih": dt.strftime("%d.%m.%Y"),
                         "ana_yayin": channel_name,
@@ -386,7 +461,7 @@ class ReservationService:
                         "adet": 1,
                         "baslangic": t0.strftime("%H:%M"),
                         "sure": duration,
-                        "spot_kodu": cell_code,
+                        "spot_kodu": str(cell_code).strip().upper(),
                         "dt_odt": dt_odt,
                         "birim_saniye": unit,
                         "butce_net": budget,
@@ -487,18 +562,41 @@ class ReservationService:
         days_in_month = int(calendar.monthrange(yy, mm)[1])
         month_name = self._MONTHS_TR[mm - 1]
 
-        # rezervasyonları ay bazlı filtrele
+        # rezervasyonları ay bazlı filtrele (tek ay kayıtları + span kayıtları)
         recs = self.repo.list_confirmed_reservations_by_plan_title(pt, limit=5000)
-        month_recs = []
+        month_recs: list[Any] = []
+        month_cells_by_id: dict[int, dict[str, str]] = {}
+
+        month_start = date(yy, mm, 1)
+        month_end = date(yy, mm, days_in_month)
+
         for r in recs:
             p = r.payload or {}
-            dstr = p.get("plan_date")
-            try:
-                d = datetime.fromisoformat(str(dstr)).date()
-            except Exception:
+            rid = int(getattr(r, "id", 0) or 0)
+            if rid <= 0:
                 continue
-            if d.year == yy and d.month == mm:
+
+            if self._is_span_payload(p):
+                mats = self._get_span_month_matrices(p)
+                cells_m = mats.get((yy, mm)) or {}
+                # bu ay için hiç hücre yoksa bu ay özetine dahil etmeyelim
+                if not any(str(v).strip() for v in cells_m.values()):
+                    continue
+
+                s0 = self._parse_iso_date(p.get("span_start")) or month_start
+                s1 = self._parse_iso_date(p.get("span_end")) or month_end
+                if s1 < month_start or s0 > month_end:
+                    continue
+
                 month_recs.append(r)
+                month_cells_by_id[rid] = self.sanitize_plan_cells(cells_m)
+            else:
+                d = self._parse_iso_date(p.get("plan_date"))
+                if not d:
+                    continue
+                if d.year == yy and d.month == mm:
+                    month_recs.append(r)
+                    month_cells_by_id[rid] = self.sanitize_plan_cells(p.get("plan_cells") or {})
 
         # Header alanları: tekse aynen, çoklaysa "ÇOKLU"
         def _uniq_or_coklu(values: list[str]) -> str:
@@ -720,6 +818,391 @@ class ReservationService:
         from src.export.excel_exporter import export_plan_ozet
         data = self.get_plan_ozet_data(plan_title, int(year), int(month))
         export_plan_ozet(out_path, data)
+
+    def get_plan_ozet_range_data(self, plan_title: str, start: date, end: date) -> dict[str, Any]:
+        """Plan Özet datasını seçili tarih aralığına göre üretir (tek tip).
+
+        Kurallar:
+        - Gün kolonları aralık kaç günse o kadar (start..end dahil).
+        - Fiyatlar ay bazında değişebilir: bütçe, her günün ait olduğu ayın fiyatıyla hesaplanır.
+        - Gün hücreleri 0 ise boş gösterilir.
+        - Header.period: 'dd.mm.yyyy-dd.mm.yyyy'
+        """
+        pt = (plan_title or "").strip()
+        if not pt or start is None or end is None:
+            return {
+                "header": {},
+                "start": start,
+                "end": end,
+                "dates": [],
+                "months": [],
+                "month_headers": [],
+                "rows": [],
+                "totals": {},
+            }
+
+        rs = start if start <= end else end
+        re = end if start <= end else start
+
+        dates: list[date] = []
+        d = rs
+        while d <= re:
+            dates.append(d)
+            d = d + timedelta(days=1)
+
+        # aralıkta geçen aylar (sıralı)
+        months: list[tuple[int, int]] = []
+        for dd in dates:
+            ym = (dd.year, dd.month)
+            if not months or months[-1] != ym:
+                months.append(ym)
+
+        # tüm plan başlığı rezervasyonları
+        recs = self.repo.list_confirmed_reservations_by_plan_title(pt, limit=5000)
+
+        # aralıkla kesişen rezervasyonlar + hücreler
+        rel_recs: list[Any] = []
+        cells_by_id_month: dict[int, dict[tuple[int, int], dict[str, str]]] = {}
+
+        for r in recs:
+            p = r.payload or {}
+            rid = int(getattr(r, "id", 0) or 0)
+            if rid <= 0:
+                continue
+
+            if self._is_span_payload(p):
+                s0 = self._parse_iso_date(p.get("span_start")) or rs
+                s1 = self._parse_iso_date(p.get("span_end")) or re
+                if s1 < rs or s0 > re:
+                    continue
+
+                mats = self._get_span_month_matrices(p)  # {(yy,mm): cells}
+                # sadece aralıkta geçen ayları al
+                mmaps: dict[tuple[int, int], dict[str, str]] = {}
+                has_any = False
+                for (yy, mm), _cells in mats.items():
+                    if (yy, mm) in months:
+                        fixed = self.sanitize_plan_cells(_cells or {})
+                        # tamamen boş ay hücrelerini geç
+                        if any(str(v).strip() for v in fixed.values()):
+                            mmaps[(yy, mm)] = fixed
+                            has_any = True
+                if not has_any:
+                    continue
+
+                rel_recs.append(r)
+                cells_by_id_month[rid] = mmaps
+            else:
+                d0 = self._parse_iso_date(p.get("plan_date"))
+                if not d0:
+                    continue
+                if d0 < rs or d0 > re:
+                    continue
+
+                rel_recs.append(r)
+                # tek gün kaydında plan_cells o günün gün numarasıyla geliyor
+                fixed = self.sanitize_plan_cells(p.get("plan_cells") or {})
+                cells_by_id_month[rid] = {(d0.year, d0.month): fixed}
+
+        # Header alanları: tekse aynen, çoklaysa "ÇOKLU"
+        def _pick_single(values: list[str]) -> str:
+            vals = [str(v or "").strip() for v in values if str(v or "").strip()]
+            if not vals:
+                return ""
+            uniq = []
+            for v in vals:
+                if v not in uniq:
+                    uniq.append(v)
+            if len(uniq) == 1:
+                return uniq[0]
+            return "ÇOKLU"
+
+        agencies = []
+        advertisers = []
+        products = []
+        resnos = []
+        for r in rel_recs:
+            p = r.payload or {}
+            agencies.append(str(p.get("agency_name") or p.get("agency") or ""))
+            advertisers.append(str(p.get("advertiser_name") or p.get("advertiser") or ""))
+            products.append(str(p.get("product_name") or p.get("product") or ""))
+
+            # Rezervasyon no: payload'da olmayabilir, DB kolonundan al
+            rn = str(getattr(r, "reservation_no", "") or p.get("reservation_no") or "").strip()
+            if rn:
+                resnos.append(rn)
+
+
+        agency = _pick_single(agencies)
+        advertiser = _pick_single(advertisers)
+        product = _pick_single(products)
+
+        # Rezervasyon no: tekse aynen, çoklaysa "ÇOKLU" + liste
+        res_nos_sorted = sorted(list({r for r in resnos if r.strip()}))
+        if not res_nos_sorted:
+            reservation_no_display = ""
+        elif len(res_nos_sorted) == 1:
+            reservation_no_display = res_nos_sorted[0]
+        else:
+            reservation_no_display = "ÇOKLU\n" + "\n".join(res_nos_sorted)
+
+        # Spot süresi: kod tanımı sayfasındaki ort. uzunluk
+        spot_len = float(self.get_kod_tanimi_avg_len(pt) or 0.0)
+
+        # Dinlenme oranı (kanal bazlı ortalama) - 2026 varsa 2026 setini tercih et
+        years_in_range = sorted(list({yy for (yy, _mm) in months}))
+        access_set_id = None
+        if 2026 in years_in_range:
+            access_set_id = self.repo.get_latest_access_set_id_for_year(2026)
+        if access_set_id is None and years_in_range:
+            access_set_id = self.repo.get_latest_access_set_id_for_year(int(years_in_range[-1]))
+        if access_set_id is None:
+            access_set_id = self.repo.get_latest_access_set_id()
+
+        access_map: dict[str, str] = {}
+        if access_set_id is not None:
+            try:
+                rows = self.repo.get_access_rows(int(access_set_id))
+                for rr in rows:
+                    ch = self._norm_name(str(rr.get("channel") or ""))
+                    if not ch:
+                        continue
+                    vals = rr.get("values") or {}
+                    nums = []
+                    for v in vals.values():
+                        if v is None or str(v).strip() == "":
+                            continue
+                        try:
+                            nums.append(float(str(v).replace(",", ".")))
+                        except Exception:
+                            continue
+                    if nums:
+                        access_map[ch] = str(round(sum(nums) / len(nums), 2))
+                    else:
+                        access_map[ch] = "NA"
+            except Exception:
+                access_map = {}
+
+        # Birim sn fiyatları: yıl bazında çekilir, ay bazında kullanılır
+        # repo.get_channel_prices(year) -> {(channel_id, month): (dt, odt)}
+        price_maps: dict[int, Any] = {}
+        for yy in years_in_range or [rs.year]:
+            try:
+                price_maps[int(yy)] = self.repo.get_channel_prices(int(yy))
+            except Exception:
+                price_maps[int(yy)] = {}
+
+        channels = self.repo.list_channels(active_only=False)
+
+        # aralıkta kullanılan kanalları yakala (aktif değilse bile)
+        used_channels = set()
+        for r in rel_recs:
+            p = r.payload or {}
+            used_channels.add(self._norm_name(str(p.get("channel_name") or "")))
+        used_channels.discard("")
+
+        ch_by_norm: dict[str, dict[str, object]] = {}
+        for ch in channels:
+            ch_by_norm[self._norm_name(str(ch["name"]))] = ch
+
+        display_channels = []
+        for ch in channels:
+            if int(ch.get("is_active", 1)) == 1:
+                display_channels.append(ch)
+        for nm in sorted(used_channels):
+            if nm in ch_by_norm and ch_by_norm[nm] not in display_channels:
+                display_channels.append(ch_by_norm[nm])
+
+        # sayaçlar: (norm_channel, dt_odt, date) -> adet/saniye/bütçe
+        counts: dict[tuple[str, str, date], int] = {}
+        seconds: dict[tuple[str, str, date], float] = {}
+        budgets: dict[tuple[str, str, date], float] = {}
+
+        # hızlı index
+        date_set = set(dates)
+
+        for r in rel_recs:
+            p = r.payload or {}
+            channel_norm = self._norm_name(str(p.get("channel_name") or ""))
+            if not channel_norm:
+                continue
+
+            ch_obj = ch_by_norm.get(channel_norm)
+            ch_id_for_price = int(ch_obj["id"]) if ch_obj and ch_obj.get("id") is not None else None
+
+            code_defs = p.get("code_defs") or []
+            code_map = {
+                str(d.get("code") or "").strip().upper(): float(d.get("duration_sec") or 0)
+                for d in code_defs
+                if str(d.get("code") or "").strip()
+            }
+            if not code_map:
+                sc = str(p.get("spot_code") or "").strip().upper()
+                if sc:
+                    code_map[sc] = float(p.get("spot_duration_sec") or 0)
+
+            rid = int(getattr(r, "id", 0) or 0)
+            mmaps = cells_by_id_month.get(rid) or {}
+
+            for (yy, mm), cells in mmaps.items():
+                if not cells:
+                    continue
+                for k, v in (cells or {}).items():
+                    if not str(v or "").strip():
+                        continue
+                    try:
+                        row_idx_s, day_s = str(k).split(",")
+                        row_idx = int(row_idx_s)
+                        day = int(day_s)
+                    except Exception:
+                        continue
+
+                    try:
+                        dd = date(int(yy), int(mm), int(day))
+                    except Exception:
+                        continue
+
+                    if dd not in date_set:
+                        continue
+
+                    t0 = self._row_idx_to_time(row_idx)
+                    dt_odt = classify_dt_odt(t0)
+                    key = (channel_norm, dt_odt, dd)
+                    counts[key] = int(counts.get(key, 0)) + 1
+
+                    cell_code = str(v or "").strip().upper()
+                    dur = float(code_map.get(cell_code, 0.0))
+                    seconds[key] = float(seconds.get(key, 0.0)) + dur
+
+                    # bütçe: günün ayına göre fiyat uygula
+                    if ch_id_for_price is not None:
+                        pm = price_maps.get(int(dd.year), {}) or {}
+                        dtp, odtp = pm.get((int(ch_id_for_price), int(dd.month)), (0.0, 0.0))
+                        unit_price = float(dtp) if dt_odt == "DT" else float(odtp)
+                        budgets[key] = float(budgets.get(key, 0.0)) + (dur * unit_price)
+
+        # ay başlıkları
+        month_headers: list[str] = []
+        for (yy, mm) in months:
+            mname = self._MONTHS_TR[int(mm) - 1]
+            month_headers.append(f"{mname} Adet")
+            month_headers.append(f"{mname} Saniye")
+
+        rows_out: list[dict[str, Any]] = []
+
+        def _unit_price_display(ch_id: int, dtodt: str) -> str:
+            prices = []
+            for (yy, mm) in months:
+                pm = price_maps.get(int(yy), {}) or {}
+                dtp, odtp = pm.get((int(ch_id), int(mm)), (0.0, 0.0))
+                p = float(dtp) if dtodt == "DT" else float(odtp)
+                if p > 0:
+                    prices.append(round(p, 6))
+            if not prices:
+                return ""
+            uniq = sorted(list({p for p in prices}))
+            if len(uniq) == 1:
+                return uniq[0]
+            return "ÇOKLU"
+
+        for ch in sorted(display_channels, key=lambda x: str(x["name"]).lower()):
+            ch_name = str(ch["name"])
+            ch_norm = self._norm_name(ch_name)
+            ch_id = int(ch["id"])
+            dinlenme = access_map.get(ch_norm, "NA")
+
+            for dtodt in ("DT", "ODT"):
+                day_vals = []
+                day_secs = []
+                day_bud = []
+                for dd in dates:
+                    day_vals.append(int(counts.get((ch_norm, dtodt, dd), 0)))
+                    day_secs.append(float(seconds.get((ch_norm, dtodt, dd), 0.0)))
+                    day_bud.append(float(budgets.get((ch_norm, dtodt, dd), 0.0)))
+
+                # 0 -> boş
+                day_vals_display = ["" if v == 0 else v for v in day_vals]
+
+                # ay kolonları (adet/saniye)
+                month_cols: list[Any] = []
+                for (yy, mm) in months:
+                    idxs = [i for i, dd in enumerate(dates) if dd.year == yy and dd.month == mm]
+                    m_adet = int(sum(day_vals[i] for i in idxs))
+                    m_san = float(sum(day_secs[i] for i in idxs))
+                    month_cols.append("" if m_adet == 0 else m_adet)
+                    month_cols.append("" if m_san == 0 else m_san)
+
+                unit_disp = _unit_price_display(ch_id, dtodt)
+                total_budget = float(sum(day_bud))
+                rows_out.append(
+                    {
+                        "channel": ch_name,
+                        "publish_group": "",
+                        "dt_odt": dtodt,
+                        "dinlenme_orani": dinlenme,
+                        "days": day_vals_display,
+                        "month_cols": month_cols,
+                        "unit_price": unit_disp,
+                        "budget": "" if total_budget == 0 else total_budget,
+                    }
+                )
+
+        # Totals
+        total_day = [0 for _ in range(len(dates))]
+        total_month_cols: list[float] = [0.0 for _ in range(len(month_headers))]
+        total_budget = 0.0
+
+        for rr in rows_out:
+            for i, v in enumerate(rr.get("days") or []):
+                total_day[i] += int(v) if v not in ("", None) else 0
+
+            mc = rr.get("month_cols") or []
+            for i, v in enumerate(mc):
+                if v in ("", None):
+                    continue
+                try:
+                    total_month_cols[i] += float(v)
+                except Exception:
+                    continue
+
+            if rr.get("budget") not in ("", None):
+                total_budget += float(rr.get("budget"))
+
+        totals = {
+            "days": ["" if v == 0 else v for v in total_day],
+            "month_cols": [
+                "" if (i % 2 == 0 and int(v) == 0) or (i % 2 == 1 and float(v) == 0.0) else (int(v) if i % 2 == 0 else float(v))
+                for i, v in enumerate(total_month_cols)
+            ],
+            "budget": "" if total_budget == 0 else total_budget,
+        }
+
+        header = {
+            "agency": agency,
+            "advertiser": advertiser,
+            "product": product,
+            "plan_title": pt,
+            "reservation_no": reservation_no_display,
+            "period": f"{rs:%d.%m.%Y}-{re:%d.%m.%Y}",
+            "spot_len": spot_len,
+        }
+
+        return {
+            "header": header,
+            "start": rs,
+            "end": re,
+            "dates": dates,
+            "months": months,
+            "month_headers": month_headers,
+            "rows": rows_out,
+            "totals": totals,
+        }
+
+    def export_plan_ozet_range_excel(self, out_path, plan_title: str, start: date, end: date) -> None:
+        """Plan Özet ekranındaki aralık bazlı özetin Excel çıktısını üretir."""
+        from src.export.excel_exporter import export_plan_ozet_range
+        data = self.get_plan_ozet_range_data(plan_title, start, end)
+        export_plan_ozet_range(out_path, data)
 
     def get_plan_ozet_yearly_data(self, plan_title: str, year: int) -> dict[str, Any]:
         """Plan başlığı için seçilen yılın tamamını (Ocak-Aralık) tek bir özet olarak döndürür.
@@ -961,7 +1444,7 @@ class ReservationService:
             "year": year,
         }
 
-        template_path = Path(__file__).resolve().parents[2] / "assets" / "PLAN_OZET_TEMPLATE.xlsx"
+        template_path = Path(__file__).resolve().parents[2] / "assets" / "plan_ozet_template.xlsx"
 
         export_plan_ozet_yearly(
             out_path,

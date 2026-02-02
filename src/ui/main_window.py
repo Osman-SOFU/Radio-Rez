@@ -438,7 +438,9 @@ class MainWindow(QMainWindow):
             elif current_tab == "REZERVASYONLAR":
                 self.refresh_reservations_tab()
             elif current_tab == "PLAN ÖZET":
-                self._set_plan_ozet_period_from_latest(name)
+                # Plan özet dönemi rezervasyon ekranındaki tarih aralığından türetilir.
+                # Metot argümansız tasarlanmıştı; bazı çağrılarda yanlışlıkla parametre gönderiliyordu.
+                self._set_plan_ozet_period_from_latest()
                 self.refresh_plan_ozet()
             elif current_tab == "KOD TANIMI":
                 self.refresh_kod_tanimi()
@@ -756,8 +758,8 @@ class MainWindow(QMainWindow):
 
         Notlar:
         - Span modunda ekranda tek tabloda birden fazla ay görünebilir.
-        - DB kayıtları yine ay bazında bölünür (her ay + her kanal için ayrı kayıt),
-          böylece Plan Özet / filtreleme mantığı bozulmaz.
+        - DB'de *tek kayıt* (kanal başına 1 kayıt) tutulur; ay ay bölünmez.
+          Aylık raporlar/Plan Özet gibi ekranlar span kaydın ay kırılımlarını payload'dan okur.
         """
 
         if not self.service:
@@ -818,27 +820,50 @@ class MainWindow(QMainWindow):
             # Year bazlı fiyat haritaları cache'i
             price_maps: dict[int, dict[tuple[int, int], tuple[float, float]]] = {}
 
-            # Her ay için her kanal kaydı
+            # DB kayıtları
             created = []
-            for (yy, mm), matrix in sorted(month_matrices.items()):
-                # PlanningGrid returns month matrices as dicts of {"r,day": "CODE", ...}.
-                # Some legacy flows may wrap them as {"cells": {...}, "row_times": [...]}.
-                if isinstance(matrix, dict) and "cells" in matrix:
-                    cells = matrix.get("cells") or {}
-                else:
-                    cells = matrix or {}
 
-                # If there is nothing to save for this month, skip it.
-                if not any(str(v).strip() for v in cells.values()):
-                    continue
+            if span_mode:
+                # Span: DB'de kanal başına tek kayıt; ay ay bölme YOK.
+                span_month_matrices_db: dict[str, dict[str, str]] = {}
+                merged_cells: dict[str, str] = {}
 
-                if yy not in price_maps:
+                for (yy, mm), matrix in sorted(month_matrices.items()):
+                    # PlanningGrid returns month matrices as dicts of {"r,day": "CODE", ...}.
+                    # Some legacy flows may wrap them as {"cells": {...}, "row_times": [...]}.
+                    if isinstance(matrix, dict) and "cells" in matrix:
+                        cells = matrix.get("cells") or {}
+                    else:
+                        cells = matrix or {}
+
+                    if not any(str(v).strip() for v in cells.values()):
+                        continue
+
+                    span_month_matrices_db[f"{int(yy):04d}-{int(mm):02d}"] = dict(cells)
+
+                    # confirm() için çakışmasız (row,YYYYMMDD) key ile merge
+                    for k, v in cells.items():
+                        vv = str(v or "").strip()
+                        if not vv:
+                            continue
+                        try:
+                            row_s, day_s = str(k).split(",", 1)
+                            row_idx = int(row_s)
+                            day = int(day_s)
+                        except Exception:
+                            continue
+                        merged_cells[f"{row_idx},{int(yy):04d}{int(mm):02d}{int(day):02d}"] = vv
+
+                if not span_month_matrices_db:
+                    QMessageBox.information(self, "Bilgi", "Kaydedilecek bir hücre bulunamadı.")
+                    return
+
+                # Başlangıç yılındaki fiyat haritası (draft için)
+                if rs.year not in price_maps:
                     try:
-                        price_maps[yy] = self.repo.get_channel_prices(yy)
+                        price_maps[rs.year] = self.repo.get_channel_prices(rs.year)
                     except Exception:
-                        price_maps[yy] = {}
-
-                plan_date = date(yy, mm, 1)
+                        price_maps[rs.year] = {}
 
                 for ch_name in selected_channels:
                     ch = ch_by_norm.get(ch_name.strip().lower())
@@ -846,11 +871,11 @@ class MainWindow(QMainWindow):
                     dt_price = 0.0
                     odt_price = 0.0
                     if ch_id is not None:
-                        dt_price, odt_price = price_maps[yy].get((ch_id, int(mm)), (0.0, 0.0))
+                        dt_price, odt_price = price_maps[rs.year].get((ch_id, int(rs.month)), (0.0, 0.0))
 
                     draft = ReservationDraft(
                         advertiser_name=self.in_advertiser.text().strip(),
-                        plan_date=plan_date,
+                        plan_date=rs,  # referans tarih: aralığın başlangıcı
                         spot_time=spot_t,
                         channel_name=ch_name,
                         channel_price_dt=float(dt_price),
@@ -866,19 +891,77 @@ class MainWindow(QMainWindow):
                         code_defs=code_defs,
                     )
 
-                    confirmed = self.service.confirm(draft, cells)
-                    # DB'ye yaz
+                    confirmed = self.service.confirm(draft, merged_cells)
+
+                    payload2 = dict(confirmed.payload or {})
+                    payload2["reservation_no"] = None  # create_reservation dolduracak
+                    payload2["created_at"] = None
+                    payload2["is_span"] = True
+                    payload2["span_start"] = rs.isoformat()
+                    payload2["span_end"] = re.isoformat()
+                    payload2["span_month_matrices"] = span_month_matrices_db
+
                     dbrec = self.repo.create_reservation(
-                        advertiser_name=str(confirmed.payload.get("advertiser_name") or "").strip(),
-                        payload=confirmed.payload,
+                        advertiser_name=str(payload2.get("advertiser_name") or "").strip(),
+                        payload=payload2,
                         confirmed=True,
                     )
                     created.append(dbrec)
 
-                    # Excel çıktısı:
-                    # - Span modunda ay ay dosya üretmek yerine, aralığı tek dosyada toplayacağız.
-                    # - Month modunda eski davranış devam.
-                    if not span_mode:
+            else:
+                # Month: eski davranış (ay + kanal bazlı kayıt)
+                for (yy, mm), matrix in sorted(month_matrices.items()):
+                    if isinstance(matrix, dict) and "cells" in matrix:
+                        cells = matrix.get("cells") or {}
+                    else:
+                        cells = matrix or {}
+
+                    if not any(str(v).strip() for v in cells.values()):
+                        continue
+
+                    if yy not in price_maps:
+                        try:
+                            price_maps[yy] = self.repo.get_channel_prices(yy)
+                        except Exception:
+                            price_maps[yy] = {}
+
+                    plan_date = date(yy, mm, 1)
+
+                    for ch_name in selected_channels:
+                        ch = ch_by_norm.get(ch_name.strip().lower())
+                        ch_id = int(ch.get("id")) if ch else None
+                        dt_price = 0.0
+                        odt_price = 0.0
+                        if ch_id is not None:
+                            dt_price, odt_price = price_maps[yy].get((ch_id, int(mm)), (0.0, 0.0))
+
+                        draft = ReservationDraft(
+                            advertiser_name=self.in_advertiser.text().strip(),
+                            plan_date=plan_date,
+                            spot_time=spot_t,
+                            channel_name=ch_name,
+                            channel_price_dt=float(dt_price),
+                            channel_price_odt=float(odt_price),
+                            agency_name=self.in_agency.text().strip(),
+                            product_name=self.in_product.text().strip(),
+                            plan_title=plan_title,
+                            spot_code=self.in_spot_code.text().strip(),
+                            spot_duration_sec=int(self.in_spot_duration.value()),
+                            code_definition=self.in_code_definition.text().strip(),
+                            note_text=self.in_note.text().strip(),
+                            prepared_by_name=self.in_prepared_by.text().strip(),
+                            code_defs=code_defs,
+                        )
+
+                        confirmed = self.service.confirm(draft, cells)
+                        dbrec = self.repo.create_reservation(
+                            advertiser_name=str(confirmed.payload.get("advertiser_name") or "").strip(),
+                            payload=confirmed.payload,
+                            confirmed=True,
+                        )
+                        created.append(dbrec)
+
+                        # Month modunda eski tek dosya davranışı:
                         try:
                             from src.export.excel_exporter import export_excel
 
@@ -896,75 +979,17 @@ class MainWindow(QMainWindow):
                 return
 
             # Span modunda: seçili tarih aralığına göre *tek dosya* rezervasyon çıktısı üret.
+            # Export: Span modunda tek dosya (çok sheet) + kanal bazında ayrı dosya
             if span_mode:
                 try:
                     from src.export.excel_exporter import export_excel_span
 
-                    # Güvenli dosya adı
-                    def _safe_name(s: str) -> str:
-                        s = "".join(ch if ch.isalnum() or ch in (" ", "-", "_", ".") else "_" for ch in (s or ""))
-                        s = "_".join(s.strip().split())
-                        return s[:120] if s else "RESERVATION"
-
-                    # Kanal bazında tek rezervasyon no: DB'de ay ay kayıt açıldığı için bir kanala
-                    # birden fazla reservation_no oluşur. Kullanıcı kanal çıktısında tek no görmek
-                    # istediğinden, aynı kanal için oluşan ilk reservation_no'yu kullanacağız.
-                    first_res_no_by_channel: dict[str, str] = {}
                     for r in created:
-                        try:
-                            p = r.payload or {}
-                            chn = str(p.get("channel_name") or "").strip()
-                            if not chn:
-                                continue
-                            if chn not in first_res_no_by_channel:
-                                first_res_no_by_channel[chn] = str(getattr(r, "reservation_no", "") or "").strip()
-                        except Exception:
-                            continue
+                        payload_span = dict(getattr(r, "payload", {}) or {})
+                        payload_span["reservation_no"] = str(getattr(r, "reservation_no", "") or "").strip()
+                        payload_span["created_at"] = getattr(r, "created_at", None)
 
-                    # Bir dosya / kanal
-                    for ch_name in selected_channels:
-                        # fiyatlar: span başlangıç ayına göre (AO sütunu satır bazında tek fiyat olduğu için)
-                        dt_price = 0.0
-                        odt_price = 0.0
-                        try:
-                            yy0, mm0 = rs.year, rs.month
-                            if yy0 not in price_maps:
-                                price_maps[yy0] = self.repo.get_channel_prices(yy0)
-                            ch = ch_by_norm.get(ch_name.strip().lower())
-                            ch_id = int(ch.get("id")) if ch else None
-                            if ch_id is not None:
-                                dt_price, odt_price = price_maps[yy0].get((ch_id, int(mm0)), (0.0, 0.0))
-                        except Exception:
-                            pass
-
-                        payload_span = {
-                            "agency_name": self.in_agency.text().strip(),
-                            "advertiser_name": self.in_advertiser.text().strip(),
-                            "product_name": self.in_product.text().strip(),
-                            "plan_title": plan_title,
-                            "reservation_no": first_res_no_by_channel.get(ch_name, ""),
-                            "spot_code": self.in_spot_code.text().strip(),
-                            "spot_duration_sec": int(self.in_spot_duration.value()),
-                            "code_definition": self.in_code_definition.text().strip(),
-                            "code_defs": code_defs,
-                            "note_text": self.in_note.text().strip(),
-                            "prepared_by": self.in_prepared_by.text().strip(),
-                            "channel_name": ch_name,
-                            "channel_price_dt": float(dt_price),
-                            "channel_price_odt": float(odt_price),
-                        }
-
-                        # Dinlenme Oranı: erişim örneğinden kanal bazlı saatlik map
-                        # (yoksa exporter zaten NA basar)
-                        try:
-                            payload_span["access_hour_map"] = self.service._get_access_hour_map_for_channel(
-                                channel_name=ch_name,
-                                year=rs.year,
-                            )
-                        except Exception:
-                            payload_span["access_hour_map"] = {}
-
-                        fname = f"{_safe_name(plan_title)}__{_safe_name(ch_name)}__{rs:%Y%m%d}-{re:%Y%m%d}.xlsx"
+                        fname = f"{payload_span['reservation_no']}.xlsx"
                         out_path = out_dir / fname
                         export_excel_span(
                             template_path=template_path,
@@ -977,12 +1002,6 @@ class MainWindow(QMainWindow):
                         out_paths.append(out_path)
                 except Exception as exs:
                     export_failures.append(f"SPAN_EXPORT: {exs}")
-
-            # UI refresh
-            self.refresh_reservations_tab()
-            # Plan özet sekmesi fonksiyonu projede refresh_plan_ozet() olarak geçiyor.
-            self.refresh_plan_ozet()
-            self.refresh_kod_tanimi()  # alias: refresh_code_def_tab
 
             QMessageBox.information(
                 self,
@@ -1188,7 +1207,7 @@ class MainWindow(QMainWindow):
         elif tab_name == "SPOTLİST+":
             self.refresh_spotlist()
         elif tab_name == "PLAN ÖZET":
-            self._set_plan_ozet_period_from_latest(self.in_plan_title.text())
+            self._set_plan_ozet_period_from_latest()
             self.refresh_plan_ozet()
         elif tab_name == "Fiyat ve Kanal Tanımı":
             self.refresh_price_channel_tab()
@@ -2059,33 +2078,57 @@ class MainWindow(QMainWindow):
         self.po_month.currentIndexChanged.connect(lambda *_: self.refresh_plan_ozet())
         self.po_table.cellChanged.connect(self._po_on_cell_changed)
 
-    def _set_plan_ozet_period_from_latest(self, plan_title: str) -> None:
-        """Reklamveren seçilince plan özetin yıl/ayını en son rezervasyona göre ayarla."""
-        pt = (plan_title or "").strip()
-        if not pt or not getattr(self, "repo", None):
-            return
+    def _set_plan_ozet_period_from_latest(self, *_args, **_kwargs) -> None:
+        """Plan Özet üstündeki 'Dönemi' alanını rezervasyon tabındaki tarih aralığına göre doldurur.
+
+        Not: Geçmişte bazı yerlerde bu metoda yanlışlıkla parametre gönderilmişti.
+        Güvenli olması için *args/**kwargs kabul ediyor.
+        """
+        # Öncelik: Rezervasyon tabındaki tarih aralığı (widget'lar mevcutsa)
+        rs = None
+        re_ = None
         try:
-            recs = self.repo.list_confirmed_reservations_by_plan_title(pt, limit=1)
-            if not recs:
-                return
-            p = recs[0].payload or {}
-            dstr = p.get("plan_date")
-            if not dstr:
-                return
-            d = datetime.fromisoformat(str(dstr)).date()
-            self.po_year.blockSignals(True)
-            self.po_month.blockSignals(True)
-            self.po_year.setValue(d.year)
-            # 0: TÜMÜ olduğu için ay index'i +1 offset
-            self.po_month.setCurrentIndex(d.month)
+            if hasattr(self, "in_range_start") and hasattr(self, "in_range_end"):
+                qd1 = self.in_range_start.date()
+                qd2 = self.in_range_end.date()
+                rs = date(qd1.year(), qd1.month(), qd1.day())
+                re_ = date(qd2.year(), qd2.month(), qd2.day())
         except Exception:
-            pass
-        finally:
+            rs = None
+            re_ = None
+
+        # İkinci öncelik: daha önce uygulanan aralık
+        if rs is None or re_ is None:
+            rs = getattr(self, "_home_range_start", None)
+            re_ = getattr(self, "_home_range_end", None)
+
+        # Son çare: Plan Özet yıl/ay seçicileri
+        if rs is None or re_ is None:
             try:
-                self.po_year.blockSignals(False)
-                self.po_month.blockSignals(False)
+                y = int(self.po_year.value())
+                m_ix = int(self.po_month.currentIndex()) if hasattr(self, "po_month") else 0
+                if m_ix <= 0:
+                    rs = date(y, 1, 1)
+                    re_ = date(y, 12, 31)
+                else:
+                    rs = date(y, m_ix, 1)
+                    if m_ix == 12:
+                        re_ = date(y + 1, 1, 1) - timedelta(days=1)
+                    else:
+                        re_ = date(y, m_ix + 1, 1) - timedelta(days=1)
             except Exception:
-                pass
+                rs = None
+                re_ = None
+
+        # UI
+        if hasattr(self, "po_period"):
+            if rs is None or re_ is None:
+                self.po_period.setText("")
+            else:
+                # ayrıca sakla (Plan Özet / Excel export aynı aralığı kullansın)
+                self._home_range_start = rs
+                self._home_range_end = re_
+                self.po_period.setText(f"{rs:%d.%m.%Y}-{re_:%d.%m.%Y}")
 
     def _po_on_cell_changed(self, row: int, col: int) -> None:
         """Yayın grubu tek yerden girilsin diye aynı kanalın DT/ODT satırlarını senkron tut."""
@@ -2122,169 +2165,134 @@ class MainWindow(QMainWindow):
             self._po_syncing = False
 
     def refresh_plan_ozet(self) -> None:
-        if not getattr(self, "service", None):
-            return
-        pt = (self.in_plan_title.text() or "").strip()
-        if not pt:
+        """Plan Özet tablosunu tarih aralığına göre (tek tip) yeniler."""
+        if not hasattr(self, "po_table"):
             return
 
-        yy = int(self.po_year.value())
-        idx = int(self.po_month.currentIndex())
-        # 0: TÜMÜ (yıllık). Diğerleri 1..12 ay numarası olacak şekilde.
-        mm = 0 if idx == 0 else idx
+        pt = (self.in_plan_title.text() or "").strip() if hasattr(self, "in_plan_title") else ""
+
+        # Plan Özet'in dönemi her zaman rezervasyon aralığına bağlı.
+        # Kullanıcı aralık seçip "Aralığı Uygula"'ya basmasa bile, rezervasyon tabındaki
+        # tarih editörlerinden güncel aralığı çekiyoruz.
+        try:
+            self._set_plan_ozet_period_from_latest()
+        except Exception:
+            pass
+
+        rs = getattr(self, "_home_range_start", None)
+        re_ = getattr(self, "_home_range_end", None)
+
+        if not pt or rs is None or re_ is None:
+            # tabloyu temizle
+            self.po_table.setRowCount(0)
+            self.po_table.setColumnCount(0)
+            if hasattr(self, "po_period"):
+                self.po_period.setText("")
+            return
 
         try:
-            if mm == 0:
-                data = self.service.get_plan_ozet_yearly_data(pt, yy)
-            else:
-                data = self.service.get_plan_ozet_data(pt, yy, mm)
-            header = data.get("header") or {}
-            rows = data.get("rows") or []
-            days = int(data.get("days") or 0)
-
-            # Header alanları
-            self.po_agency.setText(str(header.get("agency", "") or ""))
-            self.po_advertiser.setText(str(header.get("advertiser", "") or ""))
-            self.po_product.setText(str(header.get("product", "") or ""))
-            self.po_plan_title.setText(str(header.get("plan_title", "") or ""))
-            self.po_resno.setPlainText(str(header.get("reservation_no", "") or ""))
-            self.po_period.setText(str(header.get("period", "") or ""))
-            sl = header.get("spot_len", 0) or 0
-            try:
-                sl = float(sl)
-                self.po_spot_len.setText("" if sl == 0 else f"{sl:.2f}")
-            except Exception:
-                self.po_spot_len.setText(str(sl))
-
-            month_name = str(header.get("month_name", "") or "")
-
-            # Kolonlar
-            base_headers = ["KANAL", "YAYIN GRUBU", "DT/ODT", "DİNLENME ORANI"]
-            if mm == 0:
-                # Yıllık görünüm: gün bazlı kolonlar yok
-                tail_headers = [
-                    "Yıl Adet",
-                    "Yıl Saniye",
-                    "Birim sn. (TL)",
-                    "Toplam Bütçe Net TL",
-                ]
-                headers = base_headers + tail_headers
-            else:
-                day_headers = [str(i) for i in range(1, days + 1)]
-                tail_headers = [
-                    f"{month_name} Adet" if month_name else "Ay Adet",
-                    f"{month_name} Saniye" if month_name else "Ay Saniye",
-                    "Birim sn. (TL)",
-                    "Toplam Bütçe Net TL",
-                ]
-                headers = base_headers + day_headers + tail_headers
-
-            self.po_table.blockSignals(True)
-            self.po_table.clear()
-            self.po_table.setColumnCount(len(headers))
-            self.po_table.setHorizontalHeaderLabels(headers)
-
-            totals = data.get("totals") or {}
-            total_rows = len(rows) + 1  # + toplam satırı
-            self.po_table.setRowCount(total_rows)
-
-            def _fmt(v):
-                if v in (None, ""):
-                    return ""
-                try:
-                    f = float(v)
-                    if abs(f - int(f)) < 1e-9:
-                        return str(int(f))
-                    return f"{f:.2f}"
-                except Exception:
-                    return str(v)
-
-            # Data satırları
-            for r_i, rr in enumerate(rows):
-                # Kanal
-                it0 = QTableWidgetItem(str(rr.get("channel", "") or ""))
-                it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)
-                self.po_table.setItem(r_i, 0, it0)
-
-                # Yayın grubu (editable)
-                it1 = QTableWidgetItem(str(rr.get("publish_group", "") or ""))
-                self.po_table.setItem(r_i, 1, it1)
-
-                # DT/ODT
-                it2 = QTableWidgetItem(str(rr.get("dt_odt", "") or ""))
-                it2.setFlags(it2.flags() & ~Qt.ItemIsEditable)
-                self.po_table.setItem(r_i, 2, it2)
-
-                # Dinlenme oranı
-                it3 = QTableWidgetItem(str(rr.get("dinlenme_orani", "") or "NA"))
-                it3.setFlags(it3.flags() & ~Qt.ItemIsEditable)
-                self.po_table.setItem(r_i, 3, it3)
-
-                # Günler
-                day_vals = rr.get("days") or []
-                for di in range(days):
-                    v = day_vals[di] if di < len(day_vals) else ""
-                    it = QTableWidgetItem(_fmt(v))
-                    it.setTextAlignment(Qt.AlignCenter)
-                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                    self.po_table.setItem(r_i, 4 + di, it)
-
-                # Ay toplamları
-                base = 4 + days
-                if mm == 0:
-                    tail = [rr.get("year_adet"), rr.get("year_saniye"), rr.get("unit_price"), rr.get("budget")]
-                else:
-                    tail = [rr.get("month_adet"), rr.get("month_saniye"), rr.get("unit_price"), rr.get("budget")]
-                for j, v in enumerate(tail):
-                    it = QTableWidgetItem(_fmt(v))
-                    it.setTextAlignment(Qt.AlignCenter)
-                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                    self.po_table.setItem(r_i, base + j, it)
-
-            # Toplam satırı
-            t_row = len(rows)
-            bold = QFont(); bold.setBold(True)
-
-            it_t0 = QTableWidgetItem("Toplam")
-            it_t0.setFont(bold)
-            it_t0.setFlags(it_t0.flags() & ~Qt.ItemIsEditable)
-            self.po_table.setItem(t_row, 0, it_t0)
-
-            # boş publish group / dtodt / dinlenme
-            for c in (1, 2, 3):
-                it = QTableWidgetItem("")
-                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                self.po_table.setItem(t_row, c, it)
-
-            t_days = totals.get("days") or []
-            for di in range(days):
-                v = t_days[di] if di < len(t_days) else ""
-                it = QTableWidgetItem(_fmt(v))
-                it.setFont(bold)
-                it.setTextAlignment(Qt.AlignCenter)
-                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                self.po_table.setItem(t_row, 4 + di, it)
-
-            base = 4 + days
-            if mm == 0:
-                tail = [totals.get("year_adet"), totals.get("year_saniye"), "", totals.get("budget")]
-            else:
-                tail = [totals.get("month_adet"), totals.get("month_saniye"), "", totals.get("budget")]
-            for j, v in enumerate(tail):
-                it = QTableWidgetItem(_fmt(v))
-                it.setFont(bold)
-                it.setTextAlignment(Qt.AlignCenter)
-                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                self.po_table.setItem(t_row, base + j, it)
-
-            self.po_table.resizeColumnsToContents()
+            data = self.service.get_plan_ozet_range_data(pt, rs, re_)
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
+            return
+
+        header = data.get("header") or {}
+        rows = data.get("rows") or []
+        totals = data.get("totals") or {}
+        dates = data.get("dates") or []
+        months = data.get("months") or []
+
+        if hasattr(self, "po_period"):
+            self.po_period.setText(str(header.get("period", "") or ""))
+
+        # Gün başlıkları: Pş / Çr dahil
+        TR_DOW_UI = ["Pt", "Sa", "Çr", "Pş", "Cu", "Ct", "Pa"]
+        day_headers = [f"{TR_DOW_UI[d.weekday()]}\n{d:%d.%m}" for d in dates]
+
+        # Ay başlıkları
+        MONTHS_TR = ["OCAK","ŞUBAT","MART","NİSAN","MAYIS","HAZİRAN","TEMMUZ","AĞUSTOS","EYLÜL","EKİM","KASIM","ARALIK"]
+        month_headers = []
+        for (yy, mm) in months:
+            mn = MONTHS_TR[int(mm) - 1]
+            month_headers.append(f"{mn} Adet")
+            month_headers.append(f"{mn} Saniye")
+
+        headers = ["Kanal", "Yayın Grubu", "DT/ODT", "Dinlenme Oranı"] + day_headers + month_headers + ["Birim sn. (TL)", "Toplam Bütçe\nNet TL"]
+
+        self.po_table.blockSignals(True)
+        try:
+            self.po_table.setColumnCount(len(headers))
+            self.po_table.setHorizontalHeaderLabels(headers)
+            self.po_table.setRowCount(len(rows) + 1)  # +Toplam
+            self.po_table.verticalHeader().setVisible(False)
+
+            def _item(val, editable: bool = False) -> QTableWidgetItem:
+                it = QTableWidgetItem("" if val is None else str(val))
+                if not editable:
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                return it
+
+            # satırlar
+            for r_i, rr in enumerate(rows):
+                self.po_table.setItem(r_i, 0, _item(rr.get("channel", "")))
+                # yayın grubu editable
+                pg_it = QTableWidgetItem(str(rr.get("publish_group", "") or ""))
+                self.po_table.setItem(r_i, 1, pg_it)
+
+                self.po_table.setItem(r_i, 2, _item(rr.get("dt_odt", "")))
+                self.po_table.setItem(r_i, 3, _item(rr.get("dinlenme_orani", "NA")))
+
+                # günler
+                day_vals = rr.get("days") or []
+                base = 4
+                for j in range(len(day_headers)):
+                    v = day_vals[j] if j < len(day_vals) else ""
+                    self.po_table.setItem(r_i, base + j, _item("" if v in ("", None) else v))
+
+                # ay kolonları
+                mcols = rr.get("month_cols") or []
+                mbase = base + len(day_headers)
+                for j in range(len(month_headers)):
+                    v = mcols[j] if j < len(mcols) else ""
+                    self.po_table.setItem(r_i, mbase + j, _item("" if v in ("", None) else v))
+
+                # unit + budget
+                ucol = mbase + len(month_headers)
+                bcol = ucol + 1
+                self.po_table.setItem(r_i, ucol, _item("" if rr.get("unit_price", "") in ("", None) else rr.get("unit_price")))
+                self.po_table.setItem(r_i, bcol, _item("" if rr.get("budget", "") in ("", None) else rr.get("budget")))
+
+            # toplam satırı
+            tr = len(rows)
+            self.po_table.setItem(tr, 0, _item("Toplam"))
+            self.po_table.setItem(tr, 1, _item(""))
+            self.po_table.setItem(tr, 2, _item(""))
+            self.po_table.setItem(tr, 3, _item(""))
+
+            tdays = totals.get("days") or []
+            base = 4
+            for j in range(len(day_headers)):
+                v = tdays[j] if j < len(tdays) else ""
+                self.po_table.setItem(tr, base + j, _item("" if v in ("", None) else v))
+
+            tm = totals.get("month_cols") or []
+            mbase = base + len(day_headers)
+            for j in range(len(month_headers)):
+                v = tm[j] if j < len(tm) else ""
+                self.po_table.setItem(tr, mbase + j, _item("" if v in ("", None) else v))
+
+            ucol = mbase + len(month_headers)
+            bcol = ucol + 1
+            self.po_table.setItem(tr, ucol, _item(""))
+            self.po_table.setItem(tr, bcol, _item("" if totals.get("budget", "") in ("", None) else totals.get("budget")))
+
         finally:
-            try:
-                self.po_table.blockSignals(False)
-            except Exception:
-                pass
+            self.po_table.blockSignals(False)
+
+        try:
+            self.po_table.resizeColumnsToContents()
+        except Exception:
+            pass
 
     def export_plan_ozet_excel(self) -> None:
         if not getattr(self, "service", None):
@@ -2293,16 +2301,15 @@ class MainWindow(QMainWindow):
         if not pt:
             return
 
-        yy = int(self.po_year.value())
-        idx = int(self.po_month.currentIndex())
-        mm = 0 if idx == 0 else idx
+        rs = getattr(self, "_home_range_start", None)
+        re_ = getattr(self, "_home_range_end", None)
+        if rs is None or re_ is None:
+            return
 
-        if mm == 0:
-            default_name = f"PLAN_OZET_{pt}_{yy}_YILLIK.xlsx"
-        else:
-            default_name = f"PLAN_OZET_{pt}_{yy}_{mm:02d}.xlsx"
         out_dir = self.app_settings.data_dir / "exports"
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        default_name = f"PLAN_OZET_{pt}_{rs:%Y%m%d}_{re_:%Y%m%d}.xlsx"
         default_path = str((out_dir / default_name).resolve())
 
         path, _ = QFileDialog.getSaveFileName(
@@ -2315,14 +2322,10 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            if mm == 0:
-                self.service.export_plan_ozet_yearly_excel(path, pt, yy)
-            else:
-                self.service.export_plan_ozet_excel(path, pt, yy, mm)
+            self.service.export_plan_ozet_range_excel(path, pt, rs, re_)
             QMessageBox.information(self, "OK", f"Excel çıktısı oluşturuldu:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
-
 
     def _build_kod_tanimi_tab(self) -> None:
         tab = self.tab_widgets["KOD TANIMI"]
@@ -3073,4 +3076,3 @@ class MainWindow(QMainWindow):
                 it = QTableWidgetItem("" if v is None else str(v))
                 it.setTextAlignment(Qt.AlignCenter)
                 self.access_table.setItem(i, col_idx, it)
-
