@@ -86,20 +86,28 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     )
 
     # --- Header labels + values ---
+    # Şablonda etiketler A sütununda, değerler B sütununda.
     ws["A1"].value = "Ajans:"
-    ws["C1"].value = str(payload.get("agency_name", "")).strip()
+    ws["B1"].value = str(payload.get("agency_name", "")).strip()
 
     ws["A2"].value = "Reklam Veren:"
-    ws["C2"].value = str(payload.get("advertiser_name", "")).strip()
+    ws["B2"].value = str(payload.get("advertiser_name", "")).strip()
 
     ws["A3"].value = "Ürün:"
-    ws["C3"].value = str(payload.get("product_name", "")).strip()
+    ws["B3"].value = str(payload.get("product_name", "")).strip()
 
     ws["A4"].value = "Plan Başlığı:"
-    ws["C4"].value = str(payload.get("plan_title", "")).strip()
+    ws["B4"].value = str(payload.get("plan_title", "")).strip()
 
     ws["A5"].value = "Rezervasyon No:"
-    ws["C5"].value = str(payload.get("reservation_no", "")).strip()
+    ws["B5"].value = str(payload.get("reservation_no", "")).strip()
+
+    # eski şablonlardan kalma değerler iki kere görünmesin
+    for addr in ("C1", "C2", "C3", "C4", "C5"):
+        try:
+            ws[addr].value = None
+        except Exception:
+            pass
     
     # --- Header label font fix (A4/A5/A6 da A1 gibi kalın olsun) ---
     hdr_font = copy(ws["A1"].font)
@@ -118,7 +126,13 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
             period = ""
 
     ws["A6"].value = "Dönemi:"
-    ws["C6"].value = period
+    ws["B6"].value = period
+    # eski şablonlarda C6/D6 dolu olabilir; iki kere yazmasın
+    for addr in ("C6", "D6"):
+        try:
+            ws[addr].value = None
+        except Exception:
+            pass
 
     # --- Ay/Gün başlıklarını plan_date'e göre düzelt + hafta sonu sütunlarını boyala ---
     plan_date = str(payload.get("plan_date", "")).strip()  # "YYYY-MM-DD"
@@ -356,30 +370,89 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
         print("[DEBUG] logo add FAILED:", repr(e))
         pass
 
-    # --- Değiştirilebilir alt alanlar ---
-    if payload.get("spot_code") is not None:
-        ws["A67"].value = str(payload.get("spot_code", "")).strip()
+    # --- Alt alanlar (Kod listesi + süre hesabı) ---
+    # Ajans komisyon oranı (%): şirket/ajansa göre değişebilir.
+    try:
+        rate = float(payload.get("agency_commission_pct"))
+    except Exception:
+        rate = 10.0
+    try:
+        ws["AN62"].value = f"Ajans Komisyonu % {int(rate) if float(rate).is_integer() else rate}"
+        ws["AR62"].value = f"=(AR61*{rate}/100)"
+    except Exception:
+        pass
 
-    # B67: süre (sn)
-    dur_val = payload.get("spot_duration_sec", None)
-    if dur_val is None:
-        # geriye dönük uyumluluk
-        dur_val = payload.get("spot_duration", None)
-    if dur_val is not None:
+    # Kullanılan kodları grid'den topla (D8:AH59)
+    used: dict[str, int] = {}
+    for r in range(8, 60):
+        for c in range(4, 4 + 31):
+            v = ws.cell(row=r, column=c).value
+            code = str(v or "").strip().upper()
+            if not code:
+                continue
+            used[code] = used.get(code, 0) + 1
+
+    # Kod tanımları map: code -> {sn, desc}
+    code_defs = payload.get("code_defs") or []
+    code_map: dict[str, dict] = {}
+    for d in code_defs:
         try:
-            ws["C67"].value = int(dur_val)
+            c = str(d.get("code") or "").strip().upper()
+            if not c:
+                continue
+            code_map[c] = {"sn": int(d.get("duration_sec") or 0), "desc": str(d.get("desc") or "").strip()}
         except Exception:
-            pass
+            continue
+    if not code_map:
+        sc = str(payload.get("spot_code") or "").strip().upper()
+        if sc:
+            code_map[sc] = {"sn": int(payload.get("spot_duration_sec") or 0), "desc": str(payload.get("code_definition") or "").strip()}
 
-    # F67: AH60'daki toplam mantığı -> plan_cells dolu sayısı (parantez içinde)
-    adet_total = payload.get("adet_total")
-    if adet_total is None:
-        adet_total = sum(1 for v in (plan_cells or {}).values() if str(v).strip())
-    ws["F67"].value = f"({int(adet_total)})"
+    # Kod tablosu alanını temizle ve doldur (A67: Kod, C67: Süre, D67: Açıklama)
+    start_row = 67
+    max_rows = 8
+    for i in range(max_rows):
+        rr = start_row + i
+        for addr in (f"A{rr}", f"C{rr}", f"D{rr}", f"G{rr}"):
+            try:
+                ws[addr].value = None
+            except Exception:
+                pass
 
-    # D67: Kod Tanımı
-    code_def = str(payload.get("code_definition", "")).strip()
-    ws["D67"].value = code_def if code_def else None
+    ordered: list[str] = []
+    for d in code_defs:
+        c = str(d.get("code") or "").strip().upper()
+        if c and c in used and c not in ordered:
+            ordered.append(c)
+    for c in sorted(used.keys()):
+        if c not in ordered:
+            ordered.append(c)
+
+    ordered = ordered[:max_rows]
+    for i, c in enumerate(ordered):
+        rr = start_row + i
+        dd = code_map.get(c) or {}
+        ws[f"A{rr}"].value = c
+        ws[f"C{rr}"].value = int(dd.get("sn") or 0)
+        ws[f"D{rr}"].value = str(dd.get("desc") or "")
+
+    # Toplam adet göstergesi (şablonda G67)
+    try:
+        ws["G67"].value = f"({sum(used.values())})" if used else "(0)"
+    except Exception:
+        pass
+
+    # AM sütunu (Bedelli Süre): hücredeki koda göre saniye lookup
+    if ordered:
+        last_row = start_row + len(ordered) - 1
+        tbl_rng = f"$A${start_row}:$C${last_row}"
+        cols = [get_column_letter(4 + i) for i in range(31)]  # D..AH
+        for r in range(8, 60):
+            parts = [f"IFERROR(VLOOKUP({col}{r},{tbl_rng},3,FALSE),0)" for col in cols]
+            ws[f"AM{r}"].value = f"=SUM({','.join(parts)})"
+    else:
+        for r in range(8, 60):
+            ws[f"AM{r}"].value = 0
 
     # NOT: sabit, içerik değişebilir
     note = str(payload.get("note_text", "")).strip()
@@ -945,8 +1018,12 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
         ws["B5"] = _get(payload, "reservation_no")
 
         period_txt = f"{span_start:%d.%m.%Y} - {span_end:%d.%m.%Y}"
-        ws["D6"] = period_txt
-        ws["B6"] = period_txt  # geri uyumluluk
+        # Şablonda dönem B6'dadır. D6'ya yazınca çıktı içinde "dönem" iki kere görünüyor.
+        ws["B6"] = period_txt
+        try:
+            ws["D6"].value = None
+        except Exception:
+            pass
 
         ch = _get(payload, "channel_name", "channel")
         if ch:
@@ -960,6 +1037,8 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
 
     def _fill_rates(ws):
         usd = payload.get("usd_rate")
+        if usd is None:
+            usd = payload.get("dolar_kuru", payload.get("dolar", None))
         if usd is None:
             usd = 2  # default as per your examples
         for r in range(8, 60):
@@ -980,7 +1059,114 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
                 # get code from month_matrices
                 mm = month_matrices.get((dt_.year, dt_.month), {}) or {}
                 code = mm.get(f"{row_idx},{dt_.day}", "")
-                ws.cell(row=excel_row, column=4 + col_idx).value = code
+                ws.cell(row=excel_row, column=4 + col_idx).value = (str(code).strip().upper() if str(code).strip() else "")
+
+    def _apply_commission(ws):
+        # Ajans komisyon oranı değişken: %0/%5/%10/... (UI'dan gelecek)
+        rate = payload.get("agency_commission_pct")
+        try:
+            rate = float(rate)
+        except Exception:
+            rate = 10.0
+        # Etiket + formül
+        try:
+            ws["AN62"].value = f"Ajans Komisyonu % {int(rate) if float(rate).is_integer() else rate}"
+        except Exception:
+            pass
+        try:
+            ws["AR62"].value = f"=(AR61*{rate}/100)"
+        except Exception:
+            pass
+
+    def _fill_code_table_and_duration_formulas(ws):
+        """Kod tablosunu (A67:C?) doldur ve AM8:AM59 'Bedelli Süre' formüllerini
+        hücredeki koda göre saniye lookup yapacak şekilde güncelle.
+
+        Şablondaki eski mantık: AMr = AIr * $C$67 (tek bir ortalama süre)
+        Yeni mantık: AMr = SUM( VLOOKUP(D..AH, kod->sn tablosu) )
+        """
+        # 1) Grid'deki kullanılan kodları topla
+        used: dict[str, int] = {}
+        for r in range(8, 60):
+            for c in range(4, 4 + 31):  # D..AH
+                v = ws.cell(row=r, column=c).value
+                code = str(v or "").strip().upper()
+                if not code:
+                    continue
+                used[code] = used.get(code, 0) + 1
+
+        # 2) Kod tanımlarından map oluştur (desc + sn)
+        code_defs = payload.get("code_defs") or []
+        code_map: dict[str, dict] = {}
+        for d in code_defs:
+            try:
+                c = str(d.get("code") or "").strip().upper()
+                if not c:
+                    continue
+                code_map[c] = {
+                    "sn": int(d.get("duration_sec") or 0),
+                    "desc": str(d.get("desc") or "").strip(),
+                }
+            except Exception:
+                continue
+        # geri uyumluluk
+        if not code_map:
+            sc = str(payload.get("spot_code") or "").strip().upper()
+            if sc:
+                code_map[sc] = {
+                    "sn": int(payload.get("spot_duration_sec") or 0),
+                    "desc": str(payload.get("code_definition") or "").strip(),
+                }
+
+        # 3) Tabloyu doldur (A67: Kod, C67: Süre, D67: Açıklama)
+        start_row = 67
+        max_rows = 8  # şablonda alan kısıtlı; gerekirse artırırız
+
+        # önce temizle
+        for i in range(max_rows):
+            rr = start_row + i
+            for addr in (f"A{rr}", f"C{rr}", f"D{rr}", f"G{rr}"):
+                try:
+                    ws[addr].value = None
+                except Exception:
+                    pass
+
+        # kod sırası: code_defs sırası (varsa) + kalanlar alfabetik
+        ordered: list[str] = []
+        for d in code_defs:
+            c = str(d.get("code") or "").strip().upper()
+            if c and c in used and c not in ordered:
+                ordered.append(c)
+        for c in sorted(used.keys()):
+            if c not in ordered:
+                ordered.append(c)
+
+        ordered = ordered[:max_rows]
+        for i, c in enumerate(ordered):
+            rr = start_row + i
+            dd = code_map.get(c) or {}
+            ws[f"A{rr}"].value = c
+            ws[f"C{rr}"].value = int(dd.get("sn") or 0)
+            # açıklama hücreleri şablonda D..F merge; sadece D'ye yazmak yeter
+            ws[f"D{rr}"].value = str(dd.get("desc") or "")
+
+        # toplam adet göstergesi (G67) (şablonda parantezli)
+        try:
+            ws["G67"].value = f"({sum(used.values())})" if used else "(0)"
+        except Exception:
+            pass
+
+        # 4) AM sütunu formülleri: her hücre koda göre saniye bulsun.
+        if ordered:
+            last_row = start_row + len(ordered) - 1
+            tbl_rng = f"$A${start_row}:$C${last_row}"
+            cols = [get_column_letter(4 + i) for i in range(31)]  # D..AH
+            for r in range(8, 60):
+                parts = [f"IFERROR(VLOOKUP({col}{r},{tbl_rng},3,FALSE),0)" for col in cols]
+                ws[f"AM{r}"].value = f"=SUM({','.join(parts)})"
+        else:
+            for r in range(8, 60):
+                ws[f"AM{r}"].value = 0
 
     # Build output workbook sheets
     # First chunk uses TEMPLATE sheet; others are copies (and we re-add logo)
@@ -1000,6 +1186,8 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
         _fill_header_and_grid(ws, chunk)
         _fill_rates(ws)
         _fill_codes(ws, chunk)
+        _apply_commission(ws)
+        _fill_code_table_and_duration_formulas(ws)
 
     # Save
     out_path = Path(out_path)

@@ -188,6 +188,14 @@ class MainWindow(QMainWindow):
         self.in_spot_duration.setFixedWidth(90)
         row0b.addWidget(self.in_spot_duration, 1)
 
+        # Ajans komisyonu (%): çıktıda AR62 formülünü dinamik yapmak için.
+        row0b.addWidget(QLabel("Ajans Kom. (%):"))
+        self.in_agency_commission = QSpinBox()
+        self.in_agency_commission.setRange(0, 100)
+        self.in_agency_commission.setValue(10)
+        self.in_agency_commission.setFixedWidth(70)
+        row0b.addWidget(self.in_agency_commission, 1)
+
         row_code_def = QHBoxLayout()
         layout.addLayout(row_code_def)
 
@@ -889,6 +897,7 @@ class MainWindow(QMainWindow):
                         note_text=self.in_note.text().strip(),
                         prepared_by_name=self.in_prepared_by.text().strip(),
                         code_defs=code_defs,
+                        agency_commission_pct=int(self.in_agency_commission.value()),
                     )
 
                     confirmed = self.service.confirm(draft, merged_cells)
@@ -951,6 +960,7 @@ class MainWindow(QMainWindow):
                             note_text=self.in_note.text().strip(),
                             prepared_by_name=self.in_prepared_by.text().strip(),
                             code_defs=code_defs,
+                        agency_commission_pct=int(self.in_agency_commission.value()),
                         )
 
                         confirmed = self.service.confirm(draft, cells)
@@ -1123,6 +1133,7 @@ class MainWindow(QMainWindow):
                         note_text=self.in_note.text(),
                         prepared_by_name=self.in_prepared_by.text(),
                         code_defs=code_defs,
+                        agency_commission_pct=int(self.in_agency_commission.value()),
                     )
 
                     created.append(self.service.confirm(draft, cells))

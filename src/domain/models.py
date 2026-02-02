@@ -29,6 +29,9 @@ class ReservationDraft:
     note_text: str = ""
     prepared_by_name: str = ""
 
+    # Ajans komisyon oranı (%). Şirket/ajansa göre değişebilir (0,5,10,...)
+    agency_commission_pct: int = 10
+
 
 @dataclass(frozen=True)
 class ConfirmedReservation:

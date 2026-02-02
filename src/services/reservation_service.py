@@ -255,6 +255,9 @@ class ReservationService:
 
             "plan_cells": cells,
             "adet_total": adet_total,
+
+            # Excel'de Ajans Komisyonu % oranı (AR62) dinamik.
+            "agency_commission_pct": int(getattr(draft, "agency_commission_pct", 10) or 0),
             
         }
         return ConfirmedReservation(payload=payload)
