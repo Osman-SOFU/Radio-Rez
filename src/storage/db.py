@@ -86,6 +86,16 @@ CREATE TABLE IF NOT EXISTS spotlist_status (
   FOREIGN KEY(reservation_id) REFERENCES reservations(id) ON DELETE CASCADE
 );
 
+
+CREATE INDEX IF NOT EXISTS idx_reservations_plan_title_created
+ON reservations(plan_title, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_is_confirmed_plan_title
+ON reservations(is_confirmed, plan_title);
+
+CREATE INDEX IF NOT EXISTS idx_spotlist_status_res_day_row
+ON spotlist_status(reservation_id, day, row_idx);
+
 """
 
 def ensure_data_folders(data_dir: Path) -> None:

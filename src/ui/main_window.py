@@ -129,7 +129,9 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         main.addLayout(bottom)
 
+        self.btn_new_reservation = QPushButton("Yeni Rezervasyon")
         self.btn_save = QPushButton("Kaydet")
+        bottom.addWidget(self.btn_new_reservation)
         bottom.addWidget(self.btn_save)
 
         # Wire
@@ -139,6 +141,7 @@ class MainWindow(QMainWindow):
 
         # Yeni model: tek buton. Seçilen tarih aralığındaki tüm seçili kanalları DB'ye kaydeder.
         self.btn_save.clicked.connect(self.on_save)
+        self.btn_new_reservation.clicked.connect(self.reset_form_for_new_reservation)
 
         # Bootstrap storage
         self.bootstrap_storage()
@@ -404,33 +407,41 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        try:
+            self.in_agency_commission.setValue(int(float(p.get("agency_commission_pct", 0) or 0)))
+        except Exception:
+            pass
+
         # Tarih + grid
         try:
-            dstr = p.get("plan_date")
-            if dstr:
-                d = datetime.fromisoformat(str(dstr)).date()
-                # dateChanged sinyali grid'i resetlediği için önce tarihi set edip sonra matrix basıyoruz
+            is_span = bool(p.get("is_span"))
+            if is_span and p.get("span_start") and p.get("span_end"):
+                ds = datetime.fromisoformat(str(p.get("span_start"))).date()
+                de = datetime.fromisoformat(str(p.get("span_end"))).date()
+
+                self.in_range_start.blockSignals(True)
+                self.in_range_end.blockSignals(True)
+                self.in_range_start.setDate(QDate(ds.year, ds.month, ds.day))
+                self.in_range_end.setDate(QDate(de.year, de.month, de.day))
+                self.in_range_start.blockSignals(False)
+                self.in_range_end.blockSignals(False)
+
                 self.in_date.blockSignals(True)
-                self.in_date.setDate(QDate(d.year, d.month, d.day))
+                self.in_date.setDate(QDate(ds.year, ds.month, ds.day))
                 self.in_date.blockSignals(False)
-                self.on_plan_date_changed(self.in_date.date())
+
+                self.on_apply_date_range()
+            else:
+                dstr = p.get("plan_date")
+                if dstr:
+                    d = datetime.fromisoformat(str(dstr)).date()
+                    self.in_date.blockSignals(True)
+                    self.in_date.setDate(QDate(d.year, d.month, d.day))
+                    self.in_date.blockSignals(False)
+                    self.on_plan_date_changed(self.in_date.date())
         except Exception:
             pass
 
-        # Plan hücrelerini de getir (en büyük eksik buydu)
-        try:
-            self.plan_grid.set_read_only(False)
-            self.plan_grid.set_matrix(p.get("plan_cells") or {})
-        except Exception:
-            pass
-
-        # Bu formda yüklü olan kayıt id'si
-        try:
-            self._loaded_reservation_id = int(recs[0].id)
-        except Exception:
-            self._loaded_reservation_id = None
-
-        # Kanal seçimi
         self.refresh_channel_combo()
         ch = str(p.get("channel_name", "") or "").strip()
         if ch:
@@ -1209,6 +1220,48 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Hata", str(e))
 
+    def reset_form_for_new_reservation(self) -> None:
+        self._loaded_reservation_id = None
+        self.in_advertiser.clear()
+        self.in_agency.clear()
+        self.in_product.clear()
+        self.in_plan_title.clear()
+        self.in_spot_code.clear()
+        self.in_code_definition.clear()
+        self.in_note.clear()
+        self.in_prepared_by.clear()
+
+        self.in_spot_duration.setValue(0)
+        self.in_agency_commission.setValue(10)
+
+        today = QDate.currentDate()
+        self.in_date.setDate(today)
+        first = QDate(today.year(), today.month(), 1)
+        last = QDate(today.year(), today.month(), today.daysInMonth())
+        self.in_range_start.setDate(first)
+        self.in_range_end.setDate(last)
+
+        self.refresh_channel_combo()
+        if self.in_channel.count() > 0:
+            self.in_channel.setCurrentIndex(0)
+
+        if hasattr(self, 'selected_channels'):
+            self.selected_channels = []
+            try:
+                self._update_selected_channels_label()
+            except Exception:
+                pass
+
+        try:
+            self.plan_grid.clear_matrix()
+        except Exception:
+            pass
+
+        try:
+            self.kod_table.setRowCount(0)
+        except Exception:
+            pass
+
     def on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
         if tab_name == "REZERVASYONLAR":
@@ -1392,7 +1445,10 @@ class MainWindow(QMainWindow):
             p = r.payload or {}
             res_no = str(r.reservation_no or "")
             plan_title = str(p.get("plan_title") or "")
-            plan_date = str(p.get("plan_date") or "")
+            if bool(p.get("is_span")) and p.get("span_start") and p.get("span_end"):
+                plan_date = f"{p.get('span_start')} - {p.get('span_end')}"
+            else:
+                plan_date = str(p.get("plan_date") or "")
             channel = str(p.get("channel_name") or "")
             spot_code = str(p.get("spot_code") or "")
             duration = str(p.get("spot_duration_sec") or "")
@@ -1427,12 +1483,33 @@ class MainWindow(QMainWindow):
         channel = str(p.get("channel_name") or "")
         plan_title = str(p.get("plan_title") or "")
         plan_date = str(p.get("plan_date") or "")
-        self.res_preview_title.setText(f"{res_no}  |  {channel}  |  {plan_date}")
+        is_span = bool(p.get("is_span"))
+        if is_span and p.get("span_start") and p.get("span_end"):
+            title_date = f"{p.get('span_start')} - {p.get('span_end')}"
+        else:
+            title_date = plan_date
+        self.res_preview_title.setText(f"{res_no}  |  {channel}  |  {title_date}")
 
         try:
-            y, m, d = plan_date.split("-")
-            self.res_preview_grid.set_month(int(y), int(m), int(d))
-            self.res_preview_grid.set_matrix(p.get("plan_cells") or {})
+            if is_span and p.get("span_start"):
+                y, m, d = str(p.get("span_start")).split("-")
+                self.res_preview_grid.set_month(int(y), int(m), int(d))
+                raw = p.get("span_month_matrices") or {}
+                month_mats = {}
+                for k, cells in raw.items():
+                    if isinstance(k, str) and "-" in k:
+                        yy, mm = k.split("-", 1)
+                        month_mats[(int(yy), int(mm))] = cells or {}
+                    elif isinstance(k, (tuple, list)) and len(k) == 2:
+                        month_mats[(int(k[0]), int(k[1]))] = cells or {}
+                if month_mats:
+                    self.res_preview_grid.set_span_month_matrices(month_mats)
+                else:
+                    self.res_preview_grid.set_matrix(p.get("plan_cells") or {})
+            else:
+                y, m, d = plan_date.split("-")
+                self.res_preview_grid.set_month(int(y), int(m), int(d))
+                self.res_preview_grid.set_matrix(p.get("plan_cells") or {})
             self.res_preview_grid.set_read_only(True)
         except Exception:
             pass
@@ -1469,14 +1546,36 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # Tarih/range geri yükleme (span desteği)
         try:
-            dstr = p.get("plan_date")
-            if dstr:
-                d = datetime.fromisoformat(str(dstr)).date()
+            is_span = bool(p.get("is_span"))
+            if is_span and p.get("span_start") and p.get("span_end"):
+                ds = datetime.fromisoformat(str(p.get("span_start"))).date()
+                de = datetime.fromisoformat(str(p.get("span_end"))).date()
+
+                self.in_range_start.blockSignals(True)
+                self.in_range_end.blockSignals(True)
+                self.in_range_start.setDate(QDate(ds.year, ds.month, ds.day))
+                self.in_range_end.setDate(QDate(de.year, de.month, de.day))
+                self.in_range_start.blockSignals(False)
+                self.in_range_end.blockSignals(False)
+
                 self.in_date.blockSignals(True)
-                self.in_date.setDate(QDate(d.year, d.month, d.day))
+                self.in_date.setDate(QDate(ds.year, ds.month, ds.day))
                 self.in_date.blockSignals(False)
-                self.on_plan_date_changed(self.in_date.date())
+
+                try:
+                    self.on_apply_date_range()
+                except Exception:
+                    pass
+            else:
+                dstr = p.get("plan_date")
+                if dstr:
+                    d = datetime.fromisoformat(str(dstr)).date()
+                    self.in_date.blockSignals(True)
+                    self.in_date.setDate(QDate(d.year, d.month, d.day))
+                    self.in_date.blockSignals(False)
+                    self.on_plan_date_changed(self.in_date.date())
         except Exception:
             pass
 
@@ -1487,9 +1586,55 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.in_channel.setCurrentIndex(idx)
 
+        # Kod/Kod Tanımı/Süreleri geri yükle
+        try:
+            self.tbl_codes.setRowCount(0)
+            code_defs = list(p.get("code_defs") or [])
+            for cd in code_defs:
+                code = str((cd or {}).get("code") or "").strip().upper()
+                desc = str((cd or {}).get("desc") or "").strip()
+                dur = (cd or {}).get("duration_sec", 0)
+                try:
+                    dur = int(float(dur or 0))
+                except Exception:
+                    dur = 0
+                if not code:
+                    continue
+                r = self.tbl_codes.rowCount()
+                self.tbl_codes.insertRow(r)
+                self.tbl_codes.setItem(r, 0, QTableWidgetItem(code))
+                self.tbl_codes.setItem(r, 1, QTableWidgetItem(desc))
+                self.tbl_codes.setItem(r, 2, QTableWidgetItem(str(dur)))
+
+            if code_defs:
+                first = code_defs[0] or {}
+                self.in_spot_code.setText(str(first.get("code") or "").strip().upper())
+                self.in_code_definition.setText(str(first.get("desc") or "").strip())
+                try:
+                    self.in_spot_duration.setValue(int(float(first.get("duration_sec") or 0)))
+                except Exception:
+                    pass
+            self._sync_active_code_combo()
+        except Exception:
+            pass
+
         try:
             self.plan_grid.set_read_only(False)
-            self.plan_grid.set_matrix(p.get("plan_cells") or {})
+            if bool(p.get("is_span")):
+                raw = p.get("span_month_matrices") or {}
+                month_mats = {}
+                for k, cells in raw.items():
+                    if isinstance(k, str) and "-" in k:
+                        yy, mm = k.split("-", 1)
+                        month_mats[(int(yy), int(mm))] = cells or {}
+                    elif isinstance(k, (tuple, list)) and len(k) == 2:
+                        month_mats[(int(k[0]), int(k[1]))] = cells or {}
+                if month_mats:
+                    self.plan_grid.set_span_month_matrices(month_mats)
+                else:
+                    self.plan_grid.set_matrix(p.get("plan_cells") or {})
+            else:
+                self.plan_grid.set_matrix(p.get("plan_cells") or {})
         except Exception:
             pass
 
@@ -1590,7 +1735,27 @@ class MainWindow(QMainWindow):
 
                 out_path = out_dir / f"{res_no}.xlsx"
                 try:
-                    export_excel(template_path, out_path, payload2)
+                    if bool(payload2.get("is_span")) and payload2.get("span_start") and payload2.get("span_end"):
+                        from src.export.excel_exporter import export_excel_span
+                        raw = payload2.get("span_month_matrices") or {}
+                        month_matrices = {}
+                        for k, cells in raw.items():
+                            if isinstance(k, str) and "-" in k:
+                                yy, mm = k.split("-", 1)
+                                month_matrices[(int(yy), int(mm))] = cells or {}
+                        from datetime import date as _d
+                        ys, ms, ds = str(payload2.get("span_start")).split("-")
+                        ye, me, de = str(payload2.get("span_end")).split("-")
+                        export_excel_span(
+                            template_path=template_path,
+                            out_path=out_path,
+                            payload=payload2,
+                            month_matrices=month_matrices,
+                            span_start=_d(int(ys), int(ms), int(ds)),
+                            span_end=_d(int(ye), int(me), int(de)),
+                        )
+                    else:
+                        export_excel(template_path, out_path, payload2)
                     ok_paths.append(out_path)
                 except Exception as ex2:
                     failures.append(f"{res_no}: {ex2}")
@@ -1862,6 +2027,9 @@ class MainWindow(QMainWindow):
         self._update_spotlist_summary(rows)
 
     def _render_spotlist(self, rows: list[dict]) -> None:
+        self.spot_table.setUpdatesEnabled(False)
+        self.spot_table.blockSignals(True)
+        self.spot_table.setSortingEnabled(False)
         self.spot_table.setRowCount(len(rows))
 
         for r_idx, rr in enumerate(rows):
@@ -1929,6 +2097,14 @@ class MainWindow(QMainWindow):
             f"Toplam Bütçe: {total_budget:,.2f} TL    "
             f"Ortalama Süre: {avg_duration:.1f} sn"
         )
+
+
+        self.spot_table.blockSignals(False)
+        self.spot_table.setUpdatesEnabled(True)
+        try:
+            self.spot_table.setSortingEnabled(True)
+        except Exception:
+            pass
 
     def on_spot_published_changed(self, key: tuple[int, int, int], txt: str) -> None:
         try:
@@ -2542,6 +2718,9 @@ class MainWindow(QMainWindow):
 
         self.price_table = ExcelTableWidget()
         self.price_table.setAlternatingRowColors(True)
+        self.price_table.setSortingEnabled(True)
+        self.price_table.horizontalHeader().setSortIndicatorShown(True)
+        self.price_table.horizontalHeader().setSectionsClickable(True)
         # Excel gibi satır/kolon/blok seçimi + kopyala/yapıştır
         self.price_table.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.price_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -2616,14 +2795,27 @@ class MainWindow(QMainWindow):
                 dt, odt = prices.get((cid, m), (0.0, 0.0))
 
                 it_dt = QTableWidgetItem("" if dt == 0 else f"{dt:g}")
+                try:
+                    it_dt.setData(Qt.EditRole, float(dt))
+                except Exception:
+                    pass
                 it_dt.setTextAlignment(Qt.AlignCenter)
                 self.price_table.setItem(r, col, it_dt)
                 col += 1
 
                 it_odt = QTableWidgetItem("" if odt == 0 else f"{odt:g}")
+                try:
+                    it_odt.setData(Qt.EditRole, float(odt))
+                except Exception:
+                    pass
                 it_odt.setTextAlignment(Qt.AlignCenter)
                 self.price_table.setItem(r, col, it_odt)
                 col += 1
+
+        try:
+            self.price_table.sortItems(0, Qt.AscendingOrder)
+        except Exception:
+            pass
 
     def _parse_float_cell(self, item: QTableWidgetItem | None) -> float:
         if not item:
@@ -2776,6 +2968,9 @@ class MainWindow(QMainWindow):
 
         self.access_table = QTableWidget()
         self.access_table.setAlternatingRowColors(True)
+        self.access_table.setSortingEnabled(True)
+        self.access_table.horizontalHeader().setSortIndicatorShown(True)
+        self.access_table.horizontalHeader().setSectionsClickable(True)
         self.access_table.verticalHeader().setVisible(False)
 
         # Varsayılan saat kolonları (Excel örneğiyle aynı)
@@ -3106,5 +3301,15 @@ class MainWindow(QMainWindow):
                     v = norm_map.get(_norm_hour(str(hour)))
 
                 it = QTableWidgetItem("" if v is None else str(v))
+                if v is not None:
+                    try:
+                        it.setData(Qt.EditRole, float(v))
+                    except Exception:
+                        pass
                 it.setTextAlignment(Qt.AlignCenter)
                 self.access_table.setItem(i, col_idx, it)
+
+        try:
+            self.access_table.sortItems(0, Qt.AscendingOrder)
+        except Exception:
+            pass
