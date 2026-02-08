@@ -1923,6 +1923,78 @@ def export_plan_ozet_range(out_path, data: dict) -> None:
         ws.cell(header_row, month_start_col + 2*i).value = f"{mname} Adet"
         ws.cell(header_row, month_start_col + 2*i + 1).value = f"{mname} Saniye"
 
+    # --- Üst ay bandı (row 9) dinamik olsun ---
+    month_names_tr = ["OCAK","ŞUBAT","MART","NİSAN","MAYIS","HAZİRAN","TEMMUZ","AĞUSTOS","EYLÜL","EKİM","KASIM","ARALIK"]
+    band_row = header_row - 1  # 9
+
+    # Row 9'daki eski merge'leri kaldır
+    old_merges = list(ws.merged_cells.ranges)
+    for mr in old_merges:
+        if mr.min_row == band_row and mr.max_row == band_row:
+            try:
+                ws.unmerge_cells(str(mr))
+            except Exception:
+                pass
+
+    # Row 9 temizle
+    for c in range(day_start_col, max_write_col + 1):
+        ws.cell(band_row, c).value = None
+
+    # Gün kolonları üstündeki ay bloklarını oluştur (tek ay ise tek blok)
+    if len(dates) > 0:
+        groups = []  # (label, start_col, end_col)
+        s_idx = 0
+        while s_idx < len(dates):
+            d0 = dates[s_idx]
+            e_idx = s_idx
+            while e_idx + 1 < len(dates) and dates[e_idx + 1].month == d0.month and dates[e_idx + 1].year == d0.year:
+                e_idx += 1
+            sc = day_start_col + s_idx
+            ec = day_start_col + e_idx
+            label = month_names_tr[d0.month - 1]
+            groups.append((label, sc, ec))
+            s_idx = e_idx + 1
+
+        for label, sc, ec in groups:
+            if ec > sc:
+                ws.merge_cells(start_row=band_row, start_column=sc, end_row=band_row, end_column=ec)
+            ws.cell(band_row, sc).value = label
+            ws.cell(band_row, sc).alignment = Alignment(horizontal="center", vertical="center")
+
+    # Sağdaki "Toplam" bandı (ay özet + birim + bütçe kolonları)
+    sum_start_col = month_start_col
+    sum_end_col = max_write_col
+    if sum_end_col >= sum_start_col:
+        if sum_end_col > sum_start_col:
+            ws.merge_cells(start_row=band_row, start_column=sum_start_col, end_row=band_row, end_column=sum_end_col)
+
+        if len(months) == 0:
+            total_label = "TOPLAM"
+        elif len(months) == 1:
+            total_label = f"{month_names_tr[int(months[0][1]) - 1]} Toplam"
+        else:
+            first_m = month_names_tr[int(months[0][1]) - 1]
+            last_m = month_names_tr[int(months[-1][1]) - 1]
+            total_label = f"{first_m}-{last_m} Toplam"
+
+        ws.cell(band_row, sum_start_col).value = total_label
+
+        # "MAYIS Toplam" bandı, soldaki ay bandı ile aynı görünsün (fill/font/border)
+        style_ref_col = day_start_col if len(dates) > 0 else sum_start_col
+        ref_cell = ws.cell(band_row, style_ref_col)
+
+        for c in range(sum_start_col, sum_end_col + 1):
+            dst = ws.cell(band_row, c)
+            dst.font = copy(ref_cell.font)
+            dst.fill = copy(ref_cell.fill)
+            dst.border = copy(ref_cell.border)
+            dst.alignment = copy(ref_cell.alignment)
+            dst.number_format = ref_cell.number_format
+            dst.protection = copy(ref_cell.protection)
+
+        ws.cell(band_row, sum_start_col).alignment = Alignment(horizontal="center", vertical="center")
+
+
     # --- Satır sayısını ayarla (Toplam satırını sabit tut) ---
     total_row = None
     for r in range(start_row, ws.max_row + 1):
