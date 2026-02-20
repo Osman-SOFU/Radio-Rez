@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS channels (
 
 CREATE TABLE IF NOT EXISTS channel_prices (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  advertiser_name TEXT NOT NULL DEFAULT '',
   year INTEGER NOT NULL,
   month INTEGER NOT NULL,        -- 1..12
   channel_id INTEGER NOT NULL,
@@ -233,6 +234,41 @@ def migrate_and_seed(conn: sqlite3.Connection) -> None:
     )
     _backfill_plan_title_from_payload(conn)
 
+    # ---- Seed advertisers (SADECE ilk kurulumda) ----
+    # Önemli: Kullanıcı tüm reklam verenleri bilerek sildiyse, yeniden açılışta geri gelmemeli.
+    # Bu yüzden seed işlemini yalnızca bir kez (meta.advertisers_seeded yoksa) yapıyoruz.
+    seeded_flag = None
+    try:
+        r = conn.execute("SELECT value FROM meta WHERE key = ?", ("advertisers_seeded",)).fetchone()
+        seeded_flag = (r["value"] if r else None)
+    except Exception:
+        seeded_flag = None
+
+    if seeded_flag is None:
+        try:
+            cnt = conn.execute("SELECT COUNT(1) AS c FROM advertisers").fetchone()["c"]
+        except Exception:
+            cnt = 0
+
+        if int(cnt) == 0:
+            try:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO advertisers(name)
+                    SELECT DISTINCT advertiser_name
+                    FROM reservations
+                    WHERE advertiser_name IS NOT NULL AND TRIM(advertiser_name) != ''
+                    """
+                )
+            except Exception:
+                pass
+
+        # Seed işlemi bir kere yapıldı olarak işaretle
+        try:
+            conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", ("advertisers_seeded", "1"))
+        except Exception:
+            pass
+
 
     # Erişim örneği (yeni saatlik yapı) için ek kolonlar
     _ensure_column(
@@ -256,6 +292,12 @@ def migrate_and_seed(conn: sqlite3.Connection) -> None:
     _ensure_column(
         conn,
         "channel_prices",
+        "ALTER TABLE channel_prices ADD COLUMN advertiser_name TEXT NOT NULL DEFAULT ''",
+        "advertiser_name",
+    )
+    _ensure_column(
+        conn,
+        "channel_prices",
         "ALTER TABLE channel_prices ADD COLUMN year INTEGER NOT NULL DEFAULT 0",
         "year",
     )
@@ -266,9 +308,14 @@ def migrate_and_seed(conn: sqlite3.Connection) -> None:
         "month",
     )
 
-    # Unique index (yıl/ay/kanal)
+    # Unique index (reklam veren + yıl/ay/kanal)
+    # Eski index (year,month,channel_id) reklam veren bazlı fiyat tanımını engeller; kaldır.
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_channel_prices_unique")
+    except Exception:
+        pass
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_prices_unique ON channel_prices(year, month, channel_id)"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_prices_unique ON channel_prices(advertiser_name, year, month, channel_id)"
     )
 
 

@@ -21,10 +21,33 @@ class Repository:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
 
+    # -------------------------
+    # Normalization helpers
+    # -------------------------
+    @staticmethod
+    def _norm_name(name: str) -> str:
+        if name is None:
+            return ""
+        name = str(name).strip()
+        name = " ".join(name.split())
+        return name
+
+    def _resolve_advertiser_name(self, name: str) -> str:
+        """Resolve to canonical stored advertiser name (case-insensitive)."""
+        name = self._norm_name(name)
+        if not name:
+            return ""
+        row = self.conn.execute(
+            "SELECT name FROM advertisers WHERE lower(name)=lower(?) LIMIT 1",
+            (name,),
+        ).fetchone()
+        return row[0] if row else name
+
     def upsert_advertiser(self, name: str) -> None:
-        name = name.strip()
+        name = self._norm_name(name)
         if not name:
             return
+        name = self._resolve_advertiser_name(name)
         self.conn.execute(
             "INSERT OR IGNORE INTO advertisers(name) VALUES(?)",
             (name,),
@@ -43,6 +66,73 @@ class Repository:
         """
         cur = self.conn.execute(sql, (f"%{text}%", limit))
         return [r[0] for r in cur.fetchall()]
+
+    def list_advertisers(self, limit: int = 5000) -> list[str]:
+        """Reklam veren listesini döndürür.
+
+        ÖNEMLİ: Liste kaynağı yalnızca `advertisers` tablosudur.
+        Böylece kullanıcı "sil" dediğinde UI'da gerçekten kaybolur.
+        (İlk kurulumda reservations'tan seed işlemi migrate_and_seed içinde yapılır.)
+        """
+        try:
+            cur = self.conn.execute(
+                "SELECT name FROM advertisers WHERE name IS NOT NULL AND name != '' ORDER BY name COLLATE NOCASE LIMIT ?",
+                (int(limit),),
+            )
+            rows = [str(r[0]) for r in cur.fetchall()]
+            # De-dupe case-insensitively (accidental casing variants are common)
+            seen: set[str] = set()
+            out: list[str] = []
+            for n in rows:
+                key = (n or "").strip().casefold()
+                if not key:
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(n)
+            return out
+        except Exception:
+            return []
+
+    def delete_advertiser_prices(self, advertiser_name: str) -> None:
+        nm = self._norm_name(advertiser_name)
+        if not nm:
+            return
+        # case-insensitive delete (so BOSCH/Bosch both go away)
+        self.conn.execute(
+            "DELETE FROM channel_prices WHERE lower(advertiser_name)=lower(?)",
+            (nm,),
+        )
+        self.conn.execute(
+            "DELETE FROM advertisers WHERE lower(name)=lower(?)",
+            (nm,),
+        )
+        self.conn.commit()
+
+    def rename_advertiser_prices(self, old_name: str, new_name: str) -> None:
+        old_nm = (old_name or "").strip()
+        new_nm = (new_name or "").strip()
+        if not old_nm or not new_nm or old_nm == new_nm:
+            return
+
+        self.conn.execute("BEGIN")
+        try:
+            # prices
+            self.conn.execute(
+                "UPDATE channel_prices SET advertiser_name=? WHERE advertiser_name=?",
+                (new_nm, old_nm),
+            )
+            # advertisers
+            try:
+                self.conn.execute("DELETE FROM advertisers WHERE name=?", (old_nm,))
+            except Exception:
+                pass
+            self.upsert_advertiser(new_nm)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
 
     # ------------------------------
@@ -536,10 +626,17 @@ class Repository:
         )
         self.conn.commit()
 
-    def list_price_years(self) -> list[int]:
-        rows = self.conn.execute(
-            "SELECT DISTINCT year FROM channel_prices WHERE year > 0 ORDER BY year DESC"
-        ).fetchall()
+    def list_price_years(self, advertiser_name: str | None = None) -> list[int]:
+        nm = (advertiser_name or "").strip()
+        if nm:
+            rows = self.conn.execute(
+                "SELECT DISTINCT year FROM channel_prices WHERE advertiser_name=? AND year > 0 ORDER BY year DESC",
+                (nm,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT DISTINCT year FROM channel_prices WHERE year > 0 ORDER BY year DESC"
+            ).fetchall()
         return [int(r["year"]) for r in rows]
 
     def list_channels(self, active_only: bool = True) -> list[dict[str, object]]:
@@ -578,24 +675,44 @@ class Repository:
         self.conn.execute("UPDATE channels SET is_active=0 WHERE id=?", (int(channel_id),))
         self.conn.commit()
 
-    def get_channel_prices(self, year: int) -> dict[tuple[int, int], tuple[float, float]]:
-        rows = self.conn.execute(
-            "SELECT channel_id, month, price_dt, price_odt FROM channel_prices WHERE year=?",
+    def get_channel_prices(self, year: int, advertiser_name: str | None = None) -> dict[tuple[int, int], tuple[float, float]]:
+        nm = self._resolve_advertiser_name(advertiser_name or "")
+
+        # Legacy DBs may have global prices stored with advertiser_name='' (no advertiser separation).
+        # Merge: global fallback first, advertiser-specific overrides.
+        out: dict[tuple[int, int], tuple[float, float]] = {}
+        global_rows = self.conn.execute(
+            "SELECT channel_id, month, price_dt, price_odt FROM channel_prices WHERE advertiser_name='' AND year=?",
             (int(year),),
         ).fetchall()
-        out: dict[tuple[int, int], tuple[float, float]] = {}
-        for r in rows:
+        for r in global_rows:
+            out[(int(r["channel_id"]), int(r["month"]))] = (float(r["price_dt"]), float(r["price_odt"]))
+
+        adv_rows = self.conn.execute(
+            "SELECT channel_id, month, price_dt, price_odt FROM channel_prices WHERE advertiser_name=? AND year=?",
+            (nm, int(year)),
+        ).fetchall()
+        for r in adv_rows:
             out[(int(r["channel_id"]), int(r["month"]))] = (float(r["price_dt"]), float(r["price_odt"]))
         return out
 
-    def upsert_channel_price(self, year: int, month: int, channel_id: int, price_dt: float, price_odt: float) -> None:
+    def upsert_channel_price(
+        self,
+        year: int,
+        month: int,
+        channel_id: int,
+        price_dt: float,
+        price_odt: float,
+        advertiser_name: str | None = None,
+    ) -> None:
+        nm = self._resolve_advertiser_name(advertiser_name or "")
         self.conn.execute(
-            "INSERT INTO channel_prices(year, month, channel_id, price_dt, price_odt) "
-            "VALUES(?,?,?,?,?) "
-            "ON CONFLICT(year, month, channel_id) DO UPDATE SET "
+            "INSERT INTO channel_prices(advertiser_name, year, month, channel_id, price_dt, price_odt) "
+            "VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(advertiser_name, year, month, channel_id) DO UPDATE SET "
             "price_dt=excluded.price_dt, "
             "price_odt=excluded.price_odt",
-            (int(year), int(month), int(channel_id), float(price_dt), float(price_odt)),
+            (nm, int(year), int(month), int(channel_id), float(price_dt), float(price_odt)),
         )
         self.conn.commit()
 

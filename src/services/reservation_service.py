@@ -439,6 +439,8 @@ class ReservationService:
             price_dt = float(p.get("channel_price_dt") or 0.0)
             price_odt = float(p.get("channel_price_odt") or 0.0)
 
+            adv_name = str(p.get("advertiser_name") or "").strip()
+
             for yy, mm, row_idx, day, cell_code, is_span in self._iter_cells(p):
                 # gerçek tarih + saat
                 try:
@@ -450,14 +452,15 @@ class ReservationService:
                 dt_odt = classify_dt_odt(t0)
                 # span kayıtlarında fiyat ay bazlı değişebilir: repo fiyatını tercih et
                 ch_id = ch_id_map.get(channel_name.strip().lower())
-                if ch_id and int(yy) not in price_cache:
+                cache_key = (adv_name.casefold(), int(yy))
+                if ch_id and cache_key not in price_cache:
                     try:
-                        price_cache[int(yy)] = self.repo.get_channel_prices(int(yy))
+                        price_cache[cache_key] = self.repo.get_channel_prices(int(yy), adv_name)
                     except Exception:
-                        price_cache[int(yy)] = {}
+                        price_cache[cache_key] = {}
                 dt_p, odt_p = (price_dt, price_odt)
                 if ch_id:
-                    dt_p, odt_p = price_cache.get(int(yy), {}).get((int(ch_id), int(mm)), (price_dt, price_odt))
+                    dt_p, odt_p = price_cache.get(cache_key, {}).get((int(ch_id), int(mm)), (price_dt, price_odt))
                 unit = float(dt_p) if dt_odt == "DT" else float(odt_p)
 
                 duration = int(code_map.get(str(cell_code).strip().upper(), 0))
@@ -669,9 +672,14 @@ class ReservationService:
             except Exception:
                 access_map = {}
 
-        # Birim sn. fiyatları: fiyat ve kanal tanımı tablosundan (yıl/ay)
-        # repo.get_channel_prices(year) -> {(channel_id, month): (dt, odt)}
-        price_map = self.repo.get_channel_prices(yy)
+        # Birim sn. fiyatları: fiyat ve kanal tanımı tablosundan (reklam veren + yıl/ay)
+        # repo.get_channel_prices(year, advertiser) -> {(channel_id, month): (dt, odt)}
+        adv_name = ""
+        try:
+            adv_name = str(((month_recs[0].payload or {}) if month_recs else {}).get("advertiser_name") or "").strip()
+        except Exception:
+            adv_name = ""
+        price_map = self.repo.get_channel_prices(yy, adv_name)
         channels = self.repo.list_channels(active_only=False)
         # is_active=0 ama ay içinde rezervasyonda geçen kanalı yine de listele
         used_channels = set(self._norm_name(str((r.payload or {}).get("channel_name") or "")) for r in month_recs)
@@ -1004,12 +1012,18 @@ class ReservationService:
             except Exception:
                 access_map = {}
 
-        # Birim sn fiyatları: yıl bazında çekilir, ay bazında kullanılır
-        # repo.get_channel_prices(year) -> {(channel_id, month): (dt, odt)}
+        # Birim sn fiyatları: reklam veren + yıl bazında çekilir, ay bazında kullanılır
+        # repo.get_channel_prices(year, advertiser) -> {(channel_id, month): (dt, odt)}
+        adv_name = ""
+        try:
+            adv_name = str(((rel_recs[0].payload or {}) if rel_recs else {}).get("advertiser_name") or "").strip()
+        except Exception:
+            adv_name = ""
+
         price_maps: dict[int, Any] = {}
         for yy in years_in_range or [rs.year]:
             try:
-                price_maps[int(yy)] = self.repo.get_channel_prices(int(yy))
+                price_maps[int(yy)] = self.repo.get_channel_prices(int(yy), adv_name)
             except Exception:
                 price_maps[int(yy)] = {}
 

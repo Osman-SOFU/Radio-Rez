@@ -7,6 +7,7 @@ import re
 import openpyxl
 from openpyxl.styles import Alignment
 from openpyxl.drawing.image import Image
+from openpyxl.cell.cell import MergedCell
 
 from src.util.paths import resource_path
 from copy import copy
@@ -20,6 +21,51 @@ from openpyxl import Workbook
 from src.domain.time_rules import classify_dt_odt
 
 TR_DOW = ["Pt", "Sa", "Çr", "Pş", "Cu", "Ct", "Pa"]  # Monday=0
+
+_PREPARED_STAMP_RE = re.compile(r"\s-\s\d{2}\.\d{2}\.\d{4}\s\d{2}:\d{2}.*$")
+
+
+def _clean_prepared_name(raw: Any) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    return _PREPARED_STAMP_RE.sub("", s).strip()
+
+
+def _parse_created_dt_from_payload(payload: dict[str, Any]) -> datetime | None:
+    ca = payload.get("created_at")
+    if not ca:
+        return None
+    s = str(ca).strip()
+    if not s:
+        return None
+    # ISO (2026-02-19T21:58:08[.ffffff][Z]) / sqlite format / eski format
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _build_prepared_stamp(payload: dict[str, Any]) -> str:
+    name = _clean_prepared_name(
+        payload.get("prepared_by")
+        or payload.get("created_by")
+        or payload.get("form_creator")
+        or payload.get("created_user")
+        or payload.get("created_user_name")
+        or payload.get("created_user_fullname")
+        or ""
+    )
+    dt = _parse_created_dt_from_payload(payload) or datetime.now()
+    stamp = dt.strftime("%d.%m.%Y %H:%M")
+    return f"{name} - {stamp}" if name else stamp
+
 
 
 def _pick_worksheet(wb: Workbook, preferred: str, *, contains_any: list[str] | None = None):
@@ -67,6 +113,38 @@ def _norm_hour_label(label: str) -> str:
         h1, m1, h2, m2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
         return f"{h1:02d}:{m1:02d}-{h2:02d}:{m2:02d}"
     return s
+
+def _fix_daily_totals_row(ws, *, start_row: int = 8, end_row: int = 59, totals_row: int = 60, start_col: int = 4, days: int = 31) -> None:
+    """Rezervasyon çıktısındaki 60. satır toplam formüllerini düzeltir.
+
+    Bazı şablonlarda totals row hücreleri bir önceki sütunu referanslıyor (örn D60 -> C8:C59).
+    Biz her gün sütununu kendi sütun aralığını sayacak şekilde ayarlarız.
+    """
+    for i in range(days):
+        col = start_col + i
+        col_letter = get_column_letter(col)
+        ws.cell(row=totals_row, column=col).value = f"=COUNTA({col_letter}{start_row}:{col_letter}{end_row})"
+
+
+def _fill_unit_prices_span_sheet(ws, payload: dict, chunk_start: date) -> None:
+    """Span çıktısı (v2 dahil) için AP sütununa DT/ODT birim fiyatlarını yazar."""
+    ym = f"{chunk_start.year:04d}-{chunk_start.month:02d}"
+    mp = (payload.get("span_month_prices") or {}).get(ym) or {}
+
+    def _to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    dt_price = _to_float(mp.get("dt") if mp.get("dt") is not None else payload.get("channel_price_dt"))
+    odt_price = _to_float(mp.get("odt") if mp.get("odt") is not None else payload.get("channel_price_odt"))
+
+    for r in range(8, 60):
+        t0 = _row_idx_to_time(r - 8)
+        band = classify_dt_odt(t0)
+        ws[f"AP{r}"].value = dt_price if band == "DT" else odt_price
+
 
 def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -> Path:
     if not template_path.exists():
@@ -280,6 +358,13 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     # Sabit başlık
     ws["V3"].value = "Rezervasyon Formu"
 
+    # --- Formu oluşturan / tarih (rezervasyon oluşturulma zamanını baz al) ---
+    try:
+        ws["AO77"].value = _build_prepared_stamp(payload)
+    except Exception:
+        pass
+
+
     # --- PLAN GRID: temizle + doldur ---
     plan_cells = payload.get("plan_cells") or {}
 
@@ -335,20 +420,33 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     except Exception:
         pass
 
-    # --- Birim fiyatı (AO sütunu) ---
+    # --- Birim fiyatı (AP sütunu) ---
     # DT/ODT fiyatları: seçilen kanalın, plan tarihinin AY/YIL'ına göre.
-    try:
-        unit_price_col = column_index_from_string("AP")
-        dt_price = float(payload.get("channel_price_dt") or 0)
-        odt_price = float(payload.get("channel_price_odt") or 0)
+    unit_price_col = column_index_from_string("AP")
+    dt_price = float(payload.get("channel_price_dt") or 0)
+    odt_price = float(payload.get("channel_price_odt") or 0)
 
-        for row_idx in range(GRID_ROWS):
-            rr = GRID_START_ROW + row_idx
-            slot_type = classify_dt_odt(_row_idx_to_time(row_idx))
-            ws.cell(rr, unit_price_col).value = dt_price if slot_type == "DT" else odt_price
+    # Debug: export dosyasında görülebilsin (C6 hücresi boştu)
+    try:
+        ws["C6"].value = f"DT:{dt_price} / ODT:{odt_price}"
     except Exception:
-        # birim fiyatı basılamazsa export'u patlatma
         pass
+
+    for row_idx in range(GRID_ROWS):
+        rr = GRID_START_ROW + row_idx
+        slot_type = classify_dt_odt(_row_idx_to_time(row_idx))
+        val = dt_price if slot_type == "DT" else odt_price
+        try:
+            ws.cell(rr, unit_price_col).value = val
+        except Exception:
+            # Eğer hücre yazılamıyorsa (ör. korumalı/merged), deneme: top-left'e yaz
+            try:
+                c = ws.cell(rr, unit_price_col)
+                if getattr(c, "coordinate", None):
+                    ws[c.coordinate].value = val
+            except Exception:
+                pass
+
 
     # --- Logo ---
     logo_path = template_path.parent / "RADIOSCOPE.PNG"
@@ -458,9 +556,11 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     note = str(payload.get("note_text", "")).strip()
     ws["A77"].value = "NOT:" if not note else f"NOT: {note}"
 
-    # İsim değişebilir
-    if payload.get("prepared_by") is not None:
-        ws["AK77"].value = str(payload.get("prepared_by", "")).strip()
+    # İsim + oluşturulma zamanı (AK77)
+    try:
+        ws["AK77"].value = _build_prepared_stamp(payload)
+    except Exception:
+        pass
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
@@ -588,15 +688,8 @@ def _export_excel_span_legacy(
     except Exception:
         pass
 
-    # AK77: prepared_by -> timestamp ekle
-    pb = str(payload.get("prepared_by") or "").strip()
-    if pb:
-        # Eğer kullanıcı sadece isim girdiyse, sonuna tarih-saat ekle.
-        # (UI confirm akışında zaten ekleniyor; span export UI'den direkt geliyor.)
-        if " - " not in pb or len(pb.split(" - ")) == 1:
-            pb = f"{pb} - {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-    else:
-        pb = datetime.now().strftime("%d.%m.%Y %H:%M")
+    # AK77/AO77 için isim + rezervasyon oluşturulma zamanı
+    pb = _build_prepared_stamp(payload)
 
     # Helper: apply header + fills for an arbitrary date chunk
     def apply_span_headers(ws, dates_chunk: list[date]) -> None:
@@ -759,6 +852,13 @@ def _export_excel_span_legacy(
 
         ws["V3"].value = "Rezervasyon Formu"
 
+    # --- Formu oluşturan / tarih (rezervasyon oluşturulma zamanını baz al) ---
+    try:
+        ws["AO77"].value = _build_prepared_stamp(payload)
+    except Exception:
+        pass
+
+
         # Span tarih başlıkları + boyamalar
         apply_span_headers(ws, dates_chunk)
 
@@ -804,6 +904,21 @@ def _export_excel_span_legacy(
             unit_price_col = column_index_from_string("AP")
             dt_price = float(payload.get("channel_price_dt") or 0)
             odt_price = float(payload.get("channel_price_odt") or 0)
+
+            # Span export'ta (çoklu ay) her sayfanın ayına göre birim fiyatları override et
+            try:
+                smp = payload.get("span_month_prices") or {}
+                if isinstance(smp, dict) and dates_chunk:
+                    key = f"{dates_chunk[0].year:04d}-{dates_chunk[0].month:02d}"
+                    v = smp.get(key)
+                    if isinstance(v, dict):
+                        dt_price = float(v.get("dt") or v.get("DT") or dt_price)
+                        odt_price = float(v.get("odt") or v.get("ODT") or odt_price)
+                    elif isinstance(v, (list, tuple)) and len(v) >= 2:
+                        dt_price = float(v[0])
+                        odt_price = float(v[1])
+            except Exception:
+                pass
             for row_idx in range(GRID_ROWS):
                 rr = GRID_START_ROW + row_idx
                 slot_type = classify_dt_odt(_row_idx_to_time(row_idx))
@@ -1186,6 +1301,11 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
         _fill_header_and_grid(ws, chunk)
         _fill_rates(ws)
         _fill_codes(ws, chunk)
+
+        # Birim fiyatları (AP) ve 60. satır toplamlarını doğru kolonlara sabitle
+        _fill_unit_prices_span_sheet(ws, payload, ch_start)
+        _fix_daily_totals_row(ws)
+
         _apply_commission(ws)
         _fill_code_table_and_duration_formulas(ws)
 
@@ -1930,7 +2050,8 @@ def export_plan_ozet_range(out_path, data: dict) -> None:
     # Row 9'daki eski merge'leri kaldır
     old_merges = list(ws.merged_cells.ranges)
     for mr in old_merges:
-        if mr.min_row == band_row and mr.max_row == band_row:
+        # Row 9'a temas eden tüm merge'leri kaldır (9:10 gibi merge'ler dahil)
+        if mr.min_row <= band_row <= mr.max_row:
             try:
                 ws.unmerge_cells(str(mr))
             except Exception:
@@ -1938,7 +2059,10 @@ def export_plan_ozet_range(out_path, data: dict) -> None:
 
     # Row 9 temizle
     for c in range(day_start_col, max_write_col + 1):
-        ws.cell(band_row, c).value = None
+        cell = ws.cell(band_row, c)
+        if isinstance(cell, MergedCell):
+            continue
+        cell.value = None
 
     # Gün kolonları üstündeki ay bloklarını oluştur (tek ay ise tek blok)
     if len(dates) > 0:
@@ -1985,6 +2109,8 @@ def export_plan_ozet_range(out_path, data: dict) -> None:
 
         for c in range(sum_start_col, sum_end_col + 1):
             dst = ws.cell(band_row, c)
+            if isinstance(dst, MergedCell):
+                continue
             dst.font = copy(ref_cell.font)
             dst.fill = copy(ref_cell.fill)
             dst.border = copy(ref_cell.border)

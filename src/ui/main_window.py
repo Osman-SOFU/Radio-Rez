@@ -246,7 +246,9 @@ class MainWindow(QMainWindow):
         layout.addLayout(row1)
         
         row1.addWidget(QLabel("Reklam veren:"))
-        self.in_advertiser = QLineEdit()
+        self.in_advertiser = QComboBox()
+        self.in_advertiser.setEditable(True)
+        self.in_advertiser.setMinimumWidth(260)
         row1.addWidget(self.in_advertiser, 2)
 
         row2 = QHBoxLayout()
@@ -301,6 +303,7 @@ class MainWindow(QMainWindow):
         self.cb_active_code.currentIndexChanged.connect(self.on_active_code_changed)
         self.btn_select_channels.clicked.connect(self.on_select_channels)
         self.btn_apply_range.clicked.connect(self.on_apply_date_range)
+        self.in_advertiser.currentTextChanged.connect(self.on_main_advertiser_changed)
 
         # tarih aralığı defaultu: mevcut ay
         today = self.in_date.date()
@@ -337,6 +340,40 @@ class MainWindow(QMainWindow):
         finally:
             self.in_channel.blockSignals(False)
 
+    def refresh_advertiser_combo(self) -> None:
+        """Ana sayfadaki Reklam veren combobox listesini DB'den yeniler."""
+        if not getattr(self, "repo", None) or not hasattr(self, "in_advertiser"):
+            return
+        try:
+            current = (self.in_advertiser.currentText() or "").strip()
+        except Exception:
+            current = ""
+        advs = []
+        try:
+            advs = self.repo.list_advertisers()
+        except Exception:
+            advs = []
+        self.in_advertiser.blockSignals(True)
+        try:
+            self.in_advertiser.clear()
+            self.in_advertiser.addItem("")
+            for a in advs:
+                self.in_advertiser.addItem(a)
+            meta_adv = ""
+            try:
+                meta_adv = (self.repo.get_meta("main_advertiser") or "").strip()
+            except Exception:
+                meta_adv = ""
+            pick = current or meta_adv
+            if pick:
+                idx = self.in_advertiser.findText(pick)
+                if idx >= 0:
+                    self.in_advertiser.setCurrentIndex(idx)
+                else:
+                    self.in_advertiser.setCurrentText(pick)
+        finally:
+            self.in_advertiser.blockSignals(False)
+
     def bootstrap_storage(self) -> None:
         ensure_data_folders(self.app_settings.data_dir)
         db_path = self.app_settings.data_dir / "data.db"
@@ -347,10 +384,16 @@ class MainWindow(QMainWindow):
 
         # UI bağımlı listeleri yenile
         self.refresh_channel_combo()
+        self.refresh_advertiser_combo()
         try:
             self.refresh_reservation_channel_filter()
-        except Exception:
-            pass
+        except Exception as e:
+                    try:
+                        dbg = out_dir_base / "_debug_prices.txt"
+                        with dbg.open("a", encoding="utf-8") as f:
+                            f.write(f"PRICE UPDATE ERROR {res_no}: {e}")
+                    except Exception:
+                        pass
 
     def pick_data_folder(self) -> None:
         p = QFileDialog.getExistingDirectory(self, "Veri klasörünü seç")
@@ -387,7 +430,7 @@ class MainWindow(QMainWindow):
             return
         p = recs[0].payload or {}
         # Plan başlığı seçimi ile birlikte reklamvereni de payload içinden güncelle
-        self.in_advertiser.setText(str(p.get("advertiser_name") or ""))
+        self.in_advertiser.setCurrentText(str(p.get("advertiser_name") or ""))
 
         # Basit alanlar
         self.in_agency.setText(str(p.get("agency_name", "") or ""))
@@ -443,6 +486,7 @@ class MainWindow(QMainWindow):
             pass
 
         self.refresh_channel_combo()
+        self.refresh_advertiser_combo()
         ch = str(p.get("channel_name", "") or "").strip()
         if ch:
             idx = self.in_channel.findText(ch)
@@ -508,6 +552,22 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+
+    def on_main_advertiser_changed(self, text: str) -> None:
+        """Ana sayfa reklam veren seçimi değişince meta'ya yaz.
+
+        Not: Burada advertisers tablosuna INSERT YAPMIYORUZ.
+        Çünkü editable combobox'ta her harf ("a", "os" vs.) currentTextChanged tetikler.
+        Reklam veren ancak gerçek bir işlemde (rezervasyon kaydı / fiyat sayfasında ekle-kaydet)
+        tabloya yazılmalıdır.
+        """
+        if not getattr(self, "repo", None):
+            return
+        nm = (text or "").strip()
+        try:
+            self.repo.set_meta("main_advertiser", nm)
+        except Exception:
+            pass
 
     # -------------------------
     # Çoklu Kod Tanımları (ANA SAYFA)
@@ -613,6 +673,19 @@ class MainWindow(QMainWindow):
     def on_remove_code_def(self) -> None:
         row = self.tbl_codes.currentRow()
         if row < 0:
+            return
+
+        code = (self.tbl_codes.item(row, 0).text() if self.tbl_codes.item(row, 0) else "").strip()
+        desc = (self.tbl_codes.item(row, 1).text() if self.tbl_codes.item(row, 1) else "").strip()
+
+        ask = QMessageBox.question(
+            self,
+            "Onay",
+            f"Seçili kod silinsin mi?\n\nKod: {code}\nTanım: {desc}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ask != QMessageBox.Yes:
             return
         self.tbl_codes.removeRow(row)
         self._sync_active_code_combo()
@@ -792,7 +865,7 @@ class MainWindow(QMainWindow):
         try:
             # Rezervasyon Excel çıktıları bu klasöre üretilecek.
             template_path = self._resolve_template_path()
-            out_dir = self.app_settings.data_dir / "exports"
+            out_dir_base = self.app_settings.data_dir / "exports"
             out_paths: list[Path] = []
             export_failures: list[str] = []
 
@@ -836,8 +909,8 @@ class MainWindow(QMainWindow):
             channels = self.repo.list_channels(active_only=False)
             ch_by_norm = {str(c.get("name") or "").strip().lower(): c for c in channels}
 
-            # Year bazlı fiyat haritaları cache'i
-            price_maps: dict[int, dict[tuple[int, int], tuple[float, float]]] = {}
+            # Reklam veren + year bazlı fiyat haritaları cache'i
+            price_maps: dict[tuple[str, int], dict[tuple[int, int], tuple[float, float]]] = {}
 
             # DB kayıtları
             created = []
@@ -877,12 +950,15 @@ class MainWindow(QMainWindow):
                     QMessageBox.information(self, "Bilgi", "Kaydedilecek bir hücre bulunamadı.")
                     return
 
+                adv_name = (self.in_advertiser.currentText() or "").strip()
+                cache_key = (adv_name.casefold(), int(rs.year))
+
                 # Başlangıç yılındaki fiyat haritası (draft için)
-                if rs.year not in price_maps:
+                if cache_key not in price_maps:
                     try:
-                        price_maps[rs.year] = self.repo.get_channel_prices(rs.year)
+                        price_maps[cache_key] = self.repo.get_channel_prices(rs.year, adv_name)
                     except Exception:
-                        price_maps[rs.year] = {}
+                        price_maps[cache_key] = {}
 
                 for ch_name in selected_channels:
                     ch = ch_by_norm.get(ch_name.strip().lower())
@@ -890,10 +966,10 @@ class MainWindow(QMainWindow):
                     dt_price = 0.0
                     odt_price = 0.0
                     if ch_id is not None:
-                        dt_price, odt_price = price_maps[rs.year].get((ch_id, int(rs.month)), (0.0, 0.0))
+                        dt_price, odt_price = price_maps[cache_key].get((ch_id, int(rs.month)), (0.0, 0.0))
 
                     draft = ReservationDraft(
-                        advertiser_name=self.in_advertiser.text().strip(),
+                        advertiser_name=adv_name,
                         plan_date=rs,  # referans tarih: aralığın başlangıcı
                         spot_time=spot_t,
                         channel_name=ch_name,
@@ -920,6 +996,27 @@ class MainWindow(QMainWindow):
                     payload2["span_start"] = rs.isoformat()
                     payload2["span_end"] = re.isoformat()
                     payload2["span_month_matrices"] = span_month_matrices_db
+                    # Span export'ta ay bazlı birim fiyatlar doğru olsun diye (YYYY-MM -> DT/ODT)
+                    span_month_prices: dict[str, object] = {}
+                    try:
+                        for ym in (span_month_matrices_db or {}).keys():
+                            if isinstance(ym, str) and "-" in ym:
+                                yy_s, mm_s = ym.split("-", 1)
+                                yy_i = int(yy_s)
+                                mm_i = int(mm_s)
+                                ck2 = (adv_name.casefold(), int(yy_i))
+                                if ck2 not in price_maps:
+                                    try:
+                                        price_maps[ck2] = self.repo.get_channel_prices(yy_i, adv_name)
+                                    except Exception:
+                                        price_maps[ck2] = {}
+                                if ch_id is not None:
+                                    pdt, podt = price_maps[ck2].get((int(ch_id), int(mm_i)), (0.0, 0.0))
+                                    span_month_prices[f"{yy_i:04d}-{mm_i:02d}"] = {"dt": float(pdt), "odt": float(podt)}
+                    except Exception:
+                        span_month_prices = {}
+                    payload2["span_month_prices"] = span_month_prices
+
 
                     dbrec = self.repo.create_reservation(
                         advertiser_name=str(payload2.get("advertiser_name") or "").strip(),
@@ -939,11 +1036,13 @@ class MainWindow(QMainWindow):
                     if not any(str(v).strip() for v in cells.values()):
                         continue
 
-                    if yy not in price_maps:
+                    adv_name = (self.in_advertiser.currentText() or "").strip()
+                    cache_key = (adv_name.casefold(), int(yy))
+                    if cache_key not in price_maps:
                         try:
-                            price_maps[yy] = self.repo.get_channel_prices(yy)
+                            price_maps[cache_key] = self.repo.get_channel_prices(yy, adv_name)
                         except Exception:
-                            price_maps[yy] = {}
+                            price_maps[cache_key] = {}
 
                     plan_date = date(yy, mm, 1)
 
@@ -953,10 +1052,10 @@ class MainWindow(QMainWindow):
                         dt_price = 0.0
                         odt_price = 0.0
                         if ch_id is not None:
-                            dt_price, odt_price = price_maps[yy].get((ch_id, int(mm)), (0.0, 0.0))
+                            dt_price, odt_price = price_maps[cache_key].get((ch_id, int(mm)), (0.0, 0.0))
 
                         draft = ReservationDraft(
-                            advertiser_name=self.in_advertiser.text().strip(),
+                            advertiser_name=adv_name,
                             plan_date=plan_date,
                             spot_time=spot_t,
                             channel_name=ch_name,
@@ -986,10 +1085,15 @@ class MainWindow(QMainWindow):
                         try:
                             from src.export.excel_exporter import export_excel
 
-                            out_path = out_dir / f"{dbrec.reservation_no}.xlsx"
                             payload2 = dict(dbrec.payload or {})
                             payload2["reservation_no"] = dbrec.reservation_no
                             payload2["created_at"] = dbrec.created_at
+                            export_dir = self._get_export_dir(
+                                out_dir_base,
+                                str(payload2.get("advertiser_name") or "").strip(),
+                                str(payload2.get("product_name") or "").strip(),
+                            )
+                            out_path = export_dir / f"{dbrec.reservation_no}.xlsx"
                             export_excel(template_path, out_path, payload2)
                             out_paths.append(out_path)
                         except Exception as ex2:
@@ -1011,7 +1115,12 @@ class MainWindow(QMainWindow):
                         payload_span["created_at"] = getattr(r, "created_at", None)
 
                         fname = f"{payload_span['reservation_no']}.xlsx"
-                        out_path = out_dir / fname
+                        export_dir = self._get_export_dir(
+                            out_dir_base,
+                            str(payload_span.get("advertiser_name") or "").strip(),
+                            str(payload_span.get("product_name") or "").strip(),
+                        )
+                        out_path = export_dir / fname
                         export_excel_span(
                             template_path=template_path,
                             out_path=out_path,
@@ -1030,7 +1139,7 @@ class MainWindow(QMainWindow):
                 f"DB'ye {len(created)} kayıt eklendi.\n"
                 f"(Kanal x Ay kırılımı)\n\n"
                 f"Excel çıktısı: {len(out_paths)} adet\n"
-                f"Klasör: {out_dir}\n\n"
+                f"Klasör: {out_dir_base}\n\n"
                 f"İpucu: Rezervasyonlar sekmesinden filtreleyebilirsin.",
             )
 
@@ -1114,11 +1223,13 @@ class MainWindow(QMainWindow):
                 if not any(str(v).strip() for v in (cells or {}).values()):
                     continue
 
-                if yy not in price_maps:
+                adv_name = (self.in_advertiser.currentText() or "").strip()
+                cache_key = (adv_name.casefold(), int(yy))
+                if cache_key not in price_maps:
                     try:
-                        price_maps[yy] = self.repo.get_channel_prices(yy)
+                        price_maps[cache_key] = self.repo.get_channel_prices(yy, adv_name)
                     except Exception:
-                        price_maps[yy] = {}
+                        price_maps[cache_key] = {}
 
                 for ch_name in selected_channels:
                     ch = ch_by_norm.get(ch_name.strip().lower())
@@ -1126,10 +1237,10 @@ class MainWindow(QMainWindow):
                     dt_price = 0.0
                     odt_price = 0.0
                     if ch_id is not None:
-                        dt_price, odt_price = price_maps[yy].get((ch_id, int(mm)), (0.0, 0.0))
+                        dt_price, odt_price = price_maps[cache_key].get((ch_id, int(mm)), (0.0, 0.0))
 
                     draft = ReservationDraft(
-                        advertiser_name=self.in_advertiser.text(),
+                        advertiser_name=adv_name,
                         plan_date=date(yy, mm, 1),
                         spot_time=spot_t,
                         channel_name=ch_name,
@@ -1222,7 +1333,7 @@ class MainWindow(QMainWindow):
 
     def reset_form_for_new_reservation(self) -> None:
         self._loaded_reservation_id = None
-        self.in_advertiser.clear()
+        self.in_advertiser.setCurrentText("")
         self.in_agency.clear()
         self.in_product.clear()
         self.in_plan_title.clear()
@@ -1242,6 +1353,7 @@ class MainWindow(QMainWindow):
         self.in_range_end.setDate(last)
 
         self.refresh_channel_combo()
+        self.refresh_advertiser_combo()
         if self.in_channel.count() > 0:
             self.in_channel.setCurrentIndex(0)
 
@@ -1529,7 +1641,7 @@ class MainWindow(QMainWindow):
         """Kayıtlı rezervasyonu ANA SAYFA formuna basar."""
         p = rec.payload or {}
 
-        self.in_advertiser.setText(str(p.get("advertiser_name", "") or ""))
+        self.in_advertiser.setCurrentText(str(p.get("advertiser_name", "") or ""))
         self.in_agency.setText(str(p.get("agency_name", "") or ""))
         self.in_product.setText(str(p.get("product_name", "") or ""))
         self.in_plan_title.setText(str(p.get("plan_title", "") or ""))
@@ -1580,6 +1692,7 @@ class MainWindow(QMainWindow):
             pass
 
         self.refresh_channel_combo()
+        self.refresh_advertiser_combo()
         ch = str(p.get("channel_name", "") or "").strip()
         if ch:
             idx = self.in_channel.findText(ch)
@@ -1669,6 +1782,44 @@ class MainWindow(QMainWindow):
         ids = [int(r.id) for r in recs]
         self.repo.delete_reservations_by_ids(ids)
 
+        # DB'den silinen rezervasyonların Excel dosyalarını da exports klasöründen temizle
+        try:
+            exports_root = (self.app_settings.data_dir / "exports")
+            removed = 0
+            failed: list[str] = []
+            for r in recs:
+                res_no = str(getattr(r, "reservation_no", "") or "").strip()
+                if not res_no:
+                    continue
+                payload = dict(getattr(r, "payload", {}) or {})
+                adv = str(payload.get("advertiser_name") or "").strip()
+                prod = str(payload.get("product_name") or "").strip()
+
+                # 1) beklenen klasör (ReklamVeren/Ürün)
+                try:
+                    adv_dir = self._safe_fs_name(adv, "Reklam Veren Yok")
+                    prod_dir = self._safe_fs_name(prod, "Ürün Yok")
+                    exp_dir = exports_root / adv_dir / prod_dir
+                    p = exp_dir / f"{res_no}.xlsx"
+                    if p.exists():
+                        p.unlink()
+                        removed += 1
+                except Exception as exf1:
+                    failed.append(f"{res_no}: {exf1}")
+
+                # 2) güvenli: exports içinde başka yerde varsa da sil
+                try:
+                    for p2 in exports_root.glob(f"**/{res_no}.xlsx"):
+                        if p2.exists():
+                            p2.unlink()
+                            removed += 1
+                except Exception as exf2:
+                    failed.append(f"{res_no}: {exf2}")
+
+            # Sessiz geç, sadece debug için; UI'yi kirletme
+        except Exception:
+            pass
+
         # eğer formda yüklü olan kayıt silindiyse form id'sini temizle
         if self._loaded_reservation_id in ids:
             self._loaded_reservation_id = None
@@ -1708,6 +1859,29 @@ class MainWindow(QMainWindow):
         except Exception as ex:
             QMessageBox.warning(self, "Hata", f"Exports klasörü açılamadı: {ex}")
 
+    def _safe_fs_name(self, text: str, fallback: str = "Bilinmeyen") -> str:
+        """Klasör/dosya isimlerinde sorun çıkaracak karakterleri temizler."""
+        t = (text or "").strip()
+        if not t:
+            t = fallback
+        # Windows uyumluluğu
+        bad = '<>:\\"/|?*'
+        for ch in bad:
+            t = t.replace(ch, "_")
+        # boşlukları toparla
+        t = " ".join(t.split())
+        # çok uzamasın
+        if len(t) > 60:
+            t = t[:60].rstrip()
+        return t
+
+    def _get_export_dir(self, exports_root: Path, advertiser_name: str, product_name: str) -> Path:
+        adv = self._safe_fs_name(advertiser_name, "Reklam Veren Yok")
+        prod = self._safe_fs_name(product_name, "Ürün Yok")
+        out_dir = exports_root / adv / prod
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
     def _export_reservation_records(self, recs: list) -> None:
         if not recs:
             QMessageBox.information(self, "Bilgi", "Export edilecek kayıt yok.")
@@ -1715,8 +1889,8 @@ class MainWindow(QMainWindow):
 
         try:
             template_path = self._resolve_template_path()
-            out_dir = self.app_settings.data_dir / "exports"
-            out_dir.mkdir(parents=True, exist_ok=True)
+            out_dir_base = self.app_settings.data_dir / "exports"
+            out_dir_base.mkdir(parents=True, exist_ok=True)
 
             from src.export.excel_exporter import export_excel
 
@@ -1733,7 +1907,54 @@ class MainWindow(QMainWindow):
                 payload2["reservation_no"] = res_no
                 payload2["created_at"] = str(getattr(r, "created_at", "") or "")
 
-                out_path = out_dir / f"{res_no}.xlsx"
+                # --- Birim fiyatları export anında güncelle ---
+                # Rezervasyon kaydındaki payload eski fiyat (örn 100/80) taşıyabilir.
+                # Plan Özet doğru fiyatı alırken, rezervasyon Excel'i eski fiyattan
+                # çıkmasın diye DB'deki güncel fiyat tablosunu esas alıyoruz.
+                try:
+                    adv_name = str(payload2.get("advertiser_name") or "").strip()
+                    ch_name = str(payload2.get("channel_name") or "").strip().lower()
+
+                    # ay/yıl: span ise span_start, değilse plan_date (yoksa mevcut alanlar)
+                    ref_date = payload2.get("span_start") if payload2.get("is_span") else payload2.get("plan_date")
+                    if ref_date:
+                        yy, mm, *_ = str(ref_date).split("-")
+                        yy = int(yy)
+                        mm = int(mm)
+                    else:
+                        yy = int(payload2.get("year") or self.price_year.value())
+                        mm = int(payload2.get("month") or 1)
+
+                    ch_id = None
+                    for ch in self.repo.list_channels(active_only=False):
+                        if (str(ch.get("name") or "")).strip().lower() == ch_name:
+                            ch_id = int(ch.get("id"))
+                            break
+
+                    if ch_id is not None:
+                        pmap = self.repo.get_channel_prices(yy, adv_name)
+                        dt, odt = pmap.get(
+                            (ch_id, mm),
+                            (payload2.get("channel_price_dt", 0), payload2.get("channel_price_odt", 0)),
+                        )
+                        payload2["channel_price_dt"] = float(dt or 0)
+                        payload2["channel_price_odt"] = float(odt or 0)
+                        # debug: yazılan fiyatları export klasörüne logla
+                        try:
+                            dbg = out_dir_base / "_debug_prices.txt"
+                            with dbg.open("a", encoding="utf-8") as f:
+                                f.write(f"{res_no} | {adv_name} | {payload2.get('channel_name')} | {yy}-{mm:02d} | dt={payload2.get('channel_price_dt')} odt={payload2.get('channel_price_odt')}\n")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                export_dir = self._get_export_dir(
+                    out_dir_base,
+                    str(payload2.get("advertiser_name") or "").strip(),
+                    str(payload2.get("product_name") or "").strip(),
+                )
+                out_path = export_dir / f"{res_no}.xlsx"
                 try:
                     if bool(payload2.get("is_span")) and payload2.get("span_start") and payload2.get("span_end"):
                         from src.export.excel_exporter import export_excel_span
@@ -1763,7 +1984,7 @@ class MainWindow(QMainWindow):
             # Sonuç mesajı
             msg = (
                 f"Excel çıktısı üretildi: {len(ok_paths)} adet\n"
-                f"Klasör: {out_dir}\n\n"
+                f"Klasör: {out_dir_base}\n\n"
                 "Not: Aynı rezervasyon no ile dosya varsa üzerine yazar."
             )
             QMessageBox.information(self, "Export", msg)
@@ -2699,11 +2920,21 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         layout.addLayout(top)
 
+        top.addWidget(QLabel("Reklam Veren:"))
+        self.price_advertiser = QComboBox()
+        self.price_advertiser.setEditable(True)
+        self.price_advertiser.setMinimumWidth(260)
+        top.addWidget(self.price_advertiser)
+
         top.addWidget(QLabel("Yıl:"))
         self.price_year = QSpinBox()
         self.price_year.setRange(2000, 2100)
         self.price_year.setValue(datetime.now().year)
         top.addWidget(self.price_year)
+
+        self.btn_adv_add = QPushButton("Reklam Veren Ekle")
+        self.btn_adv_rename = QPushButton("Adı Değiştir")
+        self.btn_adv_delete = QPushButton("Reklam Veren Sil")
 
         self.btn_price_refresh = QPushButton("Yenile")
         self.btn_price_save = QPushButton("Kaydet")
@@ -2711,6 +2942,9 @@ class MainWindow(QMainWindow):
         self.btn_channel_delete = QPushButton("Seçili Kanalı Sil")
 
         top.addStretch(1)
+        top.addWidget(self.btn_adv_add)
+        top.addWidget(self.btn_adv_rename)
+        top.addWidget(self.btn_adv_delete)
         top.addWidget(self.btn_channel_add)
         top.addWidget(self.btn_channel_delete)
         top.addWidget(self.btn_price_refresh)
@@ -2734,9 +2968,13 @@ class MainWindow(QMainWindow):
         # Wire
         self.btn_price_refresh.clicked.connect(self.refresh_price_channel_tab)
         self.price_year.valueChanged.connect(lambda _v: self.refresh_price_channel_tab())
+        self.price_advertiser.currentTextChanged.connect(lambda _t: self.refresh_price_channel_tab())
         self.btn_price_save.clicked.connect(self.save_price_channel_tab)
         self.btn_channel_add.clicked.connect(self.add_channel_dialog)
         self.btn_channel_delete.clicked.connect(self.delete_selected_channel)
+        self.btn_adv_add.clicked.connect(self.add_price_advertiser)
+        self.btn_adv_delete.clicked.connect(self.delete_price_advertiser)
+        self.btn_adv_rename.clicked.connect(self.rename_price_advertiser)
 
     def _month_names_tr(self) -> list[str]:
         return ["OCAK", "ŞUBAT", "MART", "NİSAN", "MAYIS", "HAZİRAN", "TEMMUZ", "AĞUSTOS", "EYLÜL", "EKİM", "KASIM", "ARALIK"]
@@ -2744,6 +2982,32 @@ class MainWindow(QMainWindow):
     def refresh_price_channel_tab(self) -> None:
         if not self.repo:
             return
+
+        # Reklam veren listesini yenile
+        try:
+            current_adv = (self.price_advertiser.currentText() or "").strip()
+            advs = self.repo.list_advertisers()
+            self.price_advertiser.blockSignals(True)
+            self.price_advertiser.clear()
+            self.price_advertiser.addItem("")
+            for a in advs:
+                self.price_advertiser.addItem(a)
+
+            meta_adv = (self.repo.get_meta("price_advertiser") or "").strip()
+            pick = current_adv or meta_adv
+            if pick:
+                # yoksa yazsın (editable)
+                idx = self.price_advertiser.findText(pick)
+                if idx >= 0:
+                    self.price_advertiser.setCurrentIndex(idx)
+                else:
+                    self.price_advertiser.setCurrentText(pick)
+            self.price_advertiser.blockSignals(False)
+        except Exception:
+            try:
+                self.price_advertiser.blockSignals(False)
+            except Exception:
+                pass
 
         # Meta'dan son seçilen yılı çek
         meta_year = self.repo.get_meta("price_year")
@@ -2757,6 +3021,12 @@ class MainWindow(QMainWindow):
         year = int(self.price_year.value())
         try:
             self.repo.set_meta("price_year", str(year))
+        except Exception:
+            pass
+
+        adv_name = (self.price_advertiser.currentText() or "").strip()
+        try:
+            self.repo.set_meta("price_advertiser", adv_name)
         except Exception:
             pass
 
@@ -2778,7 +3048,7 @@ class MainWindow(QMainWindow):
             self.price_table.setColumnWidth(c, 55)
 
         channels = self.repo.list_channels(active_only=True)
-        prices = self.repo.get_channel_prices(year)
+        prices = self.repo.get_channel_prices(year, adv_name)
 
         self.price_table.setRowCount(len(channels))
 
@@ -2834,6 +3104,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Hata", "DB bağlantısı yok.")
             return
 
+        adv_name = (self.price_advertiser.currentText() or "").strip()
+        if not adv_name:
+            QMessageBox.warning(self, "Hata", "Fiyat kaydı için önce Reklam Veren seçmelisin.")
+            return
+
         # Hücre editöründe kalmış değer varsa (Enter'a basılmadıysa), kaydetmeden önce commit edelim.
         try:
             editor = QApplication.focusWidget()
@@ -2864,14 +3139,87 @@ class MainWindow(QMainWindow):
                 for m in range(1, 13):
                     price_dt = self._parse_float_cell(self.price_table.item(r, col))
                     price_odt = self._parse_float_cell(self.price_table.item(r, col + 1))
-                    self.repo.upsert_channel_price(year, m, channel_id, price_dt, price_odt)
+                    self.repo.upsert_channel_price(year, m, channel_id, price_dt, price_odt, adv_name)
                     col += 2
 
             self.repo.set_meta("price_year", str(year))
+            self.repo.set_meta("price_advertiser", adv_name)
+            self.repo.upsert_advertiser(adv_name)
             QMessageBox.information(self, "Tamam", "Fiyatlar kaydedildi.")
             self.refresh_channel_combo()
+            self.refresh_advertiser_combo()
         except Exception as e:
             QMessageBox.critical(self, "Hata", f"Kayıt sırasında hata: {e}")
+
+    def add_price_advertiser(self) -> None:
+        if not self.repo:
+            return
+        name = (self.price_advertiser.currentText() or "").strip()
+        if not name:
+            name, ok = QInputDialog.getText(self, "Reklam Veren Ekle", "Reklam veren adı:")
+            if not ok:
+                return
+            name = (name or "").strip()
+        if not name:
+            return
+        try:
+            self.repo.upsert_advertiser(name)
+            self.repo.set_meta("price_advertiser", name)
+            self.refresh_price_channel_tab()
+            self.price_advertiser.setCurrentText(name)
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", str(e))
+
+    def delete_price_advertiser(self) -> None:
+        if not self.repo:
+            return
+        name = (self.price_advertiser.currentText() or "").strip()
+        if not name:
+            return
+        ask = QMessageBox.question(
+            self,
+            "Onay",
+            f"'{name}' reklam verenine ait tüm fiyat tanımları silinecek.\n\nDevam edelim mi?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ask != QMessageBox.Yes:
+            return
+        try:
+            self.repo.delete_advertiser_prices(name)
+            # meta temizle
+            try:
+                if (self.repo.get_meta("price_advertiser") or "").strip().lower() == name.lower():
+                    self.repo.set_meta("price_advertiser", "")
+                if (self.repo.get_meta("main_advertiser") or "").strip().lower() == name.lower():
+                    self.repo.set_meta("main_advertiser", "")
+            except Exception:
+                pass
+            self.refresh_price_channel_tab()
+            QMessageBox.information(self, "Tamam", "Fiyat tanımları silindi.")
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", str(e))
+
+    def rename_price_advertiser(self) -> None:
+        if not self.repo:
+            return
+        old = (self.price_advertiser.currentText() or "").strip()
+        if not old:
+            return
+        new, ok = QInputDialog.getText(self, "Reklam Veren Adı", f"Yeni ad (eski: {old}):")
+        if not ok:
+            return
+        new = (new or "").strip()
+        if not new or new == old:
+            return
+        try:
+            self.repo.rename_advertiser_prices(old, new)
+            self.repo.set_meta("price_advertiser", new)
+            self.refresh_price_channel_tab()
+            self.price_advertiser.setCurrentText(new)
+            QMessageBox.information(self, "Tamam", "Reklam veren adı güncellendi.")
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", str(e))
 
     def add_channel_dialog(self) -> None:
         if not self.repo:
@@ -2889,6 +3237,7 @@ class MainWindow(QMainWindow):
             self.repo.get_or_create_channel(name)
             self.refresh_price_channel_tab()
             self.refresh_channel_combo()
+            self.refresh_advertiser_combo()
         except Exception as e:
             QMessageBox.critical(self, "Hata", f"Kanal eklenemedi: {e}")
 
@@ -2926,6 +3275,7 @@ class MainWindow(QMainWindow):
             self.repo.deactivate_channel(int(cid))
             self.refresh_price_channel_tab()
             self.refresh_channel_combo()
+            self.refresh_advertiser_combo()
         except Exception as e:
             QMessageBox.critical(self, "Hata", f"Silinemedi: {e}")
 
