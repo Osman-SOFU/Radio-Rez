@@ -62,7 +62,8 @@ def _build_prepared_stamp(payload: dict[str, Any]) -> str:
         or payload.get("created_user_fullname")
         or ""
     )
-    dt = _parse_created_dt_from_payload(payload) or datetime.now()
+    # Kullanıcı beklentisi: export anındaki sistem tarih-saatini yaz.
+    dt = datetime.now()
     stamp = dt.strftime("%d.%m.%Y %H:%M")
     return f"{name} - {stamp}" if name else stamp
 
@@ -124,6 +125,40 @@ def _fix_daily_totals_row(ws, *, start_row: int = 8, end_row: int = 59, totals_r
         col = start_col + i
         col_letter = get_column_letter(col)
         ws.cell(row=totals_row, column=col).value = f"=COUNTA({col_letter}{start_row}:{col_letter}{end_row})"
+
+
+def _fix_reservation_summary_row(
+    ws,
+    *,
+    start_row: int = 8,
+    end_row: int = 59,
+    totals_row: int = 60,
+) -> None:
+    """Rezervasyon çıktısındaki 60. satır özet formüllerini kullanıcı şablonuna göre sabitler.
+
+    Şablonda doğru toplamlar aşağıdaki gibidir:
+      - AI60 = SUM(AI8:AI59)  -> Bedelli Adet
+      - AJ60 = SUM(AJ8:AJ59)  -> Bedelsiz Adet
+      - AK60 = SUM(AK8:AK59)  -> Barter Adet
+      - AL60 = SUM(AI60:AK60) -> Toplam Adet
+      - AM60 = SUM(AM8:AM59)  -> Bedelli Süre
+
+    Not: Önceki patch'te AI60/AM60 farklı mantıkla override edildiği için toplamlar kayabiliyordu.
+    Burada kullanıcı şablonundaki yerleşime sadık kalıyoruz.
+    """
+    ws[f"AI{totals_row}"].value = f"=SUM(AI{start_row}:AI{end_row})"
+    ws[f"AJ{totals_row}"].value = f"=SUM(AJ{start_row}:AJ{end_row})"
+    ws[f"AK{totals_row}"].value = f"=SUM(AK{start_row}:AK{end_row})"
+    ws[f"AL{totals_row}"].value = f"=+SUM(AI{totals_row}:AK{totals_row})"
+    ws[f"AM{totals_row}"].value = f"=SUM(AM{start_row}:AM{end_row})"
+    try:
+        ws[f"AN{totals_row}"].value = f"=SUM(AN{start_row}:AN{end_row})"
+    except Exception:
+        pass
+    try:
+        ws[f"AO{totals_row}"].value = f"=SUM(AO{start_row}:AO{end_row})"
+    except Exception:
+        pass
 
 
 def _fill_unit_prices_span_sheet(ws, payload: dict, chunk_start: date) -> None:
@@ -556,11 +591,8 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
     note = str(payload.get("note_text", "")).strip()
     ws["A77"].value = "NOT:" if not note else f"NOT: {note}"
 
-    # İsim + oluşturulma zamanı (AK77)
-    try:
-        ws["AK77"].value = _build_prepared_stamp(payload)
-    except Exception:
-        pass
+    _fix_daily_totals_row(ws)
+    _fix_reservation_summary_row(ws)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
@@ -965,7 +997,8 @@ def _export_excel_span_legacy(
         note = str(payload.get("note_text", "")).strip()
         ws["A77"].value = "NOT:" if not note else f"NOT: {note}"
 
-        ws["AK77"].value = pb
+        _fix_daily_totals_row(ws)
+        _fix_reservation_summary_row(ws)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(out_path)
@@ -1149,6 +1182,13 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
             note_str = str(note).strip()
             ws["A77"] = note_str if note_str.lower().startswith("not") else f"NOT: {note_str}"
 
+        # Formu oluşturan kişi + export anı tarih/saat (AO77 ve AK77)
+        try:
+            pb = _build_prepared_stamp(payload)
+            ws["AO77"] = pb
+        except Exception:
+            pass
+
 
     def _fill_rates(ws):
         usd = payload.get("usd_rate")
@@ -1308,6 +1348,7 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
 
         _apply_commission(ws)
         _fill_code_table_and_duration_formulas(ws)
+        _fix_reservation_summary_row(ws)
 
     # Save
     out_path = Path(out_path)
