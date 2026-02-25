@@ -295,6 +295,7 @@ class MainWindow(QMainWindow):
 
         # Tarih değişince grid ay/gün vurgusunu güncelle
         self.in_date.dateChanged.connect(self.on_plan_date_changed)
+        self.in_channel.currentTextChanged.connect(self.on_channel_changed)
 
         # Kod ve kanal aksiyonları
         self.btn_add_code.clicked.connect(self.on_add_code_def)
@@ -339,6 +340,42 @@ class MainWindow(QMainWindow):
                     self.in_channel.setCurrentIndex(idx)
         finally:
             self.in_channel.blockSignals(False)
+
+        self._apply_channel_access_ratio_to_grid()
+
+    def _get_home_access_year(self) -> int:
+        try:
+            return int(self.in_date.date().toPython().year)
+        except Exception:
+            return int(datetime.now().year)
+
+    def _apply_channel_access_ratio_to_grid(self, channel_name: str | None = None) -> None:
+        if not hasattr(self, "plan_grid") or self.plan_grid is None:
+            return
+        try:
+            ch = str(channel_name or self.in_channel.currentText() or "").strip()
+        except Exception:
+            ch = ""
+        if not ch or not getattr(self, "repo", None):
+            try:
+                self.plan_grid.set_access_hour_map({})
+            except Exception:
+                pass
+            return
+
+        try:
+            year = self._get_home_access_year()
+            set_id = self.repo.get_latest_access_set_id_for_year(int(year)) or self.repo.get_latest_access_set_id()
+            hour_map = self.repo.get_access_channel_hour_map(int(set_id), ch) if set_id else {}
+            self.plan_grid.set_access_hour_map(hour_map or {})
+        except Exception:
+            try:
+                self.plan_grid.set_access_hour_map({})
+            except Exception:
+                pass
+
+    def on_channel_changed(self, text: str) -> None:
+        self._apply_channel_access_ratio_to_grid(text)
 
     def refresh_advertiser_combo(self) -> None:
         """Ana sayfadaki Reklam veren combobox listesini DB'den yeniler."""
@@ -525,6 +562,7 @@ class MainWindow(QMainWindow):
         try:
             if getattr(self.plan_grid, "is_span_mode", lambda: False)():
                 self.plan_grid.set_selected_date(d)
+                self._apply_channel_access_ratio_to_grid()
                 return
         except Exception:
             pass
@@ -552,6 +590,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+        self._apply_channel_access_ratio_to_grid()
 
     def on_main_advertiser_changed(self, text: str) -> None:
         """Ana sayfa reklam veren seçimi değişince meta'ya yaz.
@@ -807,6 +846,7 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.in_channel.setCurrentIndex(idx)
 
+        self._apply_channel_access_ratio_to_grid()
 
     # -------------------------
     # Tarih Aralığı (multi-month)
@@ -837,10 +877,12 @@ class MainWindow(QMainWindow):
             self._current_month_key = (rs.year, rs.month)
 
             self.plan_grid.set_date_span(rs, re, selected_date=sel)
+            self._apply_channel_access_ratio_to_grid()
         except Exception:
             # Fallback: en azından eski davranış bozulmasın
             try:
                 self.plan_grid.set_month(rs.year, rs.month, rs.day)
+                self._apply_channel_access_ratio_to_grid()
             except Exception:
                 pass
 
@@ -1093,7 +1135,8 @@ class MainWindow(QMainWindow):
                                 str(payload2.get("advertiser_name") or "").strip(),
                                 str(payload2.get("product_name") or "").strip(),
                             )
-                            out_path = export_dir / f"{dbrec.reservation_no}.xlsx"
+                            out_name = self._build_reservation_excel_name(payload2, str(dbrec.reservation_no or ""))
+                            out_path = self._unique_export_path(export_dir, out_name)
                             export_excel(template_path, out_path, payload2)
                             out_paths.append(out_path)
                         except Exception as ex2:
@@ -1114,13 +1157,13 @@ class MainWindow(QMainWindow):
                         payload_span["reservation_no"] = str(getattr(r, "reservation_no", "") or "").strip()
                         payload_span["created_at"] = getattr(r, "created_at", None)
 
-                        fname = f"{payload_span['reservation_no']}.xlsx"
+                        fname = self._build_reservation_excel_name(payload_span, str(payload_span.get("reservation_no") or ""))
                         export_dir = self._get_export_dir(
                             out_dir_base,
                             str(payload_span.get("advertiser_name") or "").strip(),
                             str(payload_span.get("product_name") or "").strip(),
                         )
-                        out_path = export_dir / fname
+                        out_path = self._unique_export_path(export_dir, fname)
                         export_excel_span(
                             template_path=template_path,
                             out_path=out_path,
@@ -1373,6 +1416,8 @@ class MainWindow(QMainWindow):
             self.kod_table.setRowCount(0)
         except Exception:
             pass
+
+        self._apply_channel_access_ratio_to_grid()
 
     def on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
@@ -1756,6 +1801,8 @@ class MainWindow(QMainWindow):
         except Exception:
             self._loaded_reservation_id = None
 
+        self._apply_channel_access_ratio_to_grid()
+
     def on_reservation_delete(self) -> None:
         if not getattr(self, "repo", None):
             return
@@ -1800,7 +1847,8 @@ class MainWindow(QMainWindow):
                     adv_dir = self._safe_fs_name(adv, "Reklam Veren Yok")
                     prod_dir = self._safe_fs_name(prod, "Ürün Yok")
                     exp_dir = exports_root / adv_dir / prod_dir
-                    p = exp_dir / f"{res_no}.xlsx"
+                    payload_name = self._build_reservation_excel_name(payload, res_no)
+                    p = exp_dir / payload_name
                     if p.exists():
                         p.unlink()
                         removed += 1
@@ -1809,10 +1857,21 @@ class MainWindow(QMainWindow):
 
                 # 2) güvenli: exports içinde başka yerde varsa da sil
                 try:
-                    for p2 in exports_root.glob(f"**/{res_no}.xlsx"):
-                        if p2.exists():
-                            p2.unlink()
-                            removed += 1
+                    patterns = []
+                    if res_no:
+                        patterns.append(f"**/{res_no}.xlsx")
+                    try:
+                        payload_name = self._build_reservation_excel_name(payload, res_no)
+                        stem = Path(payload_name).stem
+                        patterns.append(f"**/{stem}.xlsx")
+                        patterns.append(f"**/{stem} (*).xlsx")
+                    except Exception:
+                        pass
+                    for pat in patterns:
+                        for p2 in exports_root.glob(pat):
+                            if p2.exists():
+                                p2.unlink()
+                                removed += 1
                 except Exception as exf2:
                     failed.append(f"{res_no}: {exf2}")
 
@@ -1874,6 +1933,27 @@ class MainWindow(QMainWindow):
         if len(t) > 60:
             t = t[:60].rstrip()
         return t
+
+    def _build_reservation_excel_name(self, payload: dict, fallback_no: str = "") -> str:
+        channel = self._safe_fs_name(str((payload or {}).get("channel_name") or "").strip(), "Radyo")
+        plan = self._safe_fs_name(str((payload or {}).get("plan_title") or "").strip(), "Plan")
+        base = f"{channel} - {plan}"
+        if not str(base).strip(" -") and fallback_no:
+            base = self._safe_fs_name(fallback_no, "Rezervasyon")
+        return f"{base}.xlsx"
+
+    def _unique_export_path(self, folder: Path, filename: str) -> Path:
+        folder.mkdir(parents=True, exist_ok=True)
+        p = folder / filename
+        if not p.exists():
+            return p
+        stem, suf = p.stem, p.suffix
+        i = 2
+        while True:
+            cand = folder / f"{stem} ({i}){suf}"
+            if not cand.exists():
+                return cand
+            i += 1
 
     def _get_export_dir(self, exports_root: Path, advertiser_name: str, product_name: str) -> Path:
         adv = self._safe_fs_name(advertiser_name, "Reklam Veren Yok")
@@ -1954,7 +2034,8 @@ class MainWindow(QMainWindow):
                     str(payload2.get("advertiser_name") or "").strip(),
                     str(payload2.get("product_name") or "").strip(),
                 )
-                out_path = export_dir / f"{res_no}.xlsx"
+                out_name = self._build_reservation_excel_name(payload2, res_no)
+                out_path = self._unique_export_path(export_dir, out_name)
                 try:
                     if bool(payload2.get("is_span")) and payload2.get("span_start") and payload2.get("span_end"):
                         from src.export.excel_exporter import export_excel_span

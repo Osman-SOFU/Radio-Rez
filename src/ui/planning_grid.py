@@ -4,7 +4,7 @@ import calendar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dtime, date
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QTableWidgetItem, QAbstractItemView
 
@@ -31,7 +31,7 @@ class PlanningGrid(QWidget):
     """
     Excel-benzeri plan grid'i:
     - Satırlar: 07:00-20:00 (15dk)
-    - Kolonlar: Kuşak, Dolar Kuru + ayın günleri (1..N)
+    - Kolonlar: Kuşak, Dinlenme Oranı, Dolar Kuru + ayın günleri (1..N)
     - DT saat satırları daha koyu, ODT normal
     - Hafta sonu kolonları farklı renkte
     - Seçilen gün kolonu header'ı vurgulanır
@@ -84,19 +84,77 @@ class PlanningGrid(QWidget):
         # dışarıdan okunabilirlik: kayıtlı rezervasyonu sadece görmek için
         self._read_only: bool = False
 
+        # Saatlik erişim (Dinlenme Oranı) haritası: "07:00-08:00" -> değer
+        self._access_hour_map: dict[str, object] = {}
+
         # Sizing preferences ("no-scroll" hedefi için dinamik daraltma)
-        self._fixed_col_widths = {0: 140, 1: 70}
+        # Sabit kolonlar: Kuşak | Dinlenme Oranı | Dolar Kuru
+        self._fixed_col_widths = {0: 120, 1: 82, 2: 58}
         self._day_col_min = 28
         self._day_col_max = 60
         self._row_min = 14
         self._row_max = 22
 
+        # resizeEvent -> column/row width update bazen tekrar resize tetikleyebiliyor
+        self._in_dynamic_resize = False
+        self._resize_apply_pending = False
+
         self.table.horizontalHeader().setMinimumSectionSize(self._day_col_min)
 
         self.set_month(self.year, self.month, None)
 
+    def set_access_hour_map(self, hour_map: dict | None) -> None:
+        """Dinlenme Oranı kolonunu günceller (saatlik erişim verisi)."""
+        self._access_hour_map = dict(hour_map or {})
+        self._refresh_access_ratio_column()
+
+    @staticmethod
+    def _hour_bucket_label_for_slot(start_time: dtime) -> str:
+        h = int(start_time.hour)
+        return f"{h:02d}:00-{(h + 1):02d}:00"
+
+    @staticmethod
+    def _format_access_value(v: object) -> str:
+        if v is None:
+            return ""
+        s = str(v).strip()
+        if not s:
+            return ""
+        try:
+            f = float(str(s).replace(',', '.'))
+            if abs(f - int(f)) < 1e-9:
+                return str(int(f))
+            return f"{f:.2f}".rstrip('0').rstrip('.')
+        except Exception:
+            return s
+
+    def _refresh_access_ratio_column(self) -> None:
+        if self.table.rowCount() <= 0 or self.table.columnCount() <= 1:
+            return
+        for r, (start_time, _) in enumerate(self.times):
+            bucket = self._hour_bucket_label_for_slot(start_time)
+            raw = (self._access_hour_map or {}).get(bucket, "")
+            txt = self._format_access_value(raw)
+            it = self.table.item(r, 1)
+            if it is None:
+                it = QTableWidgetItem("")
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(r, 1, it)
+            it.setText(txt)
+
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._schedule_dynamic_sizes()
+
+    def _schedule_dynamic_sizes(self) -> None:
+        if self._resize_apply_pending:
+            return
+        self._resize_apply_pending = True
+        QTimer.singleShot(0, self._run_scheduled_dynamic_sizes)
+
+    def _run_scheduled_dynamic_sizes(self) -> None:
+        self._resize_apply_pending = False
         self._apply_dynamic_sizes()
 
     def is_span_mode(self) -> bool:
@@ -104,17 +162,22 @@ class PlanningGrid(QWidget):
 
     def _apply_dynamic_sizes(self) -> None:
         """Try to fit the whole month horizontally; reduce row height for less vertical scroll."""
+        if self._in_dynamic_resize:
+            return
+
+        self._in_dynamic_resize = True
         try:
             if self._mode == "span":
                 day_count = max(0, len(self._span_dates))
             else:
                 day_count = calendar.monthrange(self.year, self.month)[1]
-            total_cols = 2 + day_count
+            total_cols = 3 + day_count
 
             # fixed columns
             fixed_total = 0
             for c, w in self._fixed_col_widths.items():
-                self.table.setColumnWidth(c, w)
+                if c < self.table.columnCount() and self.table.columnWidth(c) != w:
+                    self.table.setColumnWidth(c, w)
                 fixed_total += w
 
             # remaining width for day columns
@@ -125,20 +188,24 @@ class PlanningGrid(QWidget):
             else:
                 day_w = self._day_col_min
 
-            for c in range(2, total_cols):
-                self.table.setColumnWidth(c, day_w)
+            for c in range(3, total_cols):
+                if c < self.table.columnCount() and self.table.columnWidth(c) != day_w:
+                    self.table.setColumnWidth(c, day_w)
 
             # row height attempt
             rows = self.table.rowCount() or 1
             rh_avail = max(0, self.table.viewport().height() - self.table.horizontalHeader().height() - 2)
             row_h = int(rh_avail / rows) if rh_avail > 0 else self._row_min
             row_h = max(self._row_min, min(self._row_max, row_h))
-            self.table.verticalHeader().setDefaultSectionSize(row_h)
+            if self.table.verticalHeader().defaultSectionSize() != row_h:
+                self.table.verticalHeader().setDefaultSectionSize(row_h)
         except Exception:
             pass
+        finally:
+            self._in_dynamic_resize = False
 
     def set_read_only(self, read_only: bool) -> None:
-        """Gün hücrelerini düzenlenemez yapar (Kuşak/Dolar zaten sabit)."""
+        """Gün hücrelerini düzenlenemez yapar (Kuşak/Dinlenme/Dolar sabit)."""
         self._read_only = bool(read_only)
         self._apply_read_only_flags()
 
@@ -166,7 +233,7 @@ class PlanningGrid(QWidget):
             days_in_month = calendar.monthrange(self.year, self.month)[1]
             # Önce tümünü aç
             for day in range(1, days_in_month + 1):
-                col = 1 + day
+                col = 2 + day
                 if col < self.table.columnCount():
                     self.table.setColumnHidden(col, False)
 
@@ -176,7 +243,7 @@ class PlanningGrid(QWidget):
             for day in range(1, days_in_month + 1):
                 dt = date(self.year, self.month, day)
                 in_range = (self._range_start <= dt <= self._range_end)
-                col = 1 + day
+                col = 2 + day
                 if col < self.table.columnCount():
                     self.table.setColumnHidden(col, not in_range)
         except Exception:
@@ -189,7 +256,7 @@ class PlanningGrid(QWidget):
             day_count = len(self._span_dates)
             for r in range(self.table.rowCount()):
                 for i in range(day_count):
-                    c = 2 + i
+                    c = 3 + i
                     it = self.table.item(r, c)
                     if it:
                         it.setText("")
@@ -198,7 +265,7 @@ class PlanningGrid(QWidget):
         days_in_month = calendar.monthrange(self.year, self.month)[1]
         for r in range(self.table.rowCount()):
             for day in range(1, days_in_month + 1):
-                c = 1 + day
+                c = 2 + day
                 it = self.table.item(r, c)
                 if it:
                     it.setText("")
@@ -242,7 +309,7 @@ class PlanningGrid(QWidget):
             if day < 1 or day > days_in_month:
                 continue
 
-            c = 1 + day
+            c = 2 + day
             it = self.table.item(r, c)
             if not it:
                 it = QTableWidgetItem("")
@@ -259,7 +326,7 @@ class PlanningGrid(QWidget):
             day_count = len(self._span_dates)
             for r in range(self.table.rowCount()):
                 for i in range(day_count):
-                    c = 2 + i
+                    c = 3 + i
                     it = self.table.item(r, c)
                     if not it:
                         continue
@@ -273,7 +340,7 @@ class PlanningGrid(QWidget):
         days_in_month = calendar.monthrange(self.year, self.month)[1]
         for r in range(self.table.rowCount()):
             for day in range(1, days_in_month + 1):
-                c = 1 + day
+                c = 2 + day
                 it = self.table.item(r, c)
                 if not it:
                     continue
@@ -295,14 +362,14 @@ class PlanningGrid(QWidget):
         self.selected_day = selected_day
 
         days_in_month = calendar.monthrange(year, month)[1]
-        total_cols = 2 + days_in_month  # Kuşak + Dolar + Günler
+        total_cols = 3 + days_in_month  # Kuşak + Dinlenme + Dolar + Günler
 
         self.table.clear()
         self.table.setRowCount(len(self.times))
         self.table.setColumnCount(total_cols)
 
         # Header
-        headers = ["Kuşak", "Dolar\nKuru"]
+        headers = ["Kuşak", "Dinlenme\nOranı", "Dolar\nKuru"]
         for d in range(1, days_in_month + 1):
             dow = TR_DOW[datetime(year, month, d).weekday()]
             headers.append(f"{dow}\n{d}")
@@ -312,9 +379,9 @@ class PlanningGrid(QWidget):
         for c, w in self._fixed_col_widths.items():
             if c < total_cols:
                 self.table.setColumnWidth(int(c), int(w))
-        for c in range(2, total_cols):
+        for c in range(3, total_cols):
             self.table.setColumnWidth(c, self._day_col_max)
-        for c in range(2, total_cols):
+        for c in range(3, total_cols):
             self.table.setColumnWidth(c, self._day_col_max)
 
         # Satırları doldur
@@ -328,11 +395,19 @@ class PlanningGrid(QWidget):
             it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(r, 0, it0)
 
-            # 2) Dolar (şimdilik sabit “2”, non-editable)
-            it1 = QTableWidgetItem("2")
+            # 2) Dinlenme Oranı (kanal erişim verisi, non-editable)
+            access_bucket = self._hour_bucket_label_for_slot(start_time)
+            access_text = self._format_access_value((self._access_hour_map or {}).get(access_bucket, ""))
+            it1 = QTableWidgetItem(access_text)
             it1.setTextAlignment(Qt.AlignCenter)
             it1.setFlags(it1.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(r, 1, it1)
+
+            # 3) Dolar (şimdilik sabit “2”, non-editable)
+            it2 = QTableWidgetItem("2")
+            it2.setTextAlignment(Qt.AlignCenter)
+            it2.setFlags(it2.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(r, 2, it2)
 
             # DT/ODT satır rengi
             row_is_dt = (classify_dt_odt(start_time) == "DT")
@@ -340,7 +415,7 @@ class PlanningGrid(QWidget):
 
             # Gün hücreleri (editable)
             for day in range(1, days_in_month + 1):
-                col = 1 + day  # 2.. (2 + days_in_month-1)
+                col = 2 + day  # 3.. (3 + days_in_month-1)
                 cell = QTableWidgetItem("")
                 self.table.setItem(r, col, cell)
 
@@ -355,7 +430,7 @@ class PlanningGrid(QWidget):
 
         # Seçili gün header vurgusu
         if self.selected_day and 1 <= self.selected_day <= days_in_month:
-            sel_col = 1 + self.selected_day
+            sel_col = 2 + self.selected_day
             font = self.table.horizontalHeader().font()
             font.setBold(True)
             self.table.horizontalHeaderItem(sel_col).setFont(font)
@@ -366,6 +441,9 @@ class PlanningGrid(QWidget):
 
         # Aralık kısıtı varsa, yeni ay için kolon görünürlüğünü güncelle
         self._apply_range_visibility()
+
+        # Dinlenme oranı kolonunu tazele (kanal değişiminde set edilir)
+        self._refresh_access_ratio_column()
 
         # mümkün olduğunca scroll ihtiyacını azalt
         self._apply_dynamic_sizes()
@@ -407,12 +485,12 @@ class PlanningGrid(QWidget):
             self.year = dates[0].year
             self.month = dates[0].month
 
-        total_cols = 2 + len(dates)
+        total_cols = 3 + len(dates)
         self.table.clear()
         self.table.setRowCount(len(self.times))
         self.table.setColumnCount(total_cols)
 
-        headers = ["Kuşak", "Dolar\nKuru"]
+        headers = ["Kuşak", "Dinlenme\nOranı", "Dolar\nKuru"]
         for d in dates:
             dow = TR_DOW[datetime(d.year, d.month, d.day).weekday()]
             headers.append(f"{dow}\n{d.day:02d}.{d.month:02d}")
@@ -422,7 +500,7 @@ class PlanningGrid(QWidget):
         for c, w in self._fixed_col_widths.items():
             if c < total_cols:
                 self.table.setColumnWidth(int(c), int(w))
-        for c in range(2, total_cols):
+        for c in range(3, total_cols):
             self.table.setColumnWidth(c, self._day_col_max)
 
         dt_row_brush = QBrush(QColor("#e0e0e0"))
@@ -434,16 +512,23 @@ class PlanningGrid(QWidget):
             it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(r, 0, it0)
 
-            it1 = QTableWidgetItem("2")
+            access_bucket = self._hour_bucket_label_for_slot(start_time)
+            access_text = self._format_access_value((self._access_hour_map or {}).get(access_bucket, ""))
+            it1 = QTableWidgetItem(access_text)
             it1.setTextAlignment(Qt.AlignCenter)
             it1.setFlags(it1.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(r, 1, it1)
+
+            it2 = QTableWidgetItem("2")
+            it2.setTextAlignment(Qt.AlignCenter)
+            it2.setFlags(it2.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(r, 2, it2)
 
             row_is_dt = (classify_dt_odt(start_time) == "DT")
             row_brush = dt_row_brush if row_is_dt else normal_brush
 
             for i, d in enumerate(dates):
-                col = 2 + i
+                col = 3 + i
                 cell = QTableWidgetItem("")
                 self.table.setItem(r, col, cell)
 
@@ -457,6 +542,7 @@ class PlanningGrid(QWidget):
         # Highlight selected date column
         self._apply_selected_date_highlight()
         self._apply_read_only_flags()
+        self._refresh_access_ratio_column()
         self._apply_dynamic_sizes()
 
     def _apply_selected_date_highlight(self) -> None:
@@ -465,7 +551,7 @@ class PlanningGrid(QWidget):
         # reset fonts
         base_font = self.table.horizontalHeader().font()
         for i in range(len(self._span_dates)):
-            col = 2 + i
+            col = 3 + i
             it = self.table.horizontalHeaderItem(col)
             if it:
                 f = QFont(base_font)
@@ -479,7 +565,7 @@ class PlanningGrid(QWidget):
             idx = self._span_dates.index(self._selected_date)
         except ValueError:
             return
-        sel_col = 2 + idx
+        sel_col = 3 + idx
         it = self.table.horizontalHeaderItem(sel_col)
         if it:
             f = QFont(base_font)
@@ -510,7 +596,7 @@ class PlanningGrid(QWidget):
 
         for r in range(self.table.rowCount()):
             for i, d in enumerate(self._span_dates):
-                c = 2 + i
+                c = 3 + i
                 it = self.table.item(r, c)
                 if not it:
                     continue
@@ -536,7 +622,7 @@ class PlanningGrid(QWidget):
 
         for r in range(self.table.rowCount()):
             for i, d in enumerate(self._span_dates):
-                c = 2 + i
+                c = 3 + i
                 v = ""
                 try:
                     mm = month_mats.get((d.year, d.month)) or {}
@@ -562,7 +648,7 @@ class PlanningGrid(QWidget):
         days_in_month = calendar.monthrange(self.year, self.month)[1]
         for r in range(self.table.rowCount()):
             for day in range(1, days_in_month + 1):
-                c = 1 + day
+                c = 2 + day
                 it = self.table.item(r, c)
                 if not it:
                     continue
