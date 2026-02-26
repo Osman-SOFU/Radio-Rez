@@ -1342,9 +1342,23 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
         _fill_rates(ws)
         _fill_codes(ws, chunk)
 
-        # Birim fiyatları (AP) ve 60. satır toplamlarını doğru kolonlara sabitle
+        # Birim fiyatları (AP) sabitle
         _fill_unit_prices_span_sheet(ws, payload, ch_start)
-        _fix_daily_totals_row(ws)
+
+        # Not: Kullanıcının şablonunda "günlerde kaç adet girildi" toplam satırı (60. satır) yok.
+        # Bazı şablonlarda 60. satır boş olduğu için burayı zorla formülle doldurmak #AD? gibi
+        # hatalara / gereksiz alana sebep oluyordu. Bu yüzden yalnızca şablonda zaten doluysa düzelt.
+        try:
+            has_day_totals = False
+            for c in range(4, 4 + 7):  # D..J kontrol yeterli
+                v = ws.cell(row=60, column=c).value
+                if v not in (None, ""):
+                    has_day_totals = True
+                    break
+            if has_day_totals:
+                _fix_daily_totals_row(ws)
+        except Exception:
+            pass
 
         _apply_commission(ws)
         _fill_code_table_and_duration_formulas(ws)

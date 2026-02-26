@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTabWidget, QFileDialog, QMessageBox, QListWidget,
     QDateEdit, QGroupBox, QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView, QAbstractItemDelegate,
-    QHeaderView, QComboBox, QApplication, QInputDialog, QPlainTextEdit
+    QHeaderView, QComboBox, QApplication, QInputDialog, QPlainTextEdit,
+    QGridLayout, QSizePolicy
 )
 
 from src.settings.app_settings import SettingsService, AppSettings
@@ -66,6 +67,7 @@ class MainWindow(QMainWindow):
         self.repo: Repository | None = None
         self.service: ReservationService | None = None
         self.current_confirmed: ConfirmedReservation | None = None
+        self._home_price_cache: dict[tuple[str, int], dict[tuple[int, int], tuple[float, float]]] = {}
         
         root = QWidget()
         self.setCentralWidget(root)
@@ -75,7 +77,8 @@ class MainWindow(QMainWindow):
         top = QHBoxLayout()
         main.addLayout(top)
 
-        top.addWidget(QLabel("Plan Başlığı Ara:"))
+        self.lbl_search_title = QLabel("Plan Başlığı Ara:")
+        top.addWidget(self.lbl_search_title)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Örn: TEST BAŞLIĞI")
         top.addWidget(self.search_edit, 2)
@@ -96,6 +99,10 @@ class MainWindow(QMainWindow):
         self.list_advertisers = QListWidget()
         left_layout.addWidget(self.list_advertisers)
         mid.addWidget(left_box, 1)
+        # İstek: Arama sonuçları paneli sadece "REZERVASYONLAR" sekmesinde görünsün.
+        self._search_results_box = left_box
+        self._search_results_box.setVisible(False)
+        self._search_results_box.setMaximumWidth(0)
 
         # Tabs
         self.tabs = QTabWidget()
@@ -147,6 +154,7 @@ class MainWindow(QMainWindow):
         self.bootstrap_storage()
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.on_tab_changed(self.tabs.currentIndex())
         self._access_set_id: int | None = None
         self._po_syncing: bool = False
         self._build_spotlist_tab()
@@ -160,138 +168,209 @@ class MainWindow(QMainWindow):
     def _build_home_tab(self) -> None:
         tab = self.tab_widgets["ANA SAYFA"]
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
-        row0 = QHBoxLayout()
-        layout.addLayout(row0)
+        # ---- Üst Bilgiler (2 satır) ----
+        # Kullanıcının istediği gibi: ilişkili alanlar gruplanmış, üstte taşma/üst üste binme yok.
+        top_block = QHBoxLayout()
+        top_block.setSpacing(8)
+        layout.addLayout(top_block)
 
-        row0.addWidget(QLabel("Ajans:"))
+        # Sol blok: plan/kanal/tarih/form bilgileri (2 satır)
+        left_panel = QWidget()
+        left_grid = QGridLayout(left_panel)
+        left_grid.setContentsMargins(0, 0, 0, 0)
+        left_grid.setHorizontalSpacing(4)
+        left_grid.setVerticalSpacing(4)
+        top_block.addWidget(left_panel, 1)
+
+        # ---- Sol blok / Satır 1 ----
+        c = 0
+        left_grid.addWidget(QLabel("Reklam veren:"), 0, c); c += 1
+        self.in_advertiser = QComboBox()
+        self.in_advertiser.setEditable(True)
+        self.in_advertiser.setFixedWidth(150)
+        left_grid.addWidget(self.in_advertiser, 0, c); c += 1
+
+        left_grid.addWidget(QLabel("Ajans:"), 0, c); c += 1
         self.in_agency = QLineEdit()
-        row0.addWidget(self.in_agency, 2)
+        self.in_agency.setFixedWidth(72)
+        left_grid.addWidget(self.in_agency, 0, c); c += 1
 
-        row0.addWidget(QLabel("Ürün:"))
+        left_grid.addWidget(QLabel("Ürün:"), 0, c); c += 1
         self.in_product = QLineEdit()
-        row0.addWidget(self.in_product, 2)
+        self.in_product.setFixedWidth(72)
+        left_grid.addWidget(self.in_product, 0, c); c += 1
 
-        row0b = QHBoxLayout()
-        layout.addLayout(row0b)
-
-        row0b.addWidget(QLabel("Plan Başlığı:"))
+        left_grid.addWidget(QLabel("Plan Başlığı:"), 0, c); c += 1
         self.in_plan_title = QLineEdit()
-        row0b.addWidget(self.in_plan_title, 2)
+        self.in_plan_title.setMinimumWidth(130)
+        self.in_plan_title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        left_grid.addWidget(self.in_plan_title, 0, c); c += 1
 
-        row0b.addWidget(QLabel("Kod:"))
+        # ---- Sol blok / Satır 2 ----
+        c = 0
+        left_grid.addWidget(QLabel("Plan Tarihi:"), 1, c); c += 1
+        self.in_date = QDateEdit()
+        self.in_date.setCalendarPopup(True)
+        self.in_date.setDate(QDate.currentDate())
+        self.in_date.setFixedWidth(95)
+        left_grid.addWidget(self.in_date, 1, c); c += 1
+
+        left_grid.addWidget(QLabel("Kanal:"), 1, c); c += 1
+        self.in_channel = QComboBox()
+        self.in_channel.setFixedWidth(90)
+        left_grid.addWidget(self.in_channel, 1, c); c += 1
+
+        self.btn_select_channels = QPushButton("Kanalları Seç")
+        self.btn_select_channels.setFixedWidth(84)
+        left_grid.addWidget(self.btn_select_channels, 1, c); c += 1
+        self.lbl_selected_channels = QLabel("")
+        self.lbl_selected_channels.setVisible(False)
+
+        left_grid.addWidget(QLabel("Tarih Aralığı:"), 1, c); c += 1
+        range_wrap = QHBoxLayout()
+        range_wrap.setContentsMargins(0, 0, 0, 0)
+        range_wrap.setSpacing(3)
+        self.in_range_start = QDateEdit()
+        self.in_range_start.setCalendarPopup(True)
+        self.in_range_start.setFixedWidth(82)
+        self.in_range_end = QDateEdit()
+        self.in_range_end.setCalendarPopup(True)
+        self.in_range_end.setFixedWidth(82)
+        self.btn_apply_range = QPushButton("Aralığı Uygula")
+        self.btn_apply_range.setFixedWidth(80)
+        range_wrap.addWidget(self.in_range_start)
+        range_wrap.addWidget(QLabel("-"))
+        range_wrap.addWidget(self.in_range_end)
+        range_wrap.addWidget(self.btn_apply_range)
+        range_host = QWidget()
+        range_host.setLayout(range_wrap)
+        left_grid.addWidget(range_host, 1, c, 1, 3); c += 3
+
+        left_grid.addWidget(QLabel("Formu Oluşturan:"), 1, c); c += 1
+        self.in_prepared_by = QLineEdit()
+        self.in_prepared_by.setFixedWidth(100)
+        left_grid.addWidget(self.in_prepared_by, 1, c); c += 1
+
+        left_grid.addWidget(QLabel("Not:"), 1, c); c += 1
+        self.in_note = QLineEdit()
+        self.in_note.setMinimumWidth(100)
+        self.in_note.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        left_grid.addWidget(self.in_note, 1, c); c += 1
+
+        # Sol blokta plan başlığı ve not alanı gerektiğinde daralıp genişlesin
+        try:
+            left_grid.setColumnStretch(7, 1)   # plan başlığı
+            left_grid.setColumnStretch(12, 1)  # note
+        except Exception:
+            pass
+
+        # Sağ blok: kod işlemleri + mini kod tablosu (kompakt)
+        right_panel = QWidget()
+        right_panel.setFixedWidth(430)
+        right_v = QVBoxLayout(right_panel)
+        right_v.setContentsMargins(0, 0, 0, 0)
+        right_v.setSpacing(4)
+        top_block.addWidget(right_panel, 0, Qt.AlignTop)
+
+        code_row1 = QHBoxLayout()
+        code_row1.setContentsMargins(0, 0, 0, 0)
+        code_row1.setSpacing(4)
+        right_v.addLayout(code_row1)
+
+        code_row1.addWidget(QLabel("Kod Tanımı:"))
+        self.in_code_definition = QLineEdit()
+        self.in_code_definition.setFixedWidth(112)
+        code_row1.addWidget(self.in_code_definition)
+
+        code_row1.addWidget(QLabel("Kod:"))
         self.in_spot_code = QLineEdit()
         self.in_spot_code.setMaxLength(10)
-        self.in_spot_code.setFixedWidth(90)
-        row0b.addWidget(self.in_spot_code, 1)
+        self.in_spot_code.setFixedWidth(42)
+        code_row1.addWidget(self.in_spot_code)
 
-        row0b.addWidget(QLabel("Süre (sn):"))
+        code_row1.addWidget(QLabel("Süre (sn):"))
         self.in_spot_duration = QSpinBox()
         self.in_spot_duration.setRange(0, 9999)
-        self.in_spot_duration.setFixedWidth(90)
-        row0b.addWidget(self.in_spot_duration, 1)
+        self.in_spot_duration.setFixedWidth(52)
+        code_row1.addWidget(self.in_spot_duration)
 
-        # Ajans komisyonu (%): çıktıda AR62 formülünü dinamik yapmak için.
-        row0b.addWidget(QLabel("Ajans Kom. (%):"))
+        self.btn_add_code = QPushButton("Kodu Ekle")
+        self.btn_add_code.setFixedWidth(68)
+        code_row1.addWidget(self.btn_add_code)
+
+        self.btn_remove_code = QPushButton("Seçili Kodu Sil")
+        self.btn_remove_code.setFixedWidth(94)
+        code_row1.addWidget(self.btn_remove_code)
+
+        code_row2 = QHBoxLayout()
+        code_row2.setContentsMargins(0, 0, 0, 0)
+        code_row2.setSpacing(4)
+        right_v.addLayout(code_row2)
+
+        code_row2.addWidget(QLabel("Ajans Kom. (%):"))
         self.in_agency_commission = QSpinBox()
         self.in_agency_commission.setRange(0, 100)
         self.in_agency_commission.setValue(10)
-        self.in_agency_commission.setFixedWidth(70)
-        row0b.addWidget(self.in_agency_commission, 1)
+        self.in_agency_commission.setFixedWidth(52)
+        code_row2.addWidget(self.in_agency_commission)
 
-        row_code_def = QHBoxLayout()
-        layout.addLayout(row_code_def)
-
-        row_code_def.addWidget(QLabel("Kod Tanımı:"))
-        self.in_code_definition = QLineEdit()
-        row_code_def.addWidget(self.in_code_definition, 6)
-
-        # Çoklu kod ekleme (kodları tanımla; grid'e K/A/B gibi harfleri kullanıcı yazar)
-        row_code_btns = QHBoxLayout()
-        layout.addLayout(row_code_btns)
-        self.btn_add_code = QPushButton("Kodu Ekle")
-        self.btn_remove_code = QPushButton("Seçili Kodu Sil")
-        self.btn_fill_selected = QPushButton("Seçili Hücrelere Yaz")
+        code_row2.addWidget(QLabel("Aktif Kod:"))
         self.cb_active_code = QComboBox()
-        self.cb_active_code.setMinimumWidth(120)
-        row_code_btns.addWidget(self.btn_add_code)
-        row_code_btns.addWidget(self.btn_remove_code)
-        row_code_btns.addSpacing(12)
-        row_code_btns.addWidget(QLabel("Aktif Kod:"))
-        row_code_btns.addWidget(self.cb_active_code)
-        row_code_btns.addWidget(self.btn_fill_selected)
-        row_code_btns.addStretch(1)
+        self.cb_active_code.setFixedWidth(90)
+        code_row2.addWidget(self.cb_active_code)
+
+        self.btn_fill_selected = QPushButton("Seçili Hücrelere Yaz")
+        self.btn_fill_selected.setFixedWidth(126)
+        code_row2.addWidget(self.btn_fill_selected)
+        code_row2.addStretch(1)
 
         self.tbl_codes = QTableWidget(0, 3)
         self.tbl_codes.setHorizontalHeaderLabels(["Kod", "Kod Tanımı", "Süre (sn)"])
         self.tbl_codes.verticalHeader().setVisible(False)
         self.tbl_codes.setSelectionBehavior(QTableWidget.SelectRows)
         self.tbl_codes.setSelectionMode(QTableWidget.SingleSelection)
-        self.tbl_codes.horizontalHeader().setStretchLastSection(True)
-        self.tbl_codes.setMaximumHeight(120)
-        layout.addWidget(self.tbl_codes)
+        self.tbl_codes.horizontalHeader().setStretchLastSection(False)
+        self.tbl_codes.setFixedWidth(430)
+        self.tbl_codes.setFixedHeight(62)
+        try:
+            self.tbl_codes.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+            self.tbl_codes.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+            self.tbl_codes.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+            self.tbl_codes.setColumnWidth(0, 52)
+            self.tbl_codes.setColumnWidth(1, 275)
+            self.tbl_codes.setColumnWidth(2, 88)
+            self.tbl_codes.verticalHeader().setDefaultSectionSize(18)
+            self.tbl_codes.setMaximumHeight(62)
+        except Exception:
+            pass
+        right_v.addWidget(self.tbl_codes, 0, Qt.AlignTop)
 
+        # Canlı hesap özeti (Excel sağ-alt toplamları)
+        calc_row = QHBoxLayout()
+        self.lbl_grid_counts = QLabel("Toplam Adet: 0 | Toplam Süre: 0 sn")
+        self.lbl_grid_amounts = QLabel("Brüt: 0,00 TL | Aj.Kom.: 0,00 TL | Kalan: 0,00 TL | KDV: 0,00 TL | Genel: 0,00 TL")
+        self.lbl_grid_amounts.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        try:
+            f_calc = self.lbl_grid_counts.font()
+            f_calc.setPointSize(max(7, (f_calc.pointSize() or 8) - 1))
+            self.lbl_grid_counts.setFont(f_calc)
+            self.lbl_grid_amounts.setFont(f_calc)
+        except Exception:
+            pass
+        calc_row.addWidget(self.lbl_grid_counts, 1)
+        calc_row.addWidget(self.lbl_grid_amounts, 3)
+        layout.addLayout(calc_row)
 
-        row0c = QHBoxLayout()
-        layout.addLayout(row0c)
-
-        row0c.addWidget(QLabel("Not:"))
-        self.in_note = QLineEdit()
-        row0c.addWidget(self.in_note, 4)
-
-        row0c.addWidget(QLabel("Formu Oluşturan:"))
-        self.in_prepared_by = QLineEdit()
-        row0c.addWidget(self.in_prepared_by, 2)
-        row1 = QHBoxLayout()
-        layout.addLayout(row1)
-        
-        row1.addWidget(QLabel("Reklam veren:"))
-        self.in_advertiser = QComboBox()
-        self.in_advertiser.setEditable(True)
-        self.in_advertiser.setMinimumWidth(260)
-        row1.addWidget(self.in_advertiser, 2)
-
-        row2 = QHBoxLayout()
-        layout.addLayout(row2)
-        row2.addWidget(QLabel("Plan Tarihi:"))
-        self.in_date = QDateEdit()
-        self.in_date.setCalendarPopup(True)
-        self.in_date.setDate(QDate.currentDate())
-        self.in_date.setFixedWidth(120)
-        row2.addWidget(self.in_date)
-
-        row2.addSpacing(12)
-        row2.addWidget(QLabel("Kanal:"))
-        self.in_channel = QComboBox()
-        self.in_channel.setMinimumWidth(200)
-        row2.addWidget(self.in_channel)
-
-        self.btn_select_channels = QPushButton("Kanalları Seç")
-        row2.addWidget(self.btn_select_channels)
-        self.lbl_selected_channels = QLabel("")
-        self.lbl_selected_channels.setMinimumWidth(180)
-        row2.addWidget(self.lbl_selected_channels)
-
-        row2.addStretch(1)
-
-        row2b = QHBoxLayout()
-        layout.addLayout(row2b)
-        row2b.addWidget(QLabel("Tarih Aralığı:"))
-        self.in_range_start = QDateEdit()
-        self.in_range_start.setCalendarPopup(True)
-        self.in_range_start.setFixedWidth(120)
-        self.in_range_end = QDateEdit()
-        self.in_range_end.setCalendarPopup(True)
-        self.in_range_end.setFixedWidth(120)
-        row2b.addWidget(self.in_range_start)
-        row2b.addWidget(QLabel("-"))
-        row2b.addWidget(self.in_range_end)
-        self.btn_apply_range = QPushButton("Aralığı Uygula")
-        row2b.addWidget(self.btn_apply_range)
-        row2b.addStretch(1)
         # --- Excel benzeri plan grid ---
         self.plan_grid = PlanningGrid()
         layout.addWidget(self.plan_grid, 1)
+
+
+        self.plan_grid.calculationsUpdated.connect(self.on_home_grid_calculations_updated)
+        self.plan_grid.set_price_resolver(self._resolve_home_grid_unit_price)
 
         # Tarih değişince grid ay/gün vurgusunu güncelle
         self.in_date.dateChanged.connect(self.on_plan_date_changed)
@@ -306,6 +385,15 @@ class MainWindow(QMainWindow):
         self.btn_apply_range.clicked.connect(self.on_apply_date_range)
         self.in_advertiser.currentTextChanged.connect(self.on_main_advertiser_changed)
 
+        # Hesap kolonları canlı güncellensin
+        self.tbl_codes.itemChanged.connect(lambda *_: self._refresh_home_grid_calculation_context())
+        self.in_spot_code.textChanged.connect(lambda *_: self._refresh_home_grid_calculation_context())
+        self.in_code_definition.textChanged.connect(lambda *_: self._refresh_home_grid_calculation_context())
+        self.in_spot_duration.valueChanged.connect(lambda *_: self._refresh_home_grid_calculation_context())
+        self.in_agency_commission.valueChanged.connect(lambda *_: self._refresh_home_grid_calculation_context())
+        self.in_advertiser.currentTextChanged.connect(lambda *_: self._refresh_home_grid_calculation_context())
+        self.in_channel.currentTextChanged.connect(lambda *_: self._refresh_home_grid_calculation_context())
+
         # tarih aralığı defaultu: mevcut ay
         today = self.in_date.date()
         first = QDate(today.year(), today.month(), 1)
@@ -316,6 +404,7 @@ class MainWindow(QMainWindow):
 
         # ilk açılışta da set et
         self.on_plan_date_changed(self.in_date.date())
+        self._refresh_home_grid_calculation_context()
 
         # formda yüklü olan kayıt (kayıtlı rezervasyonları görüntülerken işimize yarıyor)
         self._loaded_reservation_id: int | None = None
@@ -341,7 +430,11 @@ class MainWindow(QMainWindow):
         finally:
             self.in_channel.blockSignals(False)
 
+        self._home_price_cache.clear()
+        self._home_price_cache.clear()
         self._apply_channel_access_ratio_to_grid()
+        self._refresh_home_grid_calculation_context()
+        self._refresh_home_grid_calculation_context()
 
     def _get_home_access_year(self) -> int:
         try:
@@ -361,6 +454,8 @@ class MainWindow(QMainWindow):
                 self.plan_grid.set_access_hour_map({})
             except Exception:
                 pass
+            self._refresh_home_grid_calculation_context()
+            self._refresh_home_grid_calculation_context()
             return
 
         try:
@@ -368,14 +463,101 @@ class MainWindow(QMainWindow):
             set_id = self.repo.get_latest_access_set_id_for_year(int(year)) or self.repo.get_latest_access_set_id()
             hour_map = self.repo.get_access_channel_hour_map(int(set_id), ch) if set_id else {}
             self.plan_grid.set_access_hour_map(hour_map or {})
+            self._refresh_home_grid_calculation_context()
         except Exception:
             try:
                 self.plan_grid.set_access_hour_map({})
             except Exception:
                 pass
+            self._refresh_home_grid_calculation_context()
+
+    def _fmt_tl(self, value: float | int) -> str:
+        try:
+            n = float(value or 0)
+        except Exception:
+            n = 0.0
+        s = f"{n:,.2f}"
+        return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+    def _resolve_home_grid_unit_price(self, d: date, row_kind: str) -> float:
+        if not getattr(self, "repo", None):
+            return 0.0
+        try:
+            adv = (self.in_advertiser.currentText() or "").strip()
+        except Exception:
+            adv = ""
+        if not adv:
+            return 0.0
+
+        try:
+            ch_id = self.in_channel.currentData()
+        except Exception:
+            ch_id = None
+        if not isinstance(ch_id, int):
+            # combobox userData boşsa isimden resolve et
+            try:
+                ch_name = (self.in_channel.currentText() or "").strip().lower()
+            except Exception:
+                ch_name = ""
+            if ch_name:
+                try:
+                    for ch in self.repo.list_channels(active_only=False):
+                        if str(ch.get("name") or "").strip().lower() == ch_name:
+                            ch_id = int(ch.get("id"))
+                            break
+                except Exception:
+                    ch_id = None
+        if not isinstance(ch_id, int):
+            return 0.0
+
+        yy = int(getattr(d, "year", datetime.now().year))
+        mm = int(getattr(d, "month", 1))
+        key = (adv.strip().lower(), yy)
+        if key not in self._home_price_cache:
+            try:
+                self._home_price_cache[key] = self.repo.get_channel_prices(yy, adv) or {}
+            except Exception:
+                self._home_price_cache[key] = {}
+
+        dt_price, odt_price = self._home_price_cache.get(key, {}).get((ch_id, mm), (0.0, 0.0))
+        try:
+            return float(dt_price if str(row_kind or "").upper() == "DT" else odt_price)
+        except Exception:
+            return 0.0
+
+    def _refresh_home_grid_calculation_context(self) -> None:
+        if not hasattr(self, "plan_grid") or self.plan_grid is None:
+            return
+        try:
+            self.plan_grid.set_code_definitions(self._get_code_defs_from_ui())
+            self.plan_grid.set_commission_percent(self.in_agency_commission.value())
+        except Exception:
+            pass
+
+    def on_home_grid_calculations_updated(self, data: dict) -> None:
+        try:
+            adet = int(data.get("toplam_adet", 0) or 0)
+            sure = int(data.get("toplam_sure", 0) or 0)
+            b_ad = int(data.get("bedelli_adet", 0) or 0)
+            k_ad = int(data.get("bedelsiz_adet", 0) or 0)
+            a_ad = int(data.get("barter_adet", 0) or 0)
+            kom_yuzde = float(data.get("commission_percent", self.in_agency_commission.value()) or 0)
+            self.lbl_grid_counts.setText(
+                f"Toplam Adet: {adet} (B:{b_ad} / K:{k_ad} / A:{a_ad}) | Toplam Süre: {sure} sn"
+            )
+            self.lbl_grid_amounts.setText(
+                f"Brüt: {self._fmt_tl(data.get('gross_tl', 0))} TL | "
+                f"Aj.Kom. (%{int(kom_yuzde)}): {self._fmt_tl(data.get('agency_commission_tl', 0))} TL | "
+                f"Kalan: {self._fmt_tl(data.get('net_tl', 0))} TL | "
+                f"KDV: {self._fmt_tl(data.get('kdv_tl', 0))} TL | "
+                f"Genel: {self._fmt_tl(data.get('grand_total_tl', 0))} TL"
+            )
+        except Exception:
+            pass
 
     def on_channel_changed(self, text: str) -> None:
         self._apply_channel_access_ratio_to_grid(text)
+        self._refresh_home_grid_calculation_context()
 
     def refresh_advertiser_combo(self) -> None:
         """Ana sayfadaki Reklam veren combobox listesini DB'den yeniler."""
@@ -410,6 +592,8 @@ class MainWindow(QMainWindow):
                     self.in_advertiser.setCurrentText(pick)
         finally:
             self.in_advertiser.blockSignals(False)
+        self._home_price_cache.clear()
+        self._refresh_home_grid_calculation_context()
 
     def bootstrap_storage(self) -> None:
         ensure_data_folders(self.app_settings.data_dir)
@@ -424,13 +608,13 @@ class MainWindow(QMainWindow):
         self.refresh_advertiser_combo()
         try:
             self.refresh_reservation_channel_filter()
-        except Exception as e:
-                    try:
-                        dbg = out_dir_base / "_debug_prices.txt"
-                        with dbg.open("a", encoding="utf-8") as f:
-                            f.write(f"PRICE UPDATE ERROR {res_no}: {e}")
-                    except Exception:
-                        pass
+        except Exception:
+            pass
+
+        try:
+            self._refresh_home_grid_calculation_context()
+        except Exception:
+            pass
 
     def pick_data_folder(self) -> None:
         p = QFileDialog.getExistingDirectory(self, "Veri klasörünü seç")
@@ -562,7 +746,9 @@ class MainWindow(QMainWindow):
         try:
             if getattr(self.plan_grid, "is_span_mode", lambda: False)():
                 self.plan_grid.set_selected_date(d)
+                self._home_price_cache.clear()
                 self._apply_channel_access_ratio_to_grid()
+                self._refresh_home_grid_calculation_context()
                 return
         except Exception:
             pass
@@ -607,6 +793,8 @@ class MainWindow(QMainWindow):
             self.repo.set_meta("main_advertiser", nm)
         except Exception:
             pass
+        self._home_price_cache.clear()
+        self._refresh_home_grid_calculation_context()
 
     # -------------------------
     # Çoklu Kod Tanımları (ANA SAYFA)
@@ -692,6 +880,7 @@ class MainWindow(QMainWindow):
                 self.tbl_codes.setItem(r, 1, QTableWidgetItem(desc))
                 self.tbl_codes.setItem(r, 2, QTableWidgetItem(str(dur)))
                 self._sync_active_code_combo()
+                self._refresh_home_grid_calculation_context()
                 return
 
         r = self.tbl_codes.rowCount()
@@ -700,6 +889,7 @@ class MainWindow(QMainWindow):
         self.tbl_codes.setItem(r, 1, QTableWidgetItem(desc))
         self.tbl_codes.setItem(r, 2, QTableWidgetItem(str(dur)))
         self._sync_active_code_combo()
+        self._refresh_home_grid_calculation_context()
 
         # Kullanıcı hızlı ekleme yapabilsin
         self.in_spot_code.clear()
@@ -728,6 +918,7 @@ class MainWindow(QMainWindow):
             return
         self.tbl_codes.removeRow(row)
         self._sync_active_code_combo()
+        self._refresh_home_grid_calculation_context()
 
     def on_active_code_changed(self) -> None:
         # Manuel grid girişinde zorunlu değil; opsiyonel kullanım.
@@ -744,8 +935,15 @@ class MainWindow(QMainWindow):
         for it in table.selectedItems():
             r = it.row()
             c = it.column()
-            if c < 2:
+            if c < 3:
                 continue
+            try:
+                if c > self.plan_grid.table.columnCount():
+                    continue
+                if c >= self.plan_grid.table.columnCount() - len(getattr(self.plan_grid, '_calc_col_names', [])):
+                    continue
+            except Exception:
+                pass
             # read-only modda yazma
             try:
                 if self.plan_grid._read_only:
@@ -753,6 +951,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             it.setText(code)
+
+        self._refresh_home_grid_calculation_context()
 
 
     # -------------------------
@@ -877,12 +1077,16 @@ class MainWindow(QMainWindow):
             self._current_month_key = (rs.year, rs.month)
 
             self.plan_grid.set_date_span(rs, re, selected_date=sel)
+            self._home_price_cache.clear()
             self._apply_channel_access_ratio_to_grid()
+            self._refresh_home_grid_calculation_context()
         except Exception:
             # Fallback: en azından eski davranış bozulmasın
             try:
                 self.plan_grid.set_month(rs.year, rs.month, rs.day)
+                self._home_price_cache.clear()
                 self._apply_channel_access_ratio_to_grid()
+                self._refresh_home_grid_calculation_context()
             except Exception:
                 pass
 
@@ -1421,6 +1625,25 @@ class MainWindow(QMainWindow):
 
     def on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
+
+        # Arama alanı + arama sonuçları paneli sadece REZERVASYONLAR'da görünsün.
+        try:
+            is_res = (tab_name == "REZERVASYONLAR")
+            box = getattr(self, "_search_results_box", None)
+            if box is not None:
+                if is_res:
+                    box.setMaximumWidth(280)
+                    box.setVisible(True)
+                else:
+                    box.setVisible(False)
+                    box.setMaximumWidth(0)
+            if hasattr(self, "lbl_search_title"):
+                self.lbl_search_title.setVisible(is_res)
+            if hasattr(self, "search_edit"):
+                self.search_edit.setVisible(is_res)
+        except Exception:
+            pass
+
         if tab_name == "REZERVASYONLAR":
             self.refresh_reservations_tab()
         if tab_name == "KOD TANIMI":
