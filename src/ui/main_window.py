@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QPushButton, QTabWidget, QFileDialog, QMessageBox, QListWidget,
     QDateEdit, QGroupBox, QSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView, QAbstractItemDelegate,
     QHeaderView, QComboBox, QApplication, QInputDialog, QPlainTextEdit,
-    QGridLayout, QSizePolicy
+     QSizePolicy,  QFrame
 )
 
 from src.settings.app_settings import SettingsService, AppSettings
@@ -73,40 +73,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         main = QVBoxLayout(root)
 
-        # Top bar
+        # Top bar (sadece veri klasörü). Arama alanı REZERVASYONLAR sekmesine taşındı;
+        # böylece sekmelerin yeri tab değişimlerinde kaymaz.
         top = QHBoxLayout()
+        top.setContentsMargins(4, 2, 4, 2)
+        top.setSpacing(10)
         main.addLayout(top)
 
-        self.lbl_search_title = QLabel("Plan Başlığı Ara:")
-        top.addWidget(self.lbl_search_title)
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Örn: TEST BAŞLIĞI")
-        top.addWidget(self.search_edit, 2)
-
         self.data_dir_label = QLabel(f"Veri Klasörü: {self.app_settings.data_dir}")
-        top.addWidget(self.data_dir_label, 3)
+        top.addWidget(self.data_dir_label, 1)
+        top.addStretch(1)
 
         self.btn_pick_folder = QPushButton("Veri Klasörü Seç")
-        top.addWidget(self.btn_pick_folder)
-
-        # Mid: results list
-        mid = QHBoxLayout()
-        main.addLayout(mid)
-
-        left_box = QGroupBox("Arama Sonuçları (Reklam veren)")
-        left_box.setMaximumWidth(280)  # 240-320 arası idealdir
-        left_layout = QVBoxLayout(left_box)
-        self.list_advertisers = QListWidget()
-        left_layout.addWidget(self.list_advertisers)
-        mid.addWidget(left_box, 1)
-        # İstek: Arama sonuçları paneli sadece "REZERVASYONLAR" sekmesinde görünsün.
-        self._search_results_box = left_box
-        self._search_results_box.setVisible(False)
-        self._search_results_box.setMaximumWidth(0)
+        top.addWidget(self.btn_pick_folder, 0)
 
         # Tabs
         self.tabs = QTabWidget()
-        mid.addWidget(self.tabs, 6)
+        main.addWidget(self.tabs, 1)
 
         self.tab_widgets: dict[str, QWidget] = {}
         for name in TAB_NAMES:
@@ -143,8 +126,7 @@ class MainWindow(QMainWindow):
 
         # Wire
         self.btn_pick_folder.clicked.connect(self.pick_data_folder)
-        self.search_edit.textChanged.connect(self.on_search_changed)
-        self.list_advertisers.itemClicked.connect(self.on_advertiser_selected)
+        # Arama alanı + sonuç listesi REZERVASYONLAR sekmesinde kuruluyor.
 
         # Yeni model: tek buton. Seçilen tarih aralığındaki tüm seçili kanalları DB'ye kaydeder.
         self.btn_save.clicked.connect(self.on_save)
@@ -171,161 +153,165 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # ---- Üst Bilgiler (2 satır) ----
-        # Kullanıcının istediği gibi: ilişkili alanlar gruplanmış, üstte taşma/üst üste binme yok.
-        top_block = QHBoxLayout()
-        top_block.setSpacing(8)
-        layout.addLayout(top_block)
+        
+        # ---- Üst Bilgiler (2 satır, tek blok) ----
+        # Hedef: Sizin attığınız 2. görseldeki gibi: her şey aynı hizada, temiz, taşma/üst üste binme yok.
+        header = QWidget()
+        header.setObjectName("homeHeader")
+        header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        header_v = QVBoxLayout(header)
+        header_v.setContentsMargins(8, 6, 8, 6)
+        header_v.setSpacing(6)
+        layout.addWidget(header)
 
-        # Sol blok: plan/kanal/tarih/form bilgileri (2 satır)
-        left_panel = QWidget()
-        left_grid = QGridLayout(left_panel)
-        left_grid.setContentsMargins(0, 0, 0, 0)
-        left_grid.setHorizontalSpacing(4)
-        left_grid.setVerticalSpacing(4)
-        top_block.addWidget(left_panel, 1)
+        def _mk_label(t: str, min_w: int = 0) -> QLabel:
+            lbl = QLabel(t)
+            if min_w:
+                lbl.setMinimumWidth(min_w)
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lbl.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            return lbl
 
-        # ---- Sol blok / Satır 1 ----
-        c = 0
-        left_grid.addWidget(QLabel("Reklam veren:"), 0, c); c += 1
-        self.in_advertiser = QComboBox()
-        self.in_advertiser.setEditable(True)
-        self.in_advertiser.setFixedWidth(150)
-        left_grid.addWidget(self.in_advertiser, 0, c); c += 1
+        def _h24(w):
+            # DPI/font farklarında "fixed height" yerine min height daha stabil.
+            try:
+                w.setMinimumHeight(24)
+            except Exception:
+                pass
+            return w
 
-        left_grid.addWidget(QLabel("Ajans:"), 0, c); c += 1
-        self.in_agency = QLineEdit()
-        self.in_agency.setFixedWidth(72)
-        left_grid.addWidget(self.in_agency, 0, c); c += 1
-
-        left_grid.addWidget(QLabel("Ürün:"), 0, c); c += 1
-        self.in_product = QLineEdit()
-        self.in_product.setFixedWidth(72)
-        left_grid.addWidget(self.in_product, 0, c); c += 1
-
-        left_grid.addWidget(QLabel("Plan Başlığı:"), 0, c); c += 1
-        self.in_plan_title = QLineEdit()
-        self.in_plan_title.setMinimumWidth(130)
-        self.in_plan_title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        left_grid.addWidget(self.in_plan_title, 0, c); c += 1
-
-        # ---- Sol blok / Satır 2 ----
-        c = 0
-        left_grid.addWidget(QLabel("Plan Tarihi:"), 1, c); c += 1
+        # Plan Tarihi UI'da görünmeyecek; tarih aralığı seçilince sistem zaten belirliyor.
+        # Ancak mevcut akışlarda (highlight/cache) kullanıldığı için widget'ı saklı tutuyoruz.
         self.in_date = QDateEdit()
         self.in_date.setCalendarPopup(True)
         self.in_date.setDate(QDate.currentDate())
-        self.in_date.setFixedWidth(95)
-        left_grid.addWidget(self.in_date, 1, c); c += 1
+        self.in_date.setVisible(False)
 
-        left_grid.addWidget(QLabel("Kanal:"), 1, c); c += 1
-        self.in_channel = QComboBox()
-        self.in_channel.setFixedWidth(90)
-        left_grid.addWidget(self.in_channel, 1, c); c += 1
+        # --- Satır 1: Reklam / Ajans / Ürün / Plan Başlığı / Kod Tanımı / Kod / Süre / Kod butonları ---
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(8)
 
-        self.btn_select_channels = QPushButton("Kanalları Seç")
-        self.btn_select_channels.setFixedWidth(84)
-        left_grid.addWidget(self.btn_select_channels, 1, c); c += 1
+        row1.addWidget(_mk_label("Reklam veren:", 92))
+        self.in_advertiser = _h24(QComboBox())
+        self.in_advertiser.setEditable(True)
+        self.in_advertiser.setMinimumWidth(220)
+        self.in_advertiser.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row1.addWidget(self.in_advertiser)
+
+        row1.addWidget(_mk_label("Ajans:", 46))
+        self.in_agency = _h24(QLineEdit())
+        self.in_agency.setMinimumWidth(140)
+        self.in_agency.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row1.addWidget(self.in_agency)
+
+        row1.addWidget(_mk_label("Ürün:", 42))
+        self.in_product = _h24(QLineEdit())
+        self.in_product.setMinimumWidth(120)
+        self.in_product.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row1.addWidget(self.in_product)
+
+        row1.addWidget(_mk_label("Plan Başlığı:", 78))
+        self.in_plan_title = _h24(QLineEdit())
+        self.in_plan_title.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        row1.addWidget(self.in_plan_title, 1)
+
+        row1.addWidget(_mk_label("Kod Tanımı:", 70))
+        self.in_code_definition = _h24(QLineEdit())
+        self.in_code_definition.setMinimumWidth(220)
+        self.in_code_definition.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row1.addWidget(self.in_code_definition)
+
+        row1.addWidget(_mk_label("Kod:", 30))
+        self.in_spot_code = _h24(QLineEdit())
+        self.in_spot_code.setMaxLength(10)
+        self.in_spot_code.setFixedWidth(64)
+        row1.addWidget(self.in_spot_code)
+
+        row1.addWidget(_mk_label("Süre (sn):", 58))
+        self.in_spot_duration = _h24(QSpinBox())
+        self.in_spot_duration.setRange(0, 9999)
+        self.in_spot_duration.setFixedWidth(64)
+        row1.addWidget(self.in_spot_duration)
+
+        self.btn_add_code = _h24(QPushButton("Kodu Ekle"))
+        self.btn_add_code.setFixedWidth(92)
+        row1.addWidget(self.btn_add_code)
+
+        self.btn_remove_code = _h24(QPushButton("Seçili Kodu Sil"))
+        self.btn_remove_code.setFixedWidth(120)
+        row1.addWidget(self.btn_remove_code)
+
+        header_v.addLayout(row1)
+
+        # --- Satır 2: Kanal / Tarih Aralığı / Not / Formu Oluşturan / Komisyon / Aktif Kod / Hücrelere Yaz ---
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(8)
+
+        row2.addWidget(_mk_label("Kanal:", 46))
+        self.in_channel = _h24(QComboBox())
+        self.in_channel.setMinimumWidth(150)
+        self.in_channel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row2.addWidget(self.in_channel)
+
+        self.btn_select_channels = _h24(QPushButton("Kanalları Seç"))
+        self.btn_select_channels.setFixedWidth(110)
+        row2.addWidget(self.btn_select_channels)
+
         self.lbl_selected_channels = QLabel("")
         self.lbl_selected_channels.setVisible(False)
 
-        left_grid.addWidget(QLabel("Tarih Aralığı:"), 1, c); c += 1
-        range_wrap = QHBoxLayout()
-        range_wrap.setContentsMargins(0, 0, 0, 0)
-        range_wrap.setSpacing(3)
-        self.in_range_start = QDateEdit()
+        row2.addWidget(_mk_label("Tarih Aralığı:", 80))
+        self.in_range_start = _h24(QDateEdit())
         self.in_range_start.setCalendarPopup(True)
-        self.in_range_start.setFixedWidth(82)
-        self.in_range_end = QDateEdit()
+        self.in_range_end = _h24(QDateEdit())
         self.in_range_end.setCalendarPopup(True)
-        self.in_range_end.setFixedWidth(82)
-        self.btn_apply_range = QPushButton("Aralığı Uygula")
-        self.btn_apply_range.setFixedWidth(80)
-        range_wrap.addWidget(self.in_range_start)
-        range_wrap.addWidget(QLabel("-"))
-        range_wrap.addWidget(self.in_range_end)
-        range_wrap.addWidget(self.btn_apply_range)
-        range_host = QWidget()
-        range_host.setLayout(range_wrap)
-        left_grid.addWidget(range_host, 1, c, 1, 3); c += 3
+        self.in_range_start.setFixedWidth(102)
+        self.in_range_end.setFixedWidth(102)
+        row2.addWidget(self.in_range_start)
+        row2.addWidget(QLabel("-"))
+        row2.addWidget(self.in_range_end)
 
-        left_grid.addWidget(QLabel("Formu Oluşturan:"), 1, c); c += 1
-        self.in_prepared_by = QLineEdit()
-        self.in_prepared_by.setFixedWidth(100)
-        left_grid.addWidget(self.in_prepared_by, 1, c); c += 1
+        self.btn_apply_range = _h24(QPushButton("Aralığı Uygula"))
+        self.btn_apply_range.setFixedWidth(105)
+        row2.addWidget(self.btn_apply_range)
 
-        left_grid.addWidget(QLabel("Not:"), 1, c); c += 1
-        self.in_note = QLineEdit()
-        self.in_note.setMinimumWidth(100)
+        row2.addWidget(_mk_label("Not:", 32))
+        self.in_note = _h24(QLineEdit())
         self.in_note.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        left_grid.addWidget(self.in_note, 1, c); c += 1
+        row2.addWidget(self.in_note, 1)
 
-        # Sol blokta plan başlığı ve not alanı gerektiğinde daralıp genişlesin
-        try:
-            left_grid.setColumnStretch(7, 1)   # plan başlığı
-            left_grid.setColumnStretch(12, 1)  # note
-        except Exception:
-            pass
+        row2.addWidget(_mk_label("Formu Oluşturan:", 96))
+        self.in_prepared_by = _h24(QLineEdit())
+        self.in_prepared_by.setMinimumWidth(160)
+        self.in_prepared_by.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row2.addWidget(self.in_prepared_by)
 
-        # Sağ blok: kod işlemleri + mini kod tablosu (kompakt)
-        right_panel = QWidget()
-        right_panel.setFixedWidth(430)
-        right_v = QVBoxLayout(right_panel)
-        right_v.setContentsMargins(0, 0, 0, 0)
-        right_v.setSpacing(4)
-        top_block.addWidget(right_panel, 0, Qt.AlignTop)
-
-        code_row1 = QHBoxLayout()
-        code_row1.setContentsMargins(0, 0, 0, 0)
-        code_row1.setSpacing(4)
-        right_v.addLayout(code_row1)
-
-        code_row1.addWidget(QLabel("Kod Tanımı:"))
-        self.in_code_definition = QLineEdit()
-        self.in_code_definition.setFixedWidth(112)
-        code_row1.addWidget(self.in_code_definition)
-
-        code_row1.addWidget(QLabel("Kod:"))
-        self.in_spot_code = QLineEdit()
-        self.in_spot_code.setMaxLength(10)
-        self.in_spot_code.setFixedWidth(42)
-        code_row1.addWidget(self.in_spot_code)
-
-        code_row1.addWidget(QLabel("Süre (sn):"))
-        self.in_spot_duration = QSpinBox()
-        self.in_spot_duration.setRange(0, 9999)
-        self.in_spot_duration.setFixedWidth(52)
-        code_row1.addWidget(self.in_spot_duration)
-
-        self.btn_add_code = QPushButton("Kodu Ekle")
-        self.btn_add_code.setFixedWidth(68)
-        code_row1.addWidget(self.btn_add_code)
-
-        self.btn_remove_code = QPushButton("Seçili Kodu Sil")
-        self.btn_remove_code.setFixedWidth(94)
-        code_row1.addWidget(self.btn_remove_code)
-
-        code_row2 = QHBoxLayout()
-        code_row2.setContentsMargins(0, 0, 0, 0)
-        code_row2.setSpacing(4)
-        right_v.addLayout(code_row2)
-
-        code_row2.addWidget(QLabel("Ajans Kom. (%):"))
-        self.in_agency_commission = QSpinBox()
+        row2.addWidget(_mk_label("Ajans Kom. (%):", 92))
+        self.in_agency_commission = _h24(QSpinBox())
         self.in_agency_commission.setRange(0, 100)
         self.in_agency_commission.setValue(10)
-        self.in_agency_commission.setFixedWidth(52)
-        code_row2.addWidget(self.in_agency_commission)
+        self.in_agency_commission.setFixedWidth(64)
+        row2.addWidget(self.in_agency_commission)
 
-        code_row2.addWidget(QLabel("Aktif Kod:"))
-        self.cb_active_code = QComboBox()
-        self.cb_active_code.setFixedWidth(90)
-        code_row2.addWidget(self.cb_active_code)
+        row2.addWidget(_mk_label("Aktif Kod:", 64))
+        self.cb_active_code = _h24(QComboBox())
+        self.cb_active_code.setMinimumWidth(150)
+        self.cb_active_code.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row2.addWidget(self.cb_active_code)
 
-        self.btn_fill_selected = QPushButton("Seçili Hücrelere Yaz")
-        self.btn_fill_selected.setFixedWidth(126)
-        code_row2.addWidget(self.btn_fill_selected)
-        code_row2.addStretch(1)
+        self.btn_fill_selected = _h24(QPushButton("Seçili Hücrelere Yaz"))
+        self.btn_fill_selected.setFixedWidth(170)
+        row2.addWidget(self.btn_fill_selected)
+
+        header_v.addLayout(row2)
+
+        # Kod listesi (sağda, kompakt)
+        codes_row = QHBoxLayout()
+        codes_row.setContentsMargins(0, 0, 0, 0)
+        codes_row.setSpacing(0)
+        codes_row.addStretch(1)
 
         self.tbl_codes = QTableWidget(0, 3)
         self.tbl_codes.setHorizontalHeaderLabels(["Kod", "Kod Tanımı", "Süre (sn)"])
@@ -333,22 +319,32 @@ class MainWindow(QMainWindow):
         self.tbl_codes.setSelectionBehavior(QTableWidget.SelectRows)
         self.tbl_codes.setSelectionMode(QTableWidget.SingleSelection)
         self.tbl_codes.horizontalHeader().setStretchLastSection(False)
-        self.tbl_codes.setFixedWidth(430)
-        self.tbl_codes.setFixedHeight(62)
+
+        # Sağda sabit bir blok gibi dursun ama içerik büyüyünce üst üste binmesin.
+        self.tbl_codes.setMinimumWidth(560)
+        self.tbl_codes.setMaximumWidth(560)
+
+        try:
+            self.tbl_codes.setFrameShape(QFrame.NoFrame)
+        except Exception:
+            pass
         try:
             self.tbl_codes.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
             self.tbl_codes.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
             self.tbl_codes.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
-            self.tbl_codes.setColumnWidth(0, 52)
-            self.tbl_codes.setColumnWidth(1, 275)
-            self.tbl_codes.setColumnWidth(2, 88)
+            self.tbl_codes.setColumnWidth(0, 58)
+            self.tbl_codes.setColumnWidth(1, 392)
+            self.tbl_codes.setColumnWidth(2, 90)
             self.tbl_codes.verticalHeader().setDefaultSectionSize(18)
-            self.tbl_codes.setMaximumHeight(62)
         except Exception:
             pass
-        right_v.addWidget(self.tbl_codes, 0, Qt.AlignTop)
 
-        # Canlı hesap özeti (Excel sağ-alt toplamları)
+        # Boşken sadece başlık gibi görünsün; kod eklenince 2 satıra kadar aç.
+        self._auto_size_codes_table()
+        codes_row.addWidget(self.tbl_codes)
+        header_v.addLayout(codes_row)
+
+# Canlı hesap özeti (Excel sağ-alt toplamları)
         calc_row = QHBoxLayout()
         self.lbl_grid_counts = QLabel("Toplam Adet: 0 | Toplam Süre: 0 sn")
         self.lbl_grid_amounts = QLabel("Brüt: 0,00 TL | Aj.Kom.: 0,00 TL | Kalan: 0,00 TL | KDV: 0,00 TL | Genel: 0,00 TL")
@@ -409,6 +405,39 @@ class MainWindow(QMainWindow):
         # formda yüklü olan kayıt (kayıtlı rezervasyonları görüntülerken işimize yarıyor)
         self._loaded_reservation_id: int | None = None
 
+
+    def _auto_size_codes_table(self):
+        """
+        Kod tablosu (Kod / Kod Tanımı / Süre) boşken şişmesin.
+        En fazla 3 satırı baz alıp tablo yüksekliğini otomatik ayarlar.
+        """
+        tbl = getattr(self, "tbl_codes", None)
+        if tbl is None:
+            return
+
+        # Kolonları içeriğe göre ayarla
+        tbl.resizeColumnsToContents()
+        tbl.resizeRowsToContents()
+
+        # Header resize modları (istenirse)
+        hh = tbl.horizontalHeader()
+        try:
+            hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Kod
+            hh.setSectionResizeMode(1, QHeaderView.Stretch)           # Kod Tanımı
+            hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # Süre
+        except Exception:
+            pass
+
+        # Yüksekliği: header + (max 3 satır) + frame
+        visible_rows = min(tbl.rowCount(), 3)
+        height = tbl.horizontalHeader().height()
+
+        for i in range(visible_rows):
+            height += tbl.rowHeight(i)
+
+        height += tbl.frameWidth() * 2 + 6  # küçük pay
+        tbl.setFixedHeight(max(height, 38))  # boşken de çok küçülmesin
+        
     def refresh_channel_combo(self) -> None:
         """Rezervasyon sekmesindeki kanal listesini DB'den yeniler."""
         if not getattr(self, "repo", None) or not hasattr(self, "in_channel"):
@@ -631,17 +660,61 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "OK", "Veri klasörü kaydedildi ve DB hazırlandı.")
 
     def on_search_changed(self, text: str) -> None:
+        # Rezervasyonlar sekmesindeki plan başlığı araması
+        if not hasattr(self, "list_advertisers"):
+            return
         self.list_advertisers.clear()
+
+        q = (text or "").strip()
+        if not q:
+            try:
+                self.list_advertisers.setVisible(False)
+            except Exception:
+                pass
+            # arama boşsa rezervasyon listesini de temizle
+            try:
+                self.refresh_reservations_tab()
+            except Exception:
+                pass
+            return
+
         if not self.repo:
             return
-        for name in self.repo.search_plan_titles(text, limit=30):
+
+        names = list(self.repo.search_plan_titles(q, limit=30) or [])
+        for name in names:
             self.list_advertisers.addItem(name)
+
+        try:
+            self.list_advertisers.setVisible(len(names) > 0)
+        except Exception:
+            pass
 
     def on_advertiser_selected(self, item) -> None:
         if not item:
             return
         name = item.text()
-        self.in_plan_title.setText(name)
+
+        # Rezervasyon sekmesi arama kutusunu seçilen başlıkla sabitle
+        try:
+            if hasattr(self, "search_edit"):
+                self.search_edit.blockSignals(True)
+                self.search_edit.setText(name)
+                self.search_edit.blockSignals(False)
+        except Exception:
+            pass
+
+        # Home formundaki plan başlığını da güncelle (tek kaynak gibi davranalım)
+        try:
+            self.in_plan_title.setText(name)
+        except Exception:
+            pass
+
+        # arama sonuç listesini kapat (ekranı boğmasın)
+        try:
+            self.list_advertisers.setVisible(False)
+        except Exception:
+            pass
 
         # Seçili reklam veren için son kaydı forma geri getir
         if not getattr(self, "repo", None):
@@ -734,6 +807,28 @@ class MainWindow(QMainWindow):
             pass
 
         # rezervasyonlar tabı açık değilse bile, arama ile reklamvereni seçince liste tazelensin
+        try:
+            self.refresh_reservations_tab()
+        except Exception:
+            pass
+
+    def _clear_res_search(self) -> None:
+        """Rezervasyonlar sekmesindeki plan başlığı aramasını temizler."""
+        try:
+            if hasattr(self, "search_edit"):
+                self.search_edit.blockSignals(True)
+                self.search_edit.setText("")
+                self.search_edit.blockSignals(False)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "list_advertisers"):
+                self.list_advertisers.clear()
+                self.list_advertisers.setVisible(False)
+        except Exception:
+            pass
+
         try:
             self.refresh_reservations_tab()
         except Exception:
@@ -881,6 +976,7 @@ class MainWindow(QMainWindow):
                 self.tbl_codes.setItem(r, 2, QTableWidgetItem(str(dur)))
                 self._sync_active_code_combo()
                 self._refresh_home_grid_calculation_context()
+                self._auto_size_codes_table()
                 return
 
         r = self.tbl_codes.rowCount()
@@ -890,6 +986,7 @@ class MainWindow(QMainWindow):
         self.tbl_codes.setItem(r, 2, QTableWidgetItem(str(dur)))
         self._sync_active_code_combo()
         self._refresh_home_grid_calculation_context()
+        self._auto_size_codes_table()
 
         # Kullanıcı hızlı ekleme yapabilsin
         self.in_spot_code.clear()
@@ -919,6 +1016,7 @@ class MainWindow(QMainWindow):
         self.tbl_codes.removeRow(row)
         self._sync_active_code_combo()
         self._refresh_home_grid_calculation_context()
+        self._auto_size_codes_table()
 
     def on_active_code_changed(self) -> None:
         # Manuel grid girişinde zorunlu değil; opsiyonel kullanım.
@@ -1626,25 +1724,14 @@ class MainWindow(QMainWindow):
     def on_tab_changed(self, idx: int) -> None:
         tab_name = self.tabs.tabText(idx)
 
-        # Arama alanı + arama sonuçları paneli sadece REZERVASYONLAR'da görünsün.
-        try:
-            is_res = (tab_name == "REZERVASYONLAR")
-            box = getattr(self, "_search_results_box", None)
-            if box is not None:
-                if is_res:
-                    box.setMaximumWidth(280)
-                    box.setVisible(True)
-                else:
-                    box.setVisible(False)
-                    box.setMaximumWidth(0)
-            if hasattr(self, "lbl_search_title"):
-                self.lbl_search_title.setVisible(is_res)
-            if hasattr(self, "search_edit"):
-                self.search_edit.setVisible(is_res)
-        except Exception:
-            pass
-
         if tab_name == "REZERVASYONLAR":
+            # Home'daki plan başlığı varsa, rezervasyonlar sekmesi aramasına yansıt.
+            try:
+                if hasattr(self, "search_edit") and hasattr(self, "in_plan_title"):
+                    if not (self.search_edit.text() or "").strip() and (self.in_plan_title.text() or "").strip():
+                        self.search_edit.setText((self.in_plan_title.text() or "").strip())
+            except Exception:
+                pass
             self.refresh_reservations_tab()
         if tab_name == "KOD TANIMI":
             self.refresh_kod_tanimi()
@@ -1663,6 +1750,47 @@ class MainWindow(QMainWindow):
     def _build_reservations_tab(self) -> None:
         tab = self.tab_widgets["REZERVASYONLAR"]
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        # --- Arama (yatay, sekme içinde) ---
+        # Not: Bu alanı ana layout'tan kaldırdık; aksi halde sekmelerin yeri tab değişimlerinde kayıyordu.
+        search_box = QGroupBox("Plan Başlığı Arama")
+        search_box.setObjectName("resSearchBox")
+        sb = QVBoxLayout(search_box)
+        sb.setContentsMargins(10, 8, 10, 8)
+        sb.setSpacing(6)
+
+        search_row = QHBoxLayout()
+        search_row.setContentsMargins(0, 0, 0, 0)
+        search_row.setSpacing(10)
+
+        lbl = QLabel("Plan Başlığı Ara:")
+        lbl.setFixedWidth(110)
+        lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        search_row.addWidget(lbl)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Örn: TEST BAŞLIĞI")
+        self.search_edit.setFixedHeight(24)
+        self.search_edit.setMinimumWidth(320)
+        self.search_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        search_row.addWidget(self.search_edit, 1)
+
+        self.btn_res_search_clear = QPushButton("Temizle")
+        self.btn_res_search_clear.setFixedHeight(24)
+        self.btn_res_search_clear.setFixedWidth(90)
+        search_row.addWidget(self.btn_res_search_clear)
+
+        sb.addLayout(search_row)
+
+        self.list_advertisers = QListWidget()
+        self.list_advertisers.setObjectName("resSearchResults")
+        self.list_advertisers.setMaximumHeight(110)
+        self.list_advertisers.setVisible(False)
+        sb.addWidget(self.list_advertisers)
+
+        layout.addWidget(search_box, 0)
 
         top = QHBoxLayout()
         layout.addLayout(top)
@@ -1751,11 +1879,23 @@ class MainWindow(QMainWindow):
         self.btn_res_open_exports.clicked.connect(self.open_exports_folder)
         self.res_table.itemSelectionChanged.connect(self.on_reservation_selected)
 
+        # Arama (sekme içi)
+        self.search_edit.textChanged.connect(self.on_search_changed)
+        self.list_advertisers.itemClicked.connect(self.on_advertiser_selected)
+        self.btn_res_search_clear.clicked.connect(lambda: self._clear_res_search())
+
         self.res_year.valueChanged.connect(self.refresh_reservations_tab)
         self.res_month.currentIndexChanged.connect(self.refresh_reservations_tab)
         self.res_channel.currentIndexChanged.connect(self.refresh_reservations_tab)
 
         self.refresh_reservation_channel_filter()
+
+        # ilk açılışta rezervasyon listesi boş kalmasın diye: home'daki plan başlığı varsa buraya yansıt.
+        try:
+            if hasattr(self, "in_plan_title") and self.in_plan_title.text().strip() and not self.search_edit.text().strip():
+                self.search_edit.setText(self.in_plan_title.text().strip())
+        except Exception:
+            pass
 
     def refresh_reservation_channel_filter(self) -> None:
         if not getattr(self, "repo", None) or not hasattr(self, "res_channel"):
@@ -1778,7 +1918,15 @@ class MainWindow(QMainWindow):
         if not getattr(self, "repo", None):
             return
 
-        pt = (self.in_plan_title.text() or "").strip()
+        # Rezervasyon listesi için plan başlığı: önce REZERVASYONLAR araması, yoksa ana sayfadaki başlık.
+        pt = ""
+        try:
+            if hasattr(self, "search_edit"):
+                pt = (self.search_edit.text() or "").strip()
+        except Exception:
+            pt = ""
+        if not pt:
+            pt = (self.in_plan_title.text() or "").strip()
         self._res_records = []
         self.res_table.setRowCount(0)
         self.res_preview_title.setText("")
