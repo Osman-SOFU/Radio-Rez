@@ -87,48 +87,6 @@ def _pick_worksheet(wb: Workbook, preferred: str, *, contains_any: list[str] | N
     # fallback: ilk sayfa
     return wb[wb.sheetnames[0]]
 
-def _safe_add_logo(ws, template_path: Path, anchor: str = "AP1", w: int = 128, h: int = 128) -> None:
-    """Logo'yu güvenli şekilde ekler.
-
-    - Aynı sayfada zaten görsel varsa dokunmaz (çift eklemeyi önler).
-    - Pillow yoksa (PIL) logo ekleme denemesi başarısız olur; bu durumda sessizce geçmek yerine debug basar.
-    """
-    try:
-        imgs = getattr(ws, "_images", None)
-        if imgs and len(imgs) > 0:
-            return
-    except Exception:
-        pass
-
-    # Pillow kontrolü (openpyxl Image için şart)
-    try:
-        from PIL import Image as _PILImage  # noqa: F401
-    except Exception as e:
-        print("[WARN] Logo eklenemedi: Pillow (PIL) yüklü değil -> pip install Pillow. Hata:", repr(e))
-        return
-
-    logo_path = None
-    try:
-        logo_path = template_path.parent / "RADIOSCOPE.PNG"
-        if not logo_path.exists():
-            logo_path = resource_path("assets/RADIOSCOPE.PNG")
-    except Exception:
-        logo_path = None
-
-    if not logo_path or not Path(logo_path).exists():
-        print("[WARN] Logo dosyası bulunamadı:", str(logo_path))
-        return
-
-    try:
-        img = Image(str(logo_path))
-        img.width = w
-        img.height = h
-        ws.add_image(img, anchor)
-    except Exception as e:
-        print("[WARN] Logo add FAILED:", repr(e))
-        return
-
-
 
 def _row_idx_to_time(row_idx: int) -> time:
     """Grid satırı -> kuşak başlangıç saati.
@@ -548,8 +506,26 @@ def export_excel(template_path: Path, out_path: Path, payload: dict[str, Any]) -
             except Exception:
                 pass
 
+
     # --- Logo ---
-    _safe_add_logo(ws, template_path, anchor="AP1", w=128, h=128)
+    logo_path = template_path.parent / "RADIOSCOPE.PNG"
+    if not logo_path.exists():
+        logo_path = resource_path("assets/RADIOSCOPE.PNG")
+
+    try:
+        ws._images = []  # kalsın, üst üste binmesin
+        if not logo_path.exists():
+            raise FileNotFoundError(f"Logo bulunamadı: {logo_path}")
+
+        img = Image(str(logo_path))
+        img.width = 128
+        img.height = 128
+
+        ws.add_image(img, "AP1")
+
+    except Exception as e:
+        print("[DEBUG] logo add FAILED:", repr(e))
+        pass
 
     # --- Alt alanlar (Kod listesi + süre hesabı) ---
     # Ajans komisyon oranı (%): şirket/ajansa göre değişebilir.
@@ -1001,10 +977,21 @@ def _export_excel_span_legacy(
                 pass
 
             # --- Logo ---
-            _safe_add_logo(ws, template_path, anchor="AP1", w=128, h=128)
+            logo_path = template_path.parent / "RADIOSCOPE.PNG"
+            if not logo_path.exists():
+                logo_path = resource_path("assets/RADIOSCOPE.PNG")
+
+            try:
+                ws._images = []
+                if logo_path.exists():
+                    img = Image(str(logo_path))
+                    img.width = 128
+                    img.height = 128
+                    ws.add_image(img, "AP1")
+            except Exception:
+                pass
 
             # --- Alt alanlar ---
-
             if a67_codes is not None:
                 ws["A67"].value = str(a67_codes).strip()
 
@@ -1108,39 +1095,6 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
         logo_bytes = None
 
     def _add_logo(ws):
-
-        # aynı sayfada zaten görsel varsa (template'ten gelmiş olabilir) tekrar ekleme
-        try:
-            if getattr(ws, "_images", None) and len(ws._images) > 0:
-                return
-        except Exception:
-            pass
-
-        # Pillow kontrolü (openpyxl Image için şart)
-        try:
-            from PIL import Image as _PILImage  # noqa: F401
-        except Exception as e:
-            print("[WARN] Logo eklenemedi: Pillow (PIL) yüklü değil -> pip install Pillow. Hata:", repr(e))
-            return
-        logo_file = None
-        try:
-            logo_file = template_path.parent / "RADIOSCOPE.PNG"
-            if not logo_file.exists():
-                logo_file = resource_path("assets/RADIOSCOPE.PNG")
-        except Exception:
-            logo_file = None
-
-        try:
-            if logo_file and Path(logo_file).exists():
-                img = Image(str(logo_file))
-                if logo_w and logo_h:
-                    img.width = logo_w
-                    img.height = logo_h
-                ws.add_image(img, logo_anchor)
-                return
-        except Exception:
-            pass
-
         if not logo_bytes:
             return
         try:
@@ -1177,50 +1131,6 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
             h1 = int(m.group(1)); h2 = int(m.group(2))
             kk = f"{h1:02d}:00-{h2:02d}:00"
         norm_access[kk] = v
-
-    # Span boyunca kullanılan gerçek kodlar / adetler / tanımlar
-    span_used_counts: Counter[str] = Counter()
-    for (yy_i, mm_i), matrix in (month_matrices or {}).items():
-        if not isinstance(matrix, dict):
-            continue
-        for raw in matrix.values():
-            code = str(raw or "").strip().upper()
-            if code:
-                span_used_counts[code] += 1
-
-    raw_code_defs = payload.get("code_defs") or []
-    code_map: dict[str, dict[str, Any]] = {}
-    ordered_codes_from_defs: list[str] = []
-    for item in raw_code_defs:
-        try:
-            code = str(item.get("code") or "").strip().upper()
-            if not code:
-                continue
-            if code not in ordered_codes_from_defs:
-                ordered_codes_from_defs.append(code)
-            code_map[code] = {
-                "duration_sec": int(item.get("duration_sec") or 0),
-                "desc": str(item.get("desc") or "").strip(),
-            }
-        except Exception:
-            continue
-
-    fb_code = str(payload.get("spot_code") or "").strip().upper()
-    if fb_code and fb_code not in code_map:
-        code_map[fb_code] = {
-            "duration_sec": int(payload.get("spot_duration_sec") or 0),
-            "desc": str(payload.get("code_definition") or "").strip(),
-        }
-        if fb_code not in ordered_codes_from_defs:
-            ordered_codes_from_defs.append(fb_code)
-
-    ordered_span_codes: list[str] = []
-    for code in ordered_codes_from_defs:
-        if code in span_used_counts and code not in ordered_span_codes:
-            ordered_span_codes.append(code)
-    for code in sorted(span_used_counts.keys()):
-        if code not in ordered_span_codes:
-            ordered_span_codes.append(code)
 
     def _dow_tr(dt_: date) -> str:
         return ["Pt", "Sa", "Ça", "Pş", "Cu", "Ct", "Pa"][dt_.weekday()]
@@ -1315,68 +1225,6 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
         except Exception:
             pass
 
-    def _month_prices_for(yy: int, mm_: int) -> tuple[float, float]:
-        dt_price = payload.get("channel_price_dt")
-        odt_price = payload.get("channel_price_odt")
-        smp = payload.get("span_month_prices") or {}
-        try:
-            price_row = smp.get(f"{yy:04d}-{mm_:02d}")
-            if isinstance(price_row, dict):
-                if price_row.get("dt") is not None or price_row.get("DT") is not None:
-                    dt_price = price_row.get("dt") if price_row.get("dt") is not None else price_row.get("DT")
-                if price_row.get("odt") is not None or price_row.get("ODT") is not None:
-                    odt_price = price_row.get("odt") if price_row.get("odt") is not None else price_row.get("ODT")
-            elif isinstance(price_row, (list, tuple)) and len(price_row) >= 2:
-                dt_price, odt_price = price_row[0], price_row[1]
-        except Exception:
-            pass
-        try:
-            dt_price = float(dt_price or 0)
-        except Exception:
-            dt_price = 0.0
-        try:
-            odt_price = float(odt_price or 0)
-        except Exception:
-            odt_price = 0.0
-        return dt_price, odt_price
-
-    def _fill_unit_prices(ws, yy: int, mm_: int) -> None:
-        dt_price, odt_price = _month_prices_for(yy, mm_)
-        unit_price_col = column_index_from_string("AO")
-        for row_idx in range(52):
-            rr = GRID_ROW_START + row_idx
-            slot_type = classify_dt_odt(_row_idx_to_time(row_idx))
-            ws.cell(rr, unit_price_col).value = dt_price if slot_type == "DT" else odt_price
-
-    def _fill_code_summary(ws) -> None:
-        start_row = 67
-        max_rows = 8
-        for i in range(max_rows):
-            rr = start_row + i
-            for addr in (f"A{rr}", f"C{rr}", f"D{rr}", f"G{rr}"):
-                try:
-                    ws[addr].value = None
-                except Exception:
-                    pass
-        try:
-            ws["D67"].alignment = copy(ws["D67"].alignment)
-            ws["D67"].alignment = ws["D67"].alignment.copy(wrap_text=True, horizontal="center")
-            ws["D68"].alignment = copy(ws["D68"].alignment)
-            ws["D68"].alignment = ws["D68"].alignment.copy(wrap_text=True, horizontal="center")
-        except Exception:
-            pass
-
-        rows = ordered_span_codes[:max_rows]
-        for i, code in enumerate(rows):
-            rr = start_row + i
-            info = code_map.get(code) or {}
-            ws[f"A{rr}"].value = code
-            ws[f"C{rr}"].value = int(info.get("duration_sec") or 0)
-            ws[f"D{rr}"].value = str(info.get("desc") or "")
-
-        total_adet = int(sum(span_used_counts.values()))
-        ws["G67"].value = f"({total_adet})"
-
     # Create sheets per month
     created_sheets = []
     for i, (yy, mm_) in enumerate(months):
@@ -1395,10 +1243,7 @@ def export_excel_span(template_path: Path, out_path: Path, payload: dict, month_
         _fill_header_and_grid(ws, month_dates)
         _fill_rates(ws)
         _fill_codes(ws, month_dates)
-        _fill_unit_prices(ws, yy, mm_)
-        _fill_code_summary(ws)
         _apply_commission(ws)
-        _add_logo(ws)
 
         # Fix daily totals & summary rows (use existing helpers)
         try:

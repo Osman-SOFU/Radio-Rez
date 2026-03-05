@@ -2511,12 +2511,13 @@ class MainWindow(QMainWindow):
 
         # --- Tablo ---
         self.spot_table = QTableWidget()
-        self.spot_table.setColumnCount(12)
+        self.spot_table.setColumnCount(13)
         self.spot_table.setHorizontalHeaderLabels(
             [
                 "Sıra",
                 "TARİH",
                 "ANA YAYIN",
+                "DİNLENME ORANI",
                 "REKLAMIN FIRMASI",
                 "ADET",
                 "BAŞLANGIÇ",
@@ -2542,15 +2543,16 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # sıra
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)  # tarih
         header.setSectionResizeMode(2, QHeaderView.Stretch)           # ana yayın
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # firma
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # adet
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # başlangıç
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # süre
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)  # spot kodu
-        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)  # dt-odt
-        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)  # birim saniye
-        header.setSectionResizeMode(10, QHeaderView.ResizeToContents) # bütçe
-        header.setSectionResizeMode(11, QHeaderView.Stretch)          # yayınlandı
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # dinlenme oranı
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # firma
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # adet
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # başlangıç
+        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)  # süre
+        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)  # spot kodu
+        header.setSectionResizeMode(9, QHeaderView.ResizeToContents)  # dt-odt
+        header.setSectionResizeMode(10, QHeaderView.ResizeToContents) # birim saniye
+        header.setSectionResizeMode(11, QHeaderView.ResizeToContents) # bütçe
+        header.setSectionResizeMode(12, QHeaderView.Stretch)          # yayınlandı
 
         # Stil
         self.spot_table.setStyleSheet('''
@@ -2710,6 +2712,7 @@ class MainWindow(QMainWindow):
                 rr.get("sira", ""),
                 rr.get("tarih", ""),
                 rr.get("ana_yayin", ""),
+                rr.get("dinlenme_orani", ""),
                 rr.get("reklam_firmasi", ""),
                 rr.get("adet", ""),
                 rr.get("baslangic", ""),
@@ -2720,17 +2723,22 @@ class MainWindow(QMainWindow):
                 rr.get("butce_net", 0.0),
             ]
 
-            for c in range(0, 11):
+            for c in range(0, 12):
                 item = QTableWidgetItem()
-                if c in (0, 4, 6):  # int
+                if c in (0, 5, 7):  # int
                     try:
                         item.setText(str(int(vals[c])))
                     except Exception:
                         item.setText(str(vals[c]))
                     item.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
-                elif c in (9, 10):  # float
+                elif c in (3, 10, 11):  # float / oran
                     try:
-                        item.setText(f"{float(vals[c]):.2f}")
+                        raw_val = vals[c]
+                        if raw_val in ("", None):
+                            item.setText("")
+                        else:
+                            fv = float(raw_val)
+                            item.setText(f"{fv:.2f}".rstrip("0").rstrip("."))
                     except Exception:
                         item.setText(str(vals[c]))
                     item.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
@@ -2750,7 +2758,7 @@ class MainWindow(QMainWindow):
             combo.setCurrentText("1" if pub_val == 1 else "0")
             combo.blockSignals(False)
             combo.currentTextChanged.connect(lambda txt, k=key: self.on_spot_published_changed(k, txt))
-            self.spot_table.setCellWidget(r_idx, 11, combo)
+            self.spot_table.setCellWidget(r_idx, 12, combo)
 
         self.spot_table.resizeRowsToContents()
 

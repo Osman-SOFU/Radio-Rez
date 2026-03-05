@@ -418,6 +418,20 @@ class ReservationService:
         price_cache: dict[int, dict[tuple[int, int], tuple[float, float]]] = {}
 
         rows: list[dict[str, Any]] = []
+        access_cache: dict[tuple[int, str], dict[str, float]] = {}
+
+        def _get_spot_access_ratio(channel_name: str, year: int, start_time: dtime) -> object:
+            """Erişim örneğinden kanal + saat bazlı dinlenme oranını döndürür."""
+            ch_key = self._norm_name(channel_name)
+            cache_key = (int(year), ch_key)
+            if cache_key not in access_cache:
+                try:
+                    access_cache[cache_key] = self._get_access_hour_map_for_channel(channel_name, int(year)) or {}
+                except Exception:
+                    access_cache[cache_key] = {}
+            hour_key = f"{int(start_time.hour):02d}:00-{(int(start_time.hour) + 1):02d}:00"
+            return access_cache.get(cache_key, {}).get(hour_key, "")
+
         for r in recs:
             p = r.payload or {}
 
@@ -477,6 +491,7 @@ class ReservationService:
                         "datetime": datetime(dt.year, dt.month, dt.day, t0.hour, t0.minute),
                         "tarih": dt.strftime("%d.%m.%Y"),
                         "ana_yayin": channel_name,
+                        "dinlenme_orani": _get_spot_access_ratio(channel_name, int(yy), t0),
                         "reklam_firmasi": str(p.get("advertiser_name") or "").strip(),
                         "adet": 1,
                         "baslangic": t0.strftime("%H:%M"),
