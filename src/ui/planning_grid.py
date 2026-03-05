@@ -133,6 +133,10 @@ class PlanningGrid(QWidget):
         self.table.horizontalHeader().setMinimumSectionSize(self._day_col_min)
         self.table.itemChanged.connect(self._on_item_changed)
 
+        # Recalc debounce (UI takılmalarını azaltır)
+        self._recalc_pending = False
+        self._recalc_delay_ms = 60
+
         self.set_month(self.year, self.month, None)
 
     def eventFilter(self, obj, event):
@@ -184,7 +188,7 @@ class PlanningGrid(QWidget):
         except Exception:
             pass
         self._apply_dynamic_sizes()
-        self._recalc_all_metrics()
+        self._schedule_recalc()
 
     def _day_count(self) -> int:
         return len(self._span_dates) if self._mode == "span" else calendar.monthrange(self.year, self.month)[1]
@@ -250,22 +254,41 @@ class PlanningGrid(QWidget):
             self.table.setItem(fr, col, it)
         it.setFlags(it.flags() & ~self._flag_editable)
         it.setBackground(QBrush(QColor("#e6e6e6")))
-        it.setText(str(text))
+        new_text = str(text)
+        if it.text() != new_text:
+            it.setText(new_text)
         it.setTextAlignment((Qt.AlignRight | Qt.AlignVCenter) if align_right else (Qt.AlignCenter))
 
     def set_code_definitions(self, code_defs: list[dict] | None) -> None:
         self._code_defs = list(code_defs or [])
-        self._recalc_all_metrics()
+        self._schedule_recalc()
 
     def set_price_resolver(self, resolver) -> None:
         self._price_resolver = resolver
-        self._recalc_all_metrics()
+        self._schedule_recalc()
 
     def set_commission_percent(self, percent: float | int) -> None:
         try:
             self._commission_percent = float(percent)
         except Exception:
             self._commission_percent = 0.0
+        self._schedule_recalc()
+
+    def _schedule_recalc(self) -> None:
+        """Coalesce frequent UI changes into a single recalculation."""
+        if self._suspend_calc or self._in_calc_refresh:
+            return
+        if getattr(self, '_recalc_pending', False):
+            return
+        self._recalc_pending = True
+        try:
+            QTimer.singleShot(int(getattr(self, '_recalc_delay_ms', 60)), self._run_scheduled_recalc)
+        except Exception:
+            self._recalc_pending = False
+            self._recalc_all_metrics()
+
+    def _run_scheduled_recalc(self) -> None:
+        self._recalc_pending = False
         self._recalc_all_metrics()
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
@@ -273,7 +296,7 @@ class PlanningGrid(QWidget):
             return
         try:
             if self._is_day_col(item.column()):
-                self._recalc_all_metrics()
+                self._schedule_recalc()
         except Exception:
             return
 
@@ -339,7 +362,8 @@ class PlanningGrid(QWidget):
             self.table.setItem(row, col, it)
         flags = it.flags() & ~self._flag_editable
         it.setFlags(flags)
-        it.setText(text)
+        if it.text() != text:
+            it.setText(text)
         it.setTextAlignment((Qt.AlignRight | Qt.AlignVCenter) if align_right else (Qt.AlignCenter))
 
     def _recalc_all_metrics(self) -> None:
@@ -351,7 +375,18 @@ class PlanningGrid(QWidget):
             return
 
         self._in_calc_refresh = True
+        prev_updates = True
+        prev_block = False
         try:
+            try:
+                prev_updates = self.table.updatesEnabled()
+                self.table.setUpdatesEnabled(False)
+            except Exception:
+                prev_updates = True
+            try:
+                prev_block = self.table.blockSignals(True)
+            except Exception:
+                prev_block = False
             dur_map = self._code_duration_map()
             day_count = self._day_count()
             day_totals = [0] * day_count
@@ -464,6 +499,15 @@ class PlanningGrid(QWidget):
             }
             self.calculationsUpdated.emit(payload)
         finally:
+            try:
+                self.table.blockSignals(prev_block)
+            except Exception:
+                pass
+            try:
+                self.table.setUpdatesEnabled(prev_updates)
+                self.table.viewport().update()
+            except Exception:
+                pass
             self._in_calc_refresh = False
 
     def set_access_hour_map(self, hour_map: dict | None) -> None:
@@ -633,7 +677,7 @@ class PlanningGrid(QWidget):
                     it = self.table.item(r, c)
                     if it:
                         it.setText("")
-            self._recalc_all_metrics()
+            self._schedule_recalc()
             return
 
         days_in_month = calendar.monthrange(self.year, self.month)[1]
@@ -643,7 +687,7 @@ class PlanningGrid(QWidget):
                 it = self.table.item(r, c)
                 if it:
                     it.setText("")
-        self._recalc_all_metrics()
+        self._schedule_recalc()
 
     def set_matrix(self, plan_cells: dict) -> None:
         """DB'den gelen plan_cells'i grid'e basar.
@@ -663,7 +707,7 @@ class PlanningGrid(QWidget):
             if self._read_only:
                 self._apply_read_only_flags()
             self._suspend_calc = False
-            self._recalc_all_metrics()
+            self._schedule_recalc()
             return
 
         days_in_month = calendar.monthrange(self.year, self.month)[1]
@@ -700,7 +744,7 @@ class PlanningGrid(QWidget):
         # Aralık kısıtı varsa kolon görünürlüğünü güncelle
         self._apply_range_visibility()
         self._suspend_calc = False
-        self._recalc_all_metrics()
+        self._schedule_recalc()
 
     def _apply_read_only_flags(self) -> None:
         """Sadece gün hücrelerinde editable flag kontrolü.
@@ -852,7 +896,7 @@ class PlanningGrid(QWidget):
         # mümkün olduğunca scroll ihtiyacını azalt
         self._apply_dynamic_sizes()
         self._suspend_calc = False
-        self._recalc_all_metrics()
+        self._schedule_recalc()
 
     # ------------------------------
     # Span (date range) mode
@@ -969,7 +1013,7 @@ class PlanningGrid(QWidget):
         self._refresh_access_ratio_column()
         self._apply_dynamic_sizes()
         self._suspend_calc = False
-        self._recalc_all_metrics()
+        self._schedule_recalc()
 
     def _apply_selected_date_highlight(self) -> None:
         if self._mode != "span" or not self._span_dates:
@@ -1047,7 +1091,7 @@ class PlanningGrid(QWidget):
             if self._read_only:
                 self._apply_read_only_flags()
             self._suspend_calc = False
-            self._recalc_all_metrics()
+            self._schedule_recalc()
             return
 
         for r in range(self._data_row_count()):
@@ -1069,7 +1113,7 @@ class PlanningGrid(QWidget):
             self._apply_read_only_flags()
         self._apply_dynamic_sizes()
         self._suspend_calc = False
-        self._recalc_all_metrics()
+        self._schedule_recalc()
 
     def get_matrix(self) -> dict[str, str]:
         # month mode matrix. In span mode, returns the matrix for self.year/self.month.

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import time, datetime, date
 
-from PySide6.QtCore import Qt, QDate, QEvent
+from PySide6.QtCore import Qt, QDate, QEvent, QTimer
 from PySide6.QtGui import QColor, QBrush, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -68,6 +68,11 @@ class MainWindow(QMainWindow):
         self.service: ReservationService | None = None
         self.current_confirmed: ConfirmedReservation | None = None
         self._home_price_cache: dict[tuple[str, int], dict[tuple[int, int], tuple[float, float]]] = {}
+        # UI performansı: Ana sayfa hesap güncellemelerini debounce et
+        self._home_ctx_timer = QTimer(self)
+        self._home_ctx_timer.setSingleShot(True)
+        self._home_ctx_timer.setInterval(80)
+        self._home_ctx_timer.timeout.connect(self._refresh_home_grid_calculation_context_now)
         
         root = QWidget()
         self.setCentralWidget(root)
@@ -555,6 +560,25 @@ class MainWindow(QMainWindow):
             return 0.0
 
     def _refresh_home_grid_calculation_context(self) -> None:
+        """Ana sayfa grid hesaplarını debounce eder (kasma/takılmayı azaltır)."""
+        try:
+            t = getattr(self, '_home_ctx_timer', None)
+            if t is None:
+                t = QTimer(self)
+                t.setSingleShot(True)
+                t.setInterval(80)
+                t.timeout.connect(self._refresh_home_grid_calculation_context_now)
+                self._home_ctx_timer = t
+            # restart
+            t.start()
+        except Exception:
+            try:
+                self._refresh_home_grid_calculation_context_now()
+            except Exception:
+                return
+
+
+    def _refresh_home_grid_calculation_context_now(self) -> None:
         if not hasattr(self, "plan_grid") or self.plan_grid is None:
             return
         try:
@@ -1028,28 +1052,47 @@ class MainWindow(QMainWindow):
         if not code:
             return
 
-        # Day kolonları 2..N; satırlar 0..times
         table = self.plan_grid.table
-        for it in table.selectedItems():
-            r = it.row()
-            c = it.column()
-            if c < 3:
-                continue
+        prev_block = table.blockSignals(True)
+        prev_updates = True
+        try:
             try:
-                if c > self.plan_grid.table.columnCount():
-                    continue
-                if c >= self.plan_grid.table.columnCount() - len(getattr(self.plan_grid, '_calc_col_names', [])):
-                    continue
+                prev_updates = table.updatesEnabled()
+                table.setUpdatesEnabled(False)
             except Exception:
-                pass
-            # read-only modda yazma
-            try:
-                if self.plan_grid._read_only:
-                    continue
-            except Exception:
-                pass
-            it.setText(code)
+                prev_updates = True
 
+            for it in table.selectedItems():
+                c = it.column()
+                if c < 3:
+                    continue
+                try:
+                    if c >= self.plan_grid.table.columnCount() - len(getattr(self.plan_grid, '_calc_col_names', [])):
+                        continue
+                except Exception:
+                    pass
+                # read-only modda yazma
+                try:
+                    if self.plan_grid._read_only:
+                        continue
+                except Exception:
+                    pass
+                it.setText(code)
+        finally:
+            try:
+                table.setUpdatesEnabled(prev_updates)
+            except Exception:
+                pass
+            try:
+                table.blockSignals(prev_block)
+            except Exception:
+                pass
+
+        # tek sefer hesapla
+        try:
+            self.plan_grid._schedule_recalc()
+        except Exception:
+            pass
         self._refresh_home_grid_calculation_context()
 
 
